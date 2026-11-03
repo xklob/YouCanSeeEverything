@@ -124,7 +124,11 @@ def list_events(path=None, *,q='',source='',category='',start='',end='',limit=50
     tie_order='DESC' if order=='ASC' else 'ASC'
     tie='e.rowid' if source or category else 'e.id'
     ordering=f'e.occurred_at {order} NULLS LAST,{tie} {tie_order}' if sort=='date' else f'e.rowid {order}'
-    event_table='events e NOT INDEXED' if sort=='imported' else 'events e'
+    # A source/category index can turn a selective FTS search into a scan of
+    # millions of unrelated records to satisfy chronological ordering. With
+    # MATCH, drive lookup by FTS rowids instead; NOT INDEXED still permits the
+    # integer primary key. Sort only the matching records before pagination.
+    event_table='events e NOT INDEXED' if q.strip() or sort=='imported' else 'events e'
     limit,offset=min(max(limit,1),200),max(offset,0)
     budget=_RecordBudget()
     with _record_connection(path,budget) as conn:

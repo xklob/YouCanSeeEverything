@@ -9,6 +9,7 @@ Artifacts contain private rendered records and must stay out of Git.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import base64
 import hashlib
 import json
@@ -462,11 +463,15 @@ def run(args: argparse.Namespace, report: dict) -> None:
         report["record_fingerprint"] = hashlib.sha256(known["id"].encode()).hexdigest()
         report["initial_total"] = initial["total"]
 
-        with sync_playwright() as playwright:
+        # Close pages and their pending routes before stopping Playwright's
+        # event loop, including when an assertion fails partway through a run.
+        with sync_playwright() as playwright, ExitStack() as cleanup:
             browser = playwright.chromium.launch(headless=True, args=["--disable-background-networking"])
+            cleanup.callback(browser.close)
             context = browser.new_context(viewport={"width": 1440, "height": 1000},
                                           service_workers="block", accept_downloads=False,
                                           reduced_motion="reduce")
+            cleanup.callback(context.close)
 
             def guard(route):
                 request = route.request
@@ -532,8 +537,6 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 assert not report["page_errors"] and not report["browser_console_errors"], "Saved summary browser runtime errors occurred"
                 assert not report["blocked_requests"] and not server.violations, "Read-only summary browsing attempted prohibited access"
                 passed("live_summary_browsing_has_no_runtime_errors_mutations_or_outbound_requests")
-                context.close()
-                browser.close()
                 return
             if summary_workflows:
                 from summary_fixtures import run_summary_acceptance
@@ -542,8 +545,6 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 assert not report["page_errors"] and not report["browser_console_errors"], "Summary browser runtime errors occurred"
                 assert not report["blocked_requests"] and not server.violations, "Summary workflow escaped its synthetic network boundary"
                 passed("summary_workflows_have_no_runtime_errors_or_real_generation")
-                context.close()
-                browser.close()
                 return
             workspace = page.get_by_role("region", name="Map and same-day timeline", exact=True)
             expect(workspace).to_be_visible()
@@ -726,7 +727,9 @@ def run(args: argparse.Namespace, report: dict) -> None:
             expect(results.get_by_role("button").filter(has=page.get_by_role("heading"))).to_have_count(len(filtered["items"]))
             passed("category_filter_matches_api", matching_total=filtered["total"])
 
-            results.get_by_role("button").filter(has=page.get_by_role("heading", name=known["title"], exact=True)).first.click()
+            # Distinct source records can share a title and timestamp. Source
+            # filtering may change their tie order, so open the known identity.
+            results.locator('[data-record-id=' + json.dumps(known['id']) + ']').get_by_role('button').first.click()
             drawer = page.get_by_role("dialog")
             expect(drawer).to_be_visible()
             expect(drawer.get_by_role("heading", name=known["title"], exact=True)).to_be_visible()
@@ -807,8 +810,6 @@ def run(args: argparse.Namespace, report: dict) -> None:
             assert not report["browser_console_errors"], "Browser console errors occurred"
             assert not report["blocked_requests"] and not server.violations, "Candidate attempted prohibited network access"
             passed("no_runtime_errors_or_prohibited_requests")
-            context.close()
-            browser.close()
     finally:
         server.shutdown()
         server.server_close()

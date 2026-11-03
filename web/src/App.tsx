@@ -1115,7 +1115,7 @@ function EventCard({
   sourceIndex: number;
 }) {
   return (
-    <article className="event-card">
+    <article className="event-card" data-record-id={event.id}>
       <button className="event-open-button" onClick={onClick}>
         <div className="event-card-top">
           <span

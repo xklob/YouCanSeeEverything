@@ -115,3 +115,39 @@ def test_overview_and_sources_leave_event_measurement_to_cache(catalog,monkeypat
     source=queries.sources(catalog)['items'][0]
     assert source['event_count'] is None and source['first_event'] is None
     assert not any('FROM events' in sql for sql in statements)
+
+
+@pytest.mark.parametrize('filters',[
+    {'source':'source'}, {'category':'note'}, {'source':'source','category':'note'},
+])
+@pytest.mark.parametrize('direction',['asc','desc'])
+def test_selective_search_with_filters_uses_fts_rowids_before_sorting(catalog,monkeypatch,filters,direction):
+    # The newest thousands of records share the filter but not the search.
+    # A chronological source scan exhausts this deliberately small budget.
+    with transaction(catalog) as conn:
+        conn.executemany("""INSERT INTO events(id,source_id,title,occurred_at,category,created_at)
+            VALUES(?,'source','Unrelated sample','2025-01-01','note','now')""",
+            [(f'sample-{i}',) for i in range(12000)])
+    monkeypatch.setattr(queries,'RECORD_QUERY_MAX_OPCODES',20000)
+    statements=[]
+    def traced_connect(path=None):
+        conn=connect(path);conn.set_trace_callback(statements.append);return conn
+    monkeypatch.setattr(queries,'connect',traced_connect)
+    page=queries.list_events(catalog,q='searchable fixture',direction=direction,**filters)
+    assert page['total']==6
+    assert {item['id'] for item in page['items']}=={'old','same-a','same-b','new','undated-a','undated-b'}
+    assert len(queries.list_events(catalog,q='searchable fixture',limit=2,offset=2,direction=direction,**filters)['items'])==2
+    sql=next(statement for statement in statements if 'SELECT e.*,s.name AS source' in statement)
+    with transaction(catalog) as conn:
+        plan=[row['detail'] for row in conn.execute('EXPLAIN QUERY PLAN '+sql)]
+    assert any('INTEGER PRIMARY KEY' in detail for detail in plan)
+    assert not any('events_source' in detail or 'events_category' in detail for detail in plan)
+
+
+def test_search_filters_and_import_sort_preserve_all_constraints(catalog):
+    page=queries.list_events(catalog,q='searchable fixture',source='source',category='note',
+        start='2024-02-01',end='2024-02-01',sort='imported',direction='asc',limit=1)
+    assert [item['id'] for item in page['items']]==['same-a']
+    assert page['has_more'] is True
+    assert queries.list_events(catalog,q='searchable fixture',source='missing')['total']==0
+    assert {item['id'] for item in queries.list_events(catalog,q='searchable fixture',undated=True)['items']}=={'undated-a','undated-b'}

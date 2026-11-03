@@ -75,7 +75,9 @@ def reapply(path=None, *,source_id=None):
 def _reapply(path=None, *,source_id=None):
     with transaction(path) as conn:
         ensure_schema(conn)
-        sql='SELECT r.* FROM event_enrichments r JOIN events e ON e.id=r.event_id'
+        # Reviews are sparse. Keep them outermost so a source filter cannot
+        # turn reapplication into a scan of every event in that source.
+        sql='SELECT r.* FROM event_enrichments r CROSS JOIN events e ON e.id=r.event_id'
         if source_id:sql+=' WHERE e.source_id=?'
         return sum(_apply(conn,row['event_id'],json.loads(row['payload']))
                    for row in conn.execute(sql,(source_id,) if source_id else ()).fetchall())

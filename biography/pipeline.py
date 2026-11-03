@@ -20,7 +20,8 @@ def dataset_inventory(export_root=None):
         evidence=json.loads(preflight.read_text())
         if evidence.get('status') in ('complete','preflight_complete_header_only') and evidence.get('root')==str(root):
             datasets=[{'name':name,'root':d['path'],'bytes':d['bytes'],'files':d['files']}
-                for name,d in evidence['categories'].items() if Path(d['path']).is_dir()]
+                for name,d in evidence['categories'].items() if Path(d['path']).is_dir()
+                and not any(p.casefold() in settings.excluded_directory_names for p in Path(d['path']).parts)]
             return sorted(datasets,key=lambda d:(d['name'].casefold()=='meta',d['bytes'],d['name']))
     datasets=[]
     if not root.exists():return datasets
@@ -90,6 +91,8 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
     from .storage import ImportPaused
     data_dir=Path(data_dir or settings.data_dir)
     sid=dataset['id'];iid=uuid.uuid4().hex;root=Path(dataset['root'])
+    if any(p.casefold() in settings.excluded_directory_names for p in root.parts):
+        raise ValueError('Dataset is inside an excluded directory')
     paths=[]
     for base,dirs,names in os.walk(root,followlinks=False):
         dirs[:]=sorted(d for d in dirs if d.casefold() not in settings.excluded_directory_names and not Path(base,d).is_symlink())

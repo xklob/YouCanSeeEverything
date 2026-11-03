@@ -277,6 +277,17 @@ class ImporterTests(unittest.TestCase):
         self.assertFalse(any(r.get("disposition") == "opaque_container"
                              for p in manifests for r in read_manifest(p)))
 
+    def test_direct_excluded_root_is_rejected_before_storage(self):
+        excluded=self.source/'excluded-family'
+        excluded.mkdir()
+        original=excluded/'notes.txt'
+        original.write_text('Private fixture')
+        with self.assertRaisesRegex(IntegrityError,'excluded directory'):
+            self.ingest(original,delete_source=True,allowed_root=self.source,
+                        excluded_directory_names=('EXCLUDED-FAMILY',))
+        self.assertTrue(original.exists())
+        self.assertFalse((self.vault/'manifests').exists())
+
     def test_excluded_tar_hardlink_alias_cannot_bypass_exclusion(self):
         archive = self.source / "export.tar"
         with tarfile.open(archive, "w") as tar:

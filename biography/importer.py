@@ -494,6 +494,9 @@ def ingest_path(path: Path, vaultroot: Path, *, delete_source: bool = False,
     """
     path = Path(os.path.abspath(path))
     vaultroot = Path(os.path.abspath(vaultroot))
+    excluded_parts={name.casefold() for name in excluded_directory_names}
+    if any(part.casefold() in excluded_parts for part in path.parts):
+        raise IntegrityError("Import source is inside an excluded directory")
     if delete_source and allowed_root is None:
         raise IntegrityError("Source deletion requires an explicit allowed_root")
     if path.is_symlink():

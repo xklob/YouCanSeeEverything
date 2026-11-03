@@ -441,7 +441,9 @@ export default function CoverageWorkspace({
                   Daily view
                 </h3>
                 <span>
-                  {humanize(report.indexing.daily.status || "not supplied")}
+                  {report.indexing.daily.rebuild_required
+                    ? "Update required"
+                    : humanize(report.indexing.daily.status || "not supplied")}
                 </span>
                 <dl>
                   <div>
@@ -469,6 +471,9 @@ export default function CoverageWorkspace({
                     <dd>{humanize(report.indexing.coverage_stats.status)}</dd>
                   </div>
                 </dl>
+                {report.indexing.daily.rebuild_required && (
+                  <p>The daily view needs an update after record changes. Browse Records for the current archive.</p>
+                )}
                 <p>Positions are not record counts.</p>
               </div>
               <div className="coverage-backup">

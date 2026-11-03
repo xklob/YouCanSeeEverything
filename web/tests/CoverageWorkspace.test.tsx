@@ -119,6 +119,17 @@ it('distinguishes current archive verification from completed inputs and shows a
   expect(screen.getByRole('progressbar', {name: 'Example archive: input files'}).getAttribute('aria-valuenow')).toBe('50');
 });
 
+it('shows an invalidated daily view as needing an update even if its previous build caught up', async () => {
+  const data = {...report, indexing: {...report.indexing, daily: {
+    ...report.indexing.daily, status: 'caught_up', rebuild_required: true,
+  }}};
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(data))));
+  render(<CoverageWorkspace refreshKey={0} onBrowseSource={() => {}} />);
+  expect(await screen.findByText('Update required')).toBeTruthy();
+  expect(screen.queryByText('Caught up')).toBeNull();
+  expect(screen.getByText(/Browse Records for the current archive/)).toBeTruthy();
+});
+
 it("sorts the full coverage source inventory without changing execution queue order", async () => {
   const user = userEvent.setup();
   const sample = report.sources[0];

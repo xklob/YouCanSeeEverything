@@ -374,6 +374,20 @@ def test_live_wal_cut_includes_committed_but_excludes_uncommitted_rows(tmp_path)
         writer.close()
 
 
+def test_prepared_read_snapshot_can_be_copied_after_later_writer_commit(tmp_path, monkeypatch):
+    database, vault, _ = seed(tmp_path)
+    original_connect = backups._connect
+    prepared = original_connect(database)
+    prepared.execute("BEGIN")
+    assert prepared.execute("SELECT count(*) FROM events").fetchone()[0] == 2
+    with sqlite3.connect(database) as writer:
+        writer.execute("INSERT INTO events(id,source_id,title,category,created_at) VALUES(?,?,?,?,?)",
+                       ("later", "source", "Committed after read snapshot", "note", "2024-01-01"))
+    monkeypatch.setattr(backups, "_connect", lambda path: prepared if path == database else original_connect(path))
+    result = create(database, vault, tmp_path / "backup")
+    assert result["watermark"]["counts"]["events"] == 2
+
+
 def test_low_space_pauses_before_cut_and_resume_restarts_only_incomplete_cut(tmp_path):
     database, vault, _ = seed(tmp_path)
     output = tmp_path / "backup"

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "../src/App";
+vi.mock("../src/maps/LeafletCanvas", () => ({ default: () => null }));
 
 const event = {
   id: "record-one",
@@ -31,6 +32,8 @@ const fetchMock = vi.fn(
     requests.push({ path, options });
     let data: unknown;
     if (path === "/api/overview") data = overview;
+    else if (path === "/api/map-config")
+      data = { provider: "openstreetmap", google_maps_configured: false };
     else if (path === "/api/sources")
       data = {
         items: [
@@ -45,7 +48,8 @@ const fetchMock = vi.fn(
           },
         ],
       };
-    else if (path.startsWith("/api/map?")) data = { items: [], total: 0 };
+    else if (path.startsWith("/api/map?") || path.startsWith("/api/trips?"))
+      data = { items: [], total: 0 };
     else if (path === "/api/imports") data = { items: [] };
     else if (path === "/api/jobs") data = { items: [] };
     else if (path === "/api/session") data = { token: "test-session-token" };

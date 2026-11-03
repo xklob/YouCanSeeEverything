@@ -61,21 +61,29 @@ def fixture_api(path: str) -> dict:
              {"file_id": "qa-image", "url": "/api/files/qa-image/media", "mime": "image/png", "kind": "image", "caption": "Synthetic attached image"},
              {"file_id": "qa-video", "url": "/api/files/qa-video/media", "mime": "video/webm", "kind": "video", "caption": "Synthetic attached video"},
              {"file_id": "qa-missing", "url": "/api/files/qa-missing/media", "mime": "image/png", "kind": "image", "caption": "Synthetic unavailable image"}]},
+        {"id": "qa-cedar", "title": "Cedar acceptance stop", "body": "An earlier explicitly recorded stop, outside the map point page.",
+         "occurred_at": "2024-04-04T12:00:00Z", "source_id": "qa-one", "source": "QA journal",
+         "category": "location", "time_precision": "second"},
     ]
-    sources = [dict(id=f"qa-{suffix}", name=name, status="complete", file_count=1,
-                    event_count=1, bytes=128, first_event=record["occurred_at"],
-                    last_event=record["occurred_at"], notes=[])
-               for suffix, name, record in zip(("one", "two"), ("QA journal", "QA calendar"), records)]
+    sources = []
+    for suffix, name in (("one", "QA journal"), ("two", "QA calendar")):
+        own = [record for record in records if record["source_id"] == f"qa-{suffix}"]
+        sources.append(dict(id=f"qa-{suffix}", name=name, status="complete", file_count=len(own),
+                            event_count=len(own), bytes=128 * len(own),
+                            first_event=min(record["occurred_at"] for record in own),
+                            last_event=max(record["occurred_at"] for record in own), notes=[]))
     if parsed.path == "/api/overview":
-        return dict(total_events=2, sources_count=2, files_count=2, stored_bytes=256,
-                    date_range={"start": records[1]["occurred_at"], "end": records[0]["occurred_at"]},
-                    activity=[{"month": r["occurred_at"][:7], "count": 1} for r in records],
-                    categories=[{"name": r["category"], "count": 1} for r in records], undated_count=0)
+        return dict(total_events=3, sources_count=2, files_count=3, stored_bytes=384,
+                    date_range={"start": records[2]["occurred_at"], "end": records[0]["occurred_at"]},
+                    activity=[{"month": "2024-04", "count": 3}],
+                    categories=[{"name": "location", "count": 2}, {"name": "post", "count": 1}], undated_count=0)
     if parsed.path == "/api/sources":
         return {"items": sources}
     if parsed.path in {"/api/imports", "/api/jobs"}:
         return {"items": []}
-    if parsed.path in {"/api/events", "/api/map"}:
+    if parsed.path == "/api/map-config":
+        return {"provider": "openstreetmap", "google_maps_configured": False}
+    if parsed.path in {"/api/events", "/api/map", "/api/trips"}:
         selected = records
         for key, field in (("source", "source_id"), ("category", "category")):
             if params.get(key, [""])[0]:
@@ -89,12 +97,22 @@ def fixture_api(path: str) -> dict:
                               ("to", lambda date, value: date[:10] <= value)):
             if params.get(key, [""])[0]:
                 selected = [r for r in selected if relation(r["occurred_at"], params[key][0])]
+        if parsed.path == "/api/trips":
+            items = []
+            if {"qa-cedar", "qa-alder"}.issubset({record["id"] for record in selected}):
+                stops = [dict(id=point_id, event_id=record["id"], latitude=latitude, longitude=longitude,
+                              occurred_at=record["occurred_at"], time_precision="second", title=record["title"], source=record["source"])
+                         for record, point_id, latitude, longitude in [(records[2], "qa-cedar-point", 37.58, -77.46), (records[0], "qa-point", 37.54, -77.44)]]
+                items = [{"id": "qa-independent-trip", "source": "QA journal", "from": stops[0], "to": stops[1],
+                          "departure_at": stops[0]["occurred_at"], "arrival_at": stops[1]["occurred_at"],
+                          "distance_km": 4.8, "gap_hours": 24, "inferred": True, "geometry_type": "straight_line"}]
+            return {"items": items, "total": len(items), "truncated": False, "gaps": [], "gaps_total": 0}
         if parsed.path == "/api/map":
             points = [dict(id="qa-point", event_id=r["id"], latitude=37.54, longitude=-77.44,
                            occurred_at=r["occurred_at"], title=r["title"], source=r["source"],
                            kind="explicit_coordinates", time_precision="second")
                       for r in selected if r["id"] == "qa-alder"]
-            return {"items": points, "total": len(points)}
+            return {"items": points, "total": sum(record["id"] in {"qa-alder", "qa-cedar"} for record in selected)}
         selected = sorted(selected, key=lambda r: r["occurred_at"],
                           reverse=params.get("sort", ["desc"])[0] != "asc")
         offset, limit = int(params.get("offset", [0])[0]), int(params.get("limit", [40])[0])
@@ -118,7 +136,7 @@ class CandidateServer(ThreadingHTTPServer):
 
     def api(self, path: str) -> dict:
         # Do not expose a session token or download private file objects to candidate code.
-        if not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map)(/[^/?]+)?", urlsplit(path).path):
+        if not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|map-config)(/[^/?]+)?", urlsplit(path).path):
             raise ValueError("Endpoint is outside the read-only acceptance API")
         if self.upstream is None:
             return fixture_api(path)
@@ -330,6 +348,10 @@ def run(args: argparse.Namespace, report: dict) -> None:
             passed("default_map_renders_api_state", recorded_points=points["total"])
 
             if args.fixture:
+                provider = page.get_by_role("combobox", name="Map provider", exact=True)
+                expect(provider).to_have_value("openstreetmap")
+                expect(provider.get_by_role("option", name="Google Maps · not configured", exact=True)).to_have_js_property("disabled", True)
+                passed("osm_is_default_and_unconfigured_google_cannot_load")
                 location_article = workspace.get_by_role("article").filter(has=page.get_by_role("heading", name="Alder acceptance visit", exact=True))
                 context_article = workspace.get_by_role("article").filter(has=page.get_by_role("heading", name="Birch practice session", exact=True))
                 expect(location_article.get_by_text("Selected location record", exact=True)).to_be_visible()
@@ -367,6 +389,33 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 expect(page.get_by_role("dialog").get_by_role("link", name=re.compile("Open original file"))).to_have_attribute("href", "/api/files/qa-file-qa-alder/download")
                 page.keyboard.press("Escape")
                 passed("map_evidence_opens_original_selected_record")
+
+                connections = page.get_by_role("checkbox", name="Inferred trip connections", exact=True)
+                expect(connections).to_be_checked()
+                expect(workspace.get_by_text("Recorded stops", exact=True)).to_be_visible()
+                expect(workspace.get_by_text("Inferred connection", exact=True).first).to_be_visible()
+                trip_summary = workspace.get_by_text("Browse 1 inferred connections", exact=True)
+                expect(trip_summary).to_be_visible()
+                trip_summary.click()
+                workspace.get_by_role("button", name=re.compile("Cedar acceptance stop.*Alder acceptance visit")).click()
+                trip_detail = page.get_by_role("region", name="Inferred trip connection details", exact=True)
+                expect(trip_detail).to_be_visible()
+                expect(trip_detail.get_by_text("The route and mode of travel are not recorded.", exact=False)).to_be_visible()
+                trip_detail.get_by_role("button", name="Open original event", exact=True).first.click()
+                expect(page.get_by_role("dialog").get_by_role("heading", name="Cedar acceptance stop", exact=True)).to_be_visible()
+                expect(page.get_by_role("dialog").get_by_role("link", name=re.compile("Open original file"))).to_have_attribute("href", "/api/files/qa-file-qa-cedar/download")
+                page.keyboard.press("Escape")
+                page.get_by_role("button", name="Close inferred connection", exact=True).click()
+                passed("trip_index_endpoint_evidence_is_independent_of_map_point_page")
+                connections.uncheck()
+                expect(trip_summary).to_have_count(0)
+                connections.check()
+                expect(trip_summary).to_be_visible()
+                passed("trip_toggle_and_legend_distinguish_inference_from_recorded_stops")
+                if not (all(record["id"].startswith("qa-") for record in initial["items"]) and
+                        all(source["id"].startswith("qa-") for source in sources)):
+                    raise AssertionError("Synthetic acceptance data escaped its fixture namespace")
+                passed("fixture_data_uses_only_synthetic_record_and_source_ids")
 
                 filters = page.get_by_role("button", name=re.compile(r"^filters", re.I))
                 if filters.get_attribute("aria-expanded") != "true":

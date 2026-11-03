@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
 import json
@@ -27,6 +27,8 @@ class Settings:
     account_key: str = str(PROFILE.get("account_key", "owner"))
     excluded_directory_names: tuple[str, ...] = tuple(str(x).casefold() for x in PROFILE.get("excluded_directory_names", []))
     reserve_bytes: int = int(os.environ.get("BIOGRAPHY_RESERVE_BYTES", str(20 * 1024**3)))
+    # Browser-restricted key stays outside profiles, source control and builds.
+    google_maps_api_key: str = field(default=os.environ.get("BIOGRAPHY_GOOGLE_MAPS_API_KEY", "").strip(), repr=False)
 
     @property
     def database(self):

@@ -1,13 +1,30 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import L from "leaflet";
 import userEvent from "@testing-library/user-event";
 import MapWorkspace, { recordedDay } from "../src/MapWorkspace";
 import MediaGallery from "../src/MediaGallery";
 import type { MapLocation } from "../src/api";
+import {
+  withTripEndpoints,
+  tripDisplayPath,
+  type TripConnection,
+} from "../src/maps/types";
 
 const { tileLayer, maps } = vi.hoisted(() => ({
   tileLayer: vi.fn(),
   maps: [] as unknown[],
+}));
+const { googleCanvas } = vi.hoisted(() => ({ googleCanvas: vi.fn() }));
+vi.mock("../src/maps/GoogleCanvas", () => ({
+  default: (props: { onFailure: () => void }) => {
+    googleCanvas(props);
+    return (
+      <div aria-label="Mock Google map">
+        <button onClick={props.onFailure}>Simulate Google failure</button>
+      </div>
+    );
+  },
 }));
 vi.mock("leaflet", () => {
   const chain = () => {
@@ -24,9 +41,12 @@ vi.mock("leaflet", () => {
       "panTo",
       "fitBounds",
       "invalidateSize",
+      "setLatLng",
     ])
       self[key] = vi.fn(() => self);
     self.getLatLng = () => ({ lat: 38, lng: -77 });
+    self.getCenter = () => ({ lat: 38, lng: -77 });
+    self.createPane = () => ({ style: {} });
     return self;
   };
   tileLayer.mockImplementation(chain);
@@ -39,6 +59,7 @@ vi.mock("leaflet", () => {
       }),
       tileLayer,
       circleMarker: vi.fn(chain),
+      polyline: vi.fn(chain),
       layerGroup: vi.fn(chain),
       latLngBounds: vi.fn((values) => values),
     },
@@ -74,6 +95,7 @@ const filters = {
 let requests: string[];
 beforeEach(() => {
   requests = [];
+  localStorage.clear();
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -86,32 +108,37 @@ beforeEach(() => {
     vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
       requests.push(path);
-      const data = path.startsWith("/api/map?")
-        ? { items: [point, second], total: 2 }
-        : {
-            items: [
-              {
-                id: "post-record",
-                title: "A post on the same day",
-                body: "This has no recorded location.",
-                occurred_at: point.occurred_at,
-                source: "Post archive",
-                category: "post",
-                media: [
-                  {
-                    file_id: "image-file",
-                    url: "/api/files/image-file/media",
-                    mime: "image/jpeg",
-                    kind: "image",
-                    caption: "An attached photo",
-                  },
-                ],
-              },
-            ],
-            total: 1,
-            limit: 20,
-            offset: 0,
-          };
+      const data =
+        path === "/api/map-config"
+          ? { provider: "openstreetmap", google_maps_configured: false }
+          : path.startsWith("/api/trips?")
+            ? { items: [], total: 0, truncated: false, gaps: [] }
+            : path.startsWith("/api/map?")
+              ? { items: [point, second], total: 2 }
+              : {
+                  items: [
+                    {
+                      id: "post-record",
+                      title: "A post on the same day",
+                      body: "This has no recorded location.",
+                      occurred_at: point.occurred_at,
+                      source: "Post archive",
+                      category: "post",
+                      media: [
+                        {
+                          file_id: "image-file",
+                          url: "/api/files/image-file/media",
+                          mime: "image/jpeg",
+                          kind: "image",
+                          caption: "An attached photo",
+                        },
+                      ],
+                    },
+                  ],
+                  total: 1,
+                  limit: 20,
+                  offset: 0,
+                };
       return new Response(JSON.stringify(data));
     }),
   );
@@ -215,4 +242,226 @@ it("embeds retained image and video attachments while refusing external image UR
     screen.getByText("This attachment has no local media file."),
   ).toBeTruthy();
   await waitFor(() => expect(document.querySelectorAll("img").length).toBe(1));
+});
+
+it("draws only backend-provided inferred legs with off-page recorded endpoints and original evidence", async () => {
+  const trip: TripConnection = {
+    id: "leg-one",
+    source: "Location archive",
+    from: {
+      ...point,
+      event_id: point.event_id,
+      title: "Earlier recorded stop",
+    },
+    to: {
+      id: "off-page",
+      event_id: "later-record",
+      latitude: 38.2,
+      longitude: -78.1,
+      occurred_at: "2020-03-15T12:00:00Z",
+      title: "Later recorded stop",
+      time_precision: "day",
+    },
+    gap_hours: 24,
+    distance_km: 99.3,
+    inferred: true,
+    geometry_type: "straight_line",
+  };
+  vi.mocked(fetch).mockImplementation(async (input) => {
+    const path = String(input);
+    requests.push(path);
+    const data = path.startsWith("/api/trips?")
+      ? {
+          items: [trip],
+          total: 12,
+          truncated: true,
+          gaps: [{ reason: "missing_data" }],
+        }
+      : path.startsWith("/api/map?")
+        ? { items: [point], total: 4500 }
+        : { items: [], total: 0, offset: 0, limit: 20 };
+    return new Response(JSON.stringify(data));
+  });
+  const user = userEvent.setup();
+  const open = vi.fn();
+  render(
+    <MapWorkspace
+      filters={{ ...filters, from: "2020-03-01", to: "2020-03-31" }}
+      refreshKey={0}
+      onOpenEvent={open}
+      onShowTimeline={vi.fn()}
+    />,
+  );
+  await waitFor(() => expect(L.polyline).toHaveBeenCalled());
+  expect(L.polyline).toHaveBeenCalledWith(
+    [
+      [37.5, -77.4],
+      [38.2, -78.1],
+    ],
+    expect.objectContaining({
+      dashArray: "2 7",
+      pane: "inferred-trips",
+      weight: 2,
+    }),
+  );
+  expect(L.circleMarker).toHaveBeenCalledWith([38.2, -78.1], expect.anything());
+  expect(screen.getByText(/12 inferred connections/)).toBeTruthy();
+  expect(screen.getByText(/1 gap left unconnected/)).toBeTruthy();
+  const line = vi.mocked(L.polyline).mock.results.at(-1)!.value;
+  const callback = vi
+    .mocked(line.on)
+    .mock.calls.find((call) => call[0] === "click")?.[1];
+  expect(typeof callback).toBe("function");
+  act(() => {
+    (callback as () => void)();
+  });
+  expect(
+    screen.getByRole("region", { name: "Inferred trip connection details" }),
+  ).toBeTruthy();
+  expect(screen.getByText("99.3 km")).toBeTruthy();
+  expect(screen.getByText("1 day")).toBeTruthy();
+  await user.click(
+    screen.getAllByRole("button", { name: "Open original event" })[1],
+  );
+  expect(open).toHaveBeenCalledWith("later-record");
+  await user.click(screen.getByRole("button", { name: "Older points" }));
+  await waitFor(() =>
+    expect(
+      requests.some(
+        (path) => path.startsWith("/api/map?") && path.includes("offset=2000"),
+      ),
+    ).toBe(true),
+  );
+  expect(
+    requests.filter((path) => path.startsWith("/api/trips?")),
+  ).toHaveLength(1);
+  const request = new URL(
+    requests.find((path) => path.startsWith("/api/trips?"))!,
+    "http://localhost",
+  ).searchParams;
+  expect(request.get("from")).toBe("2020-03-01");
+  expect(request.has("offset")).toBe(false);
+  await user.click(
+    screen.getByRole("checkbox", { name: "Inferred trip connections" }),
+  );
+  expect(
+    screen.queryByRole("region", { name: "Inferred trip connection details" }),
+  ).toBeNull();
+  expect(withTripEndpoints([point], [trip])).toHaveLength(2);
+  expect(
+    tripDisplayPath({
+      ...trip,
+      display_path: [
+        [37.5, 179.8],
+        [38.2, 180.2],
+      ],
+    }),
+  ).toEqual([
+    [37.5, 179.8],
+    [38.2, 180.2],
+  ]);
+});
+
+it("keeps recorded stops usable when trips are unavailable and offers a separate retry", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  let failed = true;
+  vi.mocked(fetch).mockImplementation(async (input, options) =>
+    String(input).startsWith("/api/trips?") && failed
+      ? new Response(JSON.stringify({ detail: "Trip index unavailable" }), {
+          status: 503,
+        })
+      : original(input, options),
+  );
+  const user = userEvent.setup();
+  render(
+    <MapWorkspace
+      filters={filters}
+      refreshKey={0}
+      onOpenEvent={vi.fn()}
+      onShowTimeline={vi.fn()}
+    />,
+  );
+  expect(await screen.findByText(/Trip connections unavailable/)).toBeTruthy();
+  expect(
+    await screen.findByRole("button", { name: "View location evidence" }),
+  ).toBeTruthy();
+  failed = false;
+  await user.click(screen.getByRole("button", { name: "Retry connections" }));
+  await waitFor(() =>
+    expect(screen.queryByText(/Trip connections unavailable/)).toBeNull(),
+  );
+  expect(document.querySelector('script[src*="google"]')).toBeNull();
+});
+
+it("defaults to OSM even with a configured Google key and requires selection plus an enabled basemap", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, options) =>
+    String(input) === "/api/map-config"
+      ? new Response(
+          JSON.stringify({
+            provider: "google",
+            google_maps_configured: true,
+            google_maps_api_key: "synthetic-browser-key",
+          }),
+        )
+      : original(input, options),
+  );
+  const user = userEvent.setup();
+  render(
+    <MapWorkspace
+      filters={filters}
+      refreshKey={0}
+      onOpenEvent={vi.fn()}
+      onShowTimeline={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: "View location evidence" });
+  const select = screen.getByRole("combobox", { name: "Map provider" });
+  expect((select as HTMLSelectElement).value).toBe("openstreetmap");
+  expect(googleCanvas).not.toHaveBeenCalled();
+  await user.click(
+    screen.getByRole("checkbox", { name: "OpenStreetMap basemap" }),
+  );
+  await user.selectOptions(select, "google");
+  expect(googleCanvas).not.toHaveBeenCalled();
+  await user.click(
+    screen.getByRole("checkbox", { name: "Google Maps basemap" }),
+  );
+  expect(googleCanvas).toHaveBeenCalled();
+  expect(localStorage.getItem("biography.basemap")).toBe("shown");
+  expect(
+    Object.values(localStorage).some((value) =>
+      String(value).includes("synthetic-browser-key"),
+    ),
+  ).toBe(false);
+  await user.click(
+    screen.getByRole("button", { name: "Simulate Google failure" }),
+  );
+  expect((select as HTMLSelectElement).value).toBe("openstreetmap");
+  expect(
+    screen.getByText(/OpenStreetMap is active with the same recorded stops/),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "View location evidence" }),
+  ).toBeTruthy();
+});
+
+it("shows a disabled Google choice and setup hint when no key is configured", async () => {
+  render(
+    <MapWorkspace
+      filters={filters}
+      refreshKey={0}
+      onOpenEvent={vi.fn()}
+      onShowTimeline={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: "View location evidence" });
+  const option = screen.getByRole("option", {
+    name: "Google Maps · not configured",
+  }) as HTMLOptionElement;
+  expect(option.disabled).toBe(true);
+  expect(
+    screen.getByText(/Add a localhost-restricted browser key/),
+  ).toBeTruthy();
+  expect(googleCanvas).not.toHaveBeenCalled();
 });

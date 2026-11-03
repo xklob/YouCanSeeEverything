@@ -19,6 +19,24 @@ TOKEN=secrets.token_urlsafe(32)
 EXECUTOR=ThreadPoolExecutor(max_workers=1,thread_name_prefix='biography-codex')
 ALLOWED_HOSTS={'localhost','127.0.0.1','[::1]'}
 
+def content_security_policy():
+    directives={
+        'default-src':"'self'",'script-src':"'self'",'style-src':"'self' 'unsafe-inline'",
+        'img-src':"'self' data: blob: https://tile.openstreetmap.org",'font-src':"'self' data:",
+        'connect-src':"'self'",'media-src':"'self' blob:",'object-src':"'none'",
+        'frame-ancestors':"'none'",'base-uri':"'self'",'form-action':"'self'",
+    }
+    if settings.google_maps_api_key:
+        # Official Maps JS domains. No inline scripts or broad script-host wildcard.
+        directives['script-src']+=" https://maps.googleapis.com https://maps.gstatic.com 'unsafe-eval'"
+        directives['style-src']+=' https://fonts.googleapis.com'
+        directives['img-src']+=' https://*.googleapis.com https://*.gstatic.com https://*.google.com https://*.googleusercontent.com'
+        directives['connect-src']+=' https://*.googleapis.com https://*.gstatic.com https://*.google.com data: blob:'
+        directives['font-src']+=' https://fonts.gstatic.com'
+        directives['worker-src']="'self' blob:"
+        directives['frame-src']='https://www.google.com https://maps.google.com'
+    return '; '.join(f'{name} {value}' for name,value in directives.items())
+
 @asynccontextmanager
 async def lifespan(app):
     init_db()
@@ -48,7 +66,7 @@ async def local_boundary(request:Request,call_next):
     response.headers['X-Content-Type-Options']='nosniff'
     response.headers['Referrer-Policy']='strict-origin-when-cross-origin'
     response.headers['Cache-Control']='no-store'
-    response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://tile.openstreetmap.org; font-src 'self' data:; connect-src 'self'; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    response.headers['Content-Security-Policy']=content_security_policy()
     return response
 
 @app.get('/api/session')
@@ -57,6 +75,14 @@ def session():return {'token':TOKEN}
 @app.get('/api/status')
 def status():
     return {'status':'ok','local_only':True,'ai_billing':'existing_codex_sign_in_only','data_dir':str(settings.data_dir)}
+
+@app.get('/api/map-config')
+def map_configuration():
+    # A website-restricted Maps key is necessarily delivered to its browser.
+    # OSM remains the default; returning configuration never loads Google itself.
+    result={'provider':'openstreetmap','google_maps_configured':bool(settings.google_maps_api_key)}
+    if settings.google_maps_api_key:result['google_maps_api_key']=settings.google_maps_api_key
+    return result
 
 @app.get('/api/overview')
 def overview():return queries.overview()
@@ -86,6 +112,13 @@ def event_detail(event_id:str):
     event=queries.event_detail(event_id)
     if event is None:raise HTTPException(404,'Event not found.')
     return event
+
+@app.get('/api/trips')
+def inferred_trips(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),limit:int=Query(2000,ge=1,le=5000),offset:int=Query(0,ge=0),undated:bool=False):
+    from .trips import trip_connections
+    try:
+        return trip_connections(settings.database,q=q,source=source,category=category,start=start,end=end,limit=limit,offset=offset,undated=undated)
+    except ValueError as error:raise HTTPException(400,'Invalid trip filter.') from error
 
 @app.get('/api/files/{file_id}/download')
 def download_file(file_id:str):

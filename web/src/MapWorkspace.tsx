@@ -1,13 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import L from "leaflet";
-import "leaflet/dist/leaflet.css";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowUpRight,
   CalendarDays,
   CircleAlert,
   Compass,
   FileText,
-  Layers3,
   LoaderCircle,
   LocateFixed,
   MapPin,
@@ -23,6 +20,15 @@ import {
   type Page,
 } from "./api";
 import MediaGallery from "./MediaGallery";
+import LeafletCanvas from "./maps/LeafletCanvas";
+import GoogleCanvas from "./maps/GoogleCanvas";
+import {
+  validStop,
+  withTripEndpoints,
+  type TripConnection,
+  type TripsPage,
+  type MapConfig,
+} from "./maps/types";
 
 type MapPage = { items: MapLocation[]; total: number };
 type MapFilters = {
@@ -41,133 +47,74 @@ export function recordedDay(location: MapLocation): string | null {
   return location.occurred_at?.match(/^\d{4}-\d{2}-\d{2}/)?.[0] ?? null;
 }
 
-function LocationCanvas({
-  locations,
-  selectedId,
-  onSelect,
-  tilesEnabled,
-  fitRequest,
+function TripDetails({
+  trip,
+  onOpenEvent,
+  close,
 }: {
-  locations: MapLocation[];
-  selectedId: string;
-  onSelect: (id: string) => void;
-  tilesEnabled: boolean;
-  fitRequest: number;
+  trip: TripConnection;
+  onOpenEvent: (id: string) => void;
+  close: () => void;
 }) {
-  const container = useRef<HTMLDivElement>(null);
-  const map = useRef<L.Map | null>(null);
-  const markers = useRef(new Map<string, L.CircleMarker>());
-  const select = useRef(onSelect);
-  select.current = onSelect;
-  const [tileError, setTileError] = useState(false);
-
-  useEffect(() => {
-    if (!container.current) return;
-    const instance = L.map(container.current, {
-      zoomControl: true,
-      scrollWheelZoom: false,
-      preferCanvas: true,
-    }).setView([20, 0], 2);
-    map.current = instance;
-    const resize = new ResizeObserver(() => instance.invalidateSize());
-    resize.observe(container.current);
-    return () => {
-      resize.disconnect();
-      instance.remove();
-      map.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    const instance = map.current;
-    if (!instance || !tilesEnabled) return;
-    setTileError(false);
-    const layer = L.tileLayer(
-      "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-      {
-        attribution:
-          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-        maxZoom: 19,
-        referrerPolicy: "origin",
-        keepBuffer: 0,
-      },
-    );
-    layer.on("tileerror", () => setTileError(true));
-    layer.addTo(instance);
-    return () => {
-      layer.remove();
-    };
-  }, [tilesEnabled]);
-
-  useEffect(() => {
-    const instance = map.current;
-    if (!instance) return;
-    const group = L.layerGroup().addTo(instance);
-    markers.current.clear();
-    for (const point of locations) {
-      const marker = L.circleMarker([point.latitude, point.longitude], {
-        radius: 6,
-        color: "#ffffff",
-        weight: 2,
-        fillColor: "#3465b4",
-        fillOpacity: 0.8,
-      });
-      const label = document.createElement("span");
-      label.textContent = point.title || "Recorded location";
-      marker.bindTooltip(label, { direction: "top" });
-      marker.on("click", () => select.current(point.id));
-      marker.addTo(group);
-      markers.current.set(point.id, marker);
-    }
-    if (locations.length)
-      instance.fitBounds(
-        L.latLngBounds(
-          locations.map((point) => [point.latitude, point.longitude]),
-        ),
-        { padding: [35, 35], maxZoom: 14, animate: false },
-      );
-    return () => {
-      group.remove();
-      markers.current.clear();
-    };
-  }, [locations, fitRequest]);
-
-  useEffect(() => {
-    for (const [id, marker] of markers.current) {
-      marker.setStyle({
-        fillColor: id === selectedId ? "#ca8a25" : "#3465b4",
-        fillOpacity: id === selectedId ? 1 : 0.8,
-      });
-      marker.setRadius(id === selectedId ? 9 : 6);
-      if (id === selectedId) {
-        marker.bringToFront();
-        map.current?.panTo(marker.getLatLng(), { animate: false });
-      }
-    }
-  }, [selectedId, locations]);
-
+  const gap = Number.isFinite(trip.gap_hours)
+    ? trip.gap_hours >= 24
+      ? `${(trip.gap_hours / 24).toLocaleString("en-US", { maximumFractionDigits: 1 })} ${trip.gap_hours === 24 ? "day" : "days"}`
+      : `${trip.gap_hours.toLocaleString("en-US", { maximumFractionDigits: 1 })} ${trip.gap_hours === 1 ? "hour" : "hours"}`
+    : "Unknown";
   return (
-    <div className="map-canvas-wrap">
-      <div
-        ref={container}
-        className="location-canvas"
-        role="region"
-        aria-label="Map of explicitly recorded locations. Use the recorded locations list to select a point."
-      />
-      {!tilesEnabled && (
-        <div className="basemap-disabled">
-          <Layers3 size={14} />
-          Basemap hidden. Your recorded points remain visible.
-        </div>
-      )}
-      {tilesEnabled && tileError && (
-        <div className="map-tile-error" role="status">
-          <CircleAlert size={13} />
-          Some map tiles are unavailable. Recorded points and the location list
-          still work.
-        </div>
-      )}
-    </div>
+    <section
+      className="trip-details"
+      aria-label="Inferred trip connection details"
+    >
+      <div className="trip-detail-heading">
+        <h3>
+          <span className="legend-trip" />
+          Inferred connection
+        </h3>
+        <button
+          className="icon-button"
+          onClick={close}
+          aria-label="Close inferred connection"
+        >
+          <X size={15} />
+        </button>
+      </div>
+      <p>
+        A straight-line link between recorded stops. The route and mode of
+        travel are not recorded.
+      </p>
+      <div className="trip-endpoints">
+        {(
+          [
+            ["From recorded stop", trip.from, trip.departure_at],
+            ["To recorded stop", trip.to, trip.arrival_at],
+          ] as const
+        ).map(([label, stop, at]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <h4>{stop.title || "Recorded stop"}</h4>
+            <p>{formatDate(at || stop.occurred_at, stop.time_precision)}</p>
+            <button onClick={() => onOpenEvent(stop.event_id)}>
+              Open original event
+              <ArrowUpRight size={12} />
+            </button>
+          </div>
+        ))}
+      </div>
+      <div className="trip-facts">
+        <span>
+          Time between records <strong>{gap}</strong>
+        </span>
+        <span>
+          Straight-line distance{" "}
+          <strong>
+            {Number.isFinite(trip.distance_km)
+              ? `${trip.distance_km.toLocaleString("en-US", { maximumFractionDigits: 1 })} km`
+              : "Unknown"}
+          </strong>
+        </span>
+      </div>
+    </section>
   );
 }
 
@@ -200,6 +147,34 @@ export default function MapWorkspace({
   const [contextLoading, setContextLoading] = useState(false);
   const [contextError, setContextError] = useState("");
   const [dayOffset, setDayOffset] = useState(0);
+  const [tripsEnabled, setTripsEnabled] = useState(true);
+  const [tripsPage, setTripsPage] = useState<TripsPage | null>(null);
+  const [tripsLoading, setTripsLoading] = useState(true);
+  const [tripsError, setTripsError] = useState("");
+  const [tripsRetry, setTripsRetry] = useState(0);
+  const [selectedTripId, setSelectedTripId] = useState("");
+  const [provider, setProvider] = useState<"openstreetmap" | "google">(
+    "openstreetmap",
+  );
+  const [mapConfig, setMapConfig] = useState<MapConfig | null>(null);
+  const [providerError, setProviderError] = useState("");
+  const [googleWasSelected, setGoogleWasSelected] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    api<MapConfig>("/map-config", { signal: controller.signal })
+      .then((config) => {
+        if (!controller.signal.aborted) setMapConfig(config);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted)
+          setMapConfig({
+            provider: "openstreetmap",
+            google_maps_configured: false,
+          });
+      });
+    return () => controller.abort();
+  }, []);
   const { q, source, category, from, to, undated } = filters;
   const filterKey = [q, source, category, from, to, undated].join("\0");
   const [previousFilters, setPreviousFilters] = useState(filterKey);
@@ -252,8 +227,72 @@ export default function MapWorkspace({
     return () => controller.abort();
   }, [q, source, category, from, to, undated, refreshKey, retry, mapOffset]);
 
+  useEffect(() => {
+    if (!tripsEnabled) {
+      setSelectedTripId("");
+      setTripsLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setTripsLoading(true);
+    setTripsError("");
+    setTripsPage(null);
+    setSelectedTripId("");
+    const params = new URLSearchParams({ limit: "2000" });
+    for (const [key, value] of Object.entries({
+      q,
+      source,
+      category,
+      from,
+      to,
+    }))
+      if (value) params.set(key, value);
+    if (undated) params.set("undated", "true");
+    api<TripsPage>(`/trips?${params}`, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        setTripsPage({
+          ...result,
+          items: result.items.filter(
+            (trip) =>
+              trip.inferred === true &&
+              trip.geometry_type === "straight_line" &&
+              validStop(trip.from) &&
+              validStop(trip.to),
+          ),
+        });
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted) setTripsError(cause.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setTripsLoading(false);
+      });
+    return () => controller.abort();
+  }, [
+    q,
+    source,
+    category,
+    from,
+    to,
+    undated,
+    refreshKey,
+    tripsEnabled,
+    tripsRetry,
+  ]);
+
   const locations = useMemo(() => page?.items ?? [], [page]);
-  const selected = locations.find((point) => point.id === selectedId);
+  const trips = useMemo(
+    () => (tripsEnabled ? (tripsPage?.items ?? []) : []),
+    [tripsEnabled, tripsPage],
+  );
+  const canvasLocations = useMemo(
+    () => withTripEndpoints(locations, trips),
+    [locations, trips],
+  );
+  const selectedTrip = trips.find((trip) => trip.id === selectedTripId);
+  const gapCount = tripsPage?.gaps_total ?? tripsPage?.gaps?.length ?? 0;
+  const selected = canvasLocations.find((point) => point.id === selectedId);
   const day = selected ? recordedDay(selected) : null;
   useEffect(() => {
     if (!day) {
@@ -312,15 +351,65 @@ export default function MapWorkspace({
         <Compass size={14} />
         <span>
           Markers come from explicit source coordinates. Same-day posts provide
-          temporal context; their location is not inferred. No routes are drawn.
+          temporal context; their location is not inferred. Dotted links infer
+          connections between recorded stops, not recorded routes.
         </span>
       </div>
-      {loading ? (
+      <div className="trip-controls-row">
+        <label>
+          <input
+            type="checkbox"
+            checked={tripsEnabled}
+            onChange={(event) => setTripsEnabled(event.target.checked)}
+          />
+          Inferred trip connections
+        </label>
+        <div className="map-legend">
+          <span>
+            <i className="legend-stop" />
+            Recorded stops
+          </span>
+          <span>
+            <i className="legend-trip" />
+            Inferred connection
+          </span>
+        </div>
+      </div>
+      {tripsEnabled && (
+        <div className="trip-status" role="status">
+          {tripsLoading ? (
+            "Loading connections from recorded stops…"
+          ) : tripsError ? (
+            <>
+              <span>
+                Trip connections unavailable. Recorded stops remain visible.
+              </span>
+              <button onClick={() => setTripsRetry((value) => value + 1)}>
+                Retry connections
+              </button>
+            </>
+          ) : (
+            <span>
+              {count(tripsPage?.total)} inferred connections
+              {tripsPage?.truncated
+                ? ` · First ${count(trips.length)} shown; narrow the dates to see a smaller period.`
+                : ""}
+              {gapCount
+                ? ` · ${count(gapCount)} ${gapCount === 1 ? "gap" : "gaps"} left unconnected.`
+                : ""}
+              {trips.length === 0
+                ? " Only dated recorded stops can be connected."
+                : ""}
+            </span>
+          )}
+        </div>
+      )}
+      {loading && !page ? (
         <div className="map-loading" role="status">
           <LoaderCircle className="spin" size={22} />
           Finding recorded locations…
         </div>
-      ) : error ? (
+      ) : error && !page ? (
         <div className="notice error" role="alert">
           <CircleAlert size={17} />
           <span>{error}</span>
@@ -328,24 +417,67 @@ export default function MapWorkspace({
             Try again
           </button>
         </div>
-      ) : !locations.length ? (
-        <div className="empty-state">
-          <div className="empty-icon">
-            <MapPin size={26} />
-          </div>
-          <h3>No explicit locations in this selection</h3>
-          <p>
-            Location records with coordinates appear here after import. Ordinary
-            posts are never assigned a location from date alone.
-          </p>
-          <button className="map-timeline-link" onClick={onShowTimeline}>
-            Browse the timeline instead
-            <ArrowUpRight size={14} />
-          </button>
-        </div>
       ) : (
         <>
+          {!canvasLocations.length && (
+            <div className="empty-state map-empty-inline">
+              <div className="empty-icon">
+                <MapPin size={26} />
+              </div>
+              <h3>No explicit locations in this selection</h3>
+              <p>
+                Location records with coordinates appear here after import.
+                Ordinary posts are never assigned a location from date alone.
+              </p>
+              <button className="map-timeline-link" onClick={onShowTimeline}>
+                Browse the timeline instead
+                <ArrowUpRight size={14} />
+              </button>
+            </div>
+          )}
+          {error && (
+            <div className="notice error" role="alert">
+              <CircleAlert size={15} />
+              <span>{error}</span>
+              <button onClick={() => setRetry((value) => value + 1)}>
+                Try again
+              </button>
+            </div>
+          )}
           <div className="map-controls">
+            <label className="map-provider-label">
+              Map provider
+              <select
+                aria-label="Map provider"
+                value={provider}
+                onChange={(event) => {
+                  setProviderError("");
+                  if (
+                    event.target.value === "google" &&
+                    mapConfig?.google_maps_configured &&
+                    mapConfig.google_maps_api_key
+                  ) {
+                    setGoogleWasSelected(true);
+                    setProvider("google");
+                  } else setProvider("openstreetmap");
+                }}
+              >
+                <option value="openstreetmap">OpenStreetMap</option>
+                <option
+                  value="google"
+                  disabled={
+                    !mapConfig?.google_maps_configured ||
+                    !mapConfig.google_maps_api_key
+                  }
+                >
+                  Google Maps
+                  {mapConfig?.google_maps_configured &&
+                  mapConfig.google_maps_api_key
+                    ? ""
+                    : " · not configured"}
+                </option>
+              </select>
+            </label>
             <label>
               <input
                 type="checkbox"
@@ -362,24 +494,109 @@ export default function MapWorkspace({
                   }
                 }}
               />
-              OpenStreetMap basemap
+              {provider === "google"
+                ? "Google Maps basemap"
+                : "OpenStreetMap basemap"}
             </label>
             <button onClick={() => setFitRequest((value) => value + 1)}>
               <LocateFixed size={14} />
               Fit recorded points
             </button>
           </div>
-          <LocationCanvas
-            locations={locations}
-            selectedId={selectedId}
-            onSelect={selectLocation}
-            tilesEnabled={tilesEnabled}
-            fitRequest={fitRequest}
-          />
+          {!mapConfig?.google_maps_configured && (
+            <p className="google-setup-hint">
+              Google Maps is optional. Add a localhost-restricted browser key in
+              the private local configuration to enable it; OpenStreetMap stays
+              the default.
+            </p>
+          )}
+          {providerError && (
+            <div className="provider-fallback-note" role="status">
+              {providerError}
+            </div>
+          )}
+          {provider === "google" &&
+          tilesEnabled &&
+          mapConfig?.google_maps_api_key ? (
+            <GoogleCanvas
+              apiKey={mapConfig.google_maps_api_key}
+              onFailure={() => {
+                setProvider("openstreetmap");
+                setProviderError(
+                  "Google Maps could not load. OpenStreetMap is active with the same recorded stops and inferred connections.",
+                );
+              }}
+              locations={canvasLocations}
+              selectedId={selectedId}
+              onSelect={selectLocation}
+              tilesEnabled={tilesEnabled}
+              fitRequest={fitRequest}
+              trips={trips}
+              selectedTripId={selectedTripId}
+              onSelectTrip={setSelectedTripId}
+            />
+          ) : (
+            <LeafletCanvas
+              locations={canvasLocations}
+              selectedId={selectedId}
+              onSelect={selectLocation}
+              tilesEnabled={tilesEnabled && provider === "openstreetmap"}
+              fitRequest={fitRequest}
+              trips={trips}
+              selectedTripId={selectedTripId}
+              onSelectTrip={setSelectedTripId}
+            />
+          )}
           <p className="map-privacy-note">
-            Basemap requests reveal the viewed map area to OpenStreetMap. Hide
-            the basemap to stop external tile requests. Your posts are not sent.
+            {provider === "google"
+              ? "Google Maps receives the viewed area and coordinates used to render map overlays. Your post text is not sent. Google map loads may use your project quota."
+              : "Basemap requests reveal the viewed map area to OpenStreetMap. Hide the basemap to stop external tile requests. Your posts are not sent."}
+            {googleWasSelected &&
+              " Hiding the basemap removes the Google map; its JavaScript remains loaded until the page is closed."}
           </p>
+          {selectedTrip && (
+            <TripDetails
+              trip={selectedTrip}
+              onOpenEvent={onOpenEvent}
+              close={() => setSelectedTripId("")}
+            />
+          )}
+          {tripsEnabled && trips.length > 0 && (
+            <details className="trip-list">
+              <summary>
+                Browse {count(trips.length)} inferred connections
+              </summary>
+              <p>
+                Chronological recorded stops from the trip index, independent of
+                the point page. Straight lines do not establish the road,
+                transport, or path taken.
+              </p>
+              <div>
+                {trips.slice(0, 200).map((trip) => (
+                  <button
+                    key={trip.id}
+                    className={selectedTripId === trip.id ? "selected" : ""}
+                    onClick={() => setSelectedTripId(trip.id)}
+                  >
+                    <span>
+                      {trip.from.title || "Recorded stop"} →{" "}
+                      {trip.to.title || "Recorded stop"}
+                    </span>
+                    <span>
+                      {formatDate(trip.departure_at || trip.from.occurred_at)} ·{" "}
+                      {count(Math.round(trip.distance_km))} km
+                    </span>
+                  </button>
+                ))}
+              </div>
+              {trips.length > 200 && (
+                <p>
+                  First 200 listed. All loaded connections are on the map;
+                  narrow the date filter for a shorter list.
+                </p>
+              )}
+            </details>
+          )}
           {page && (page.total > locations.length || mapOffset > 0) && (
             <div className="map-limit-note">
               <span>

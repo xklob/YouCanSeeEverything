@@ -5,7 +5,7 @@ from biography.config import Settings
 
 @pytest.fixture
 def client(tmp_path,monkeypatch):
-    local=Settings(data_dir=tmp_path/'vault')
+    local=Settings(data_dir=tmp_path/'vault',google_maps_api_key='')
     monkeypatch.setattr(db,'settings',local)
     monkeypatch.setattr(api,'settings',local)
     with TestClient(api.app,base_url='http://127.0.0.1:8000') as c:yield c
@@ -24,6 +24,52 @@ def test_api_unknown_objects_and_safe_static_boundaries(client):
     assert client.get('/api/not-real').status_code==404
     assert client.get('/api/overview').json()['total_events']==0
     assert 'frame-ancestors' in client.get('/api/status').headers['content-security-policy']
+
+
+def test_map_configuration_is_opt_in_and_browser_key_is_not_status_data(client,monkeypatch):
+    from dataclasses import replace
+    response=client.get('/api/map-config')
+    assert response.json()=={'provider':'openstreetmap','google_maps_configured':False}
+    assert response.headers['cache-control']=='no-store'
+    assert 'google' not in response.headers['content-security-policy']
+    fake_key='synthetic-browser-key-for-api-test'
+    configured=replace(api.settings,google_maps_api_key=fake_key)
+    monkeypatch.setattr(api,'settings',configured)
+    response=client.get('/api/map-config')
+    assert response.json()=={'provider':'openstreetmap','google_maps_configured':True,'google_maps_api_key':fake_key}
+    assert response.headers['cache-control']=='no-store'
+    policy=response.headers['content-security-policy']
+    script_policy=next(item for item in policy.split('; ') if item.startswith('script-src '))
+    assert 'https://maps.googleapis.com' in script_policy
+    assert 'https://maps.gstatic.com' in script_policy
+    assert "'unsafe-inline'" not in script_policy
+    assert fake_key not in repr(configured)
+    assert fake_key not in client.get('/api/status').text
+    assert fake_key not in policy
+    assert client.get('/api/map-config',headers={'host':'rebound.example'}).status_code==403
+
+
+def test_trip_api_validates_filters_and_keeps_full_adjacency(client):
+    import json
+    from biography.locations import reconcile_locations
+    with db.transaction() as conn:
+        conn.execute("INSERT INTO sources(id,name,created_at,updated_at) VALUES('s','Synthetic','now','now')")
+        for index,title in enumerate(('matching first','intervening stop','matching last')):
+            conn.execute("""INSERT INTO events(id,source_id,title,category,occurred_at,end_at,time_precision,metadata,created_at)
+                VALUES(?,'s',?,'place_visit',?,?,'second',?,'now')""",
+                (f'stop-{index}',title,f'2024-06-01T{index*4:02d}:00:00Z',f'2024-06-01T{index*4+1:02d}:00:00Z',
+                 json.dumps({'location':{'latitude':40,'longitude':-73+index}})))
+    reconcile_locations()
+    response=client.get('/api/trips?from=2024-06-01&to=2024-06-01&limit=1')
+    assert response.status_code==200
+    result=response.json()
+    assert result['total']==2 and result['truncated'] and len(result['items'])==1
+    assert result['items'][0]['from']['event_id']=='stop-0'
+    assert result['items'][0]['to']['event_id']=='stop-1'
+    assert client.get('/api/trips?q=matching').json()['total']==0
+    assert client.get('/api/trips?from=2025-01-01').json()['total']==0
+    assert client.get('/api/trips?from=invalid').status_code==400
+    assert client.get('/api/trips?limit=5001').status_code==422
 
 
 def test_media_range_and_map_filters(client):

@@ -4,9 +4,19 @@ A local personal-history archive: import exported data, search one timeline, exp
 
 This is an early, single-user application. It binds to localhost. A public source-code checkout and a separate private profile/data directory are the intended deployment arrangement.
 
+## Preview
+
+These screenshots use entirely fictional records and generated illustrations. The map background is a labeled schematic, not provider imagery. No personal archive was used.
+
+![Unified timeline with fictional journal, calendar and location records](docs/screenshots/timeline.png)
+
+![Recorded places and dotted inferred connections with their supporting evidence](docs/screenshots/map.png)
+
+![A fictional post with inline media and its original-source evidence](docs/screenshots/evidence.png)
+
 ## Run locally
 
-Requirements: Python 3.11+, Node.js 20+, `uv`, and Linux or WSL. Codex features additionally need the Codex CLI signed into ChatGPT, Bubblewrap, and Playwright Chromium. Existing subscription authentication is used; this app does not provision or use a separately billed API key.
+Requirements: Python 3.11+, Node.js 20+, `uv`, and Linux or WSL. Codex features additionally need the Codex CLI signed into ChatGPT, Bubblewrap, and Playwright Chromium. AI features use existing subscription authentication without a separately billed model API key. Google Maps is an optional, separately configured map provider.
 
 ```sh
 uv sync --extra dev
@@ -41,7 +51,8 @@ The parser supports JSON/JSONL, CSV, calendar, text/Markdown, HTML, several docu
 ## Explore and change the dashboard
 
 - Search and filter the timeline by source, category and date; open records to inspect provenance and download retained originals.
-- Use the map for explicit source coordinates. Same-day context is a temporal association, not a claim that a post was written at that place. Map tiles are optional and requested from OpenStreetMap when enabled.
+- Use the map for explicit source coordinates. Same-day context is a temporal association, not a claim that a post was written at that place. OpenStreetMap is the default; the background can be hidden or switched to optional Google Maps after [local setup](docs/google-maps-setup.md).
+- Follow faint dotted connections between adjacent recorded stops. Select a connection to inspect its endpoint records, dates and straight-line distance. Gaps and implausible intervals break connections; lines do not claim the exact route traveled.
 - View explicitly associated local images and videos alongside records. Unresolved or ambiguous media references are not guessed.
 - Ask Codex questions using retrieved evidence, or request a dashboard change. Changes build in an isolated workspace, pass checks and a browser smoke test, then activate atomically. Undo restores the previous UI. UI undo does not delete imported data.
 
@@ -51,7 +62,7 @@ Model processing sends selected imported content to the signed-in cloud model. I
 
 The public repository contains application code, synthetic tests, and generic examples only. Set `BIOGRAPHY_PROFILE` to a JSON file in your private workspace. `BIOGRAPHY_STATE_DIR`, `BIOGRAPHY_DATA_DIR`, and `BIOGRAPHY_EXPORT_ROOT` can override profile paths.
 
-Keep raw objects, live databases, agent logs, screenshots, build artifacts and credentials out of ordinary Git. A private repository can hold configuration, normalized snapshots, analysis, manifests, and dashboard customizations. A records snapshot is not a backup of original media; preserve or separately back up the content-addressed vault.
+Keep raw objects, live databases, agent logs, personal screenshots, build artifacts and credentials out of ordinary Git. A private repository can hold configuration, normalized snapshots, analysis, manifests, and dashboard customizations. A records snapshot is not a backup of original media; preserve or separately back up the content-addressed vault.
 
 ## Validate
 
@@ -66,6 +77,8 @@ uv run python scripts/check_dashboard.py --dist web/dist --fixture --output .loc
 ```
 
 Tests cover source cleanup safety, archive traversal and hardlinks, content readback, identity and timestamp behavior, parsing, localhost API boundaries, and isolated model-driven revisions. Fixture browser checks use synthetic data and block external network requests.
+
+Regenerate the public screenshots with `uv run python scripts/generate_demo_screenshots.py` after building the frontend. Its fixture-only server generates invented records and local artwork, with no live database or external map requests.
 
 ## Scope and roadmap
 

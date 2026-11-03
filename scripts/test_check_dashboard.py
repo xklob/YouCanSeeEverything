@@ -19,17 +19,23 @@ class AcceptanceBoundaryTests(unittest.TestCase):
                 api_origin(value)
 
     def test_synthetic_search_and_filters_reduce_records(self):
-        self.assertEqual(fixture_api("/api/events")["total"], 2)
+        self.assertEqual(fixture_api("/api/events")["total"], 3)
         self.assertEqual(fixture_api("/api/events?q=alder")["total"], 1)
         self.assertEqual(fixture_api("/api/events?source=qa-one&category=activity")["total"], 0)
-        self.assertEqual(fixture_api("/api/events?from=2024-01-01")["total"], 2)
-        self.assertEqual(fixture_api("/api/map")["total"], 1)
+        self.assertEqual(fixture_api("/api/events?from=2024-01-01")["total"], 3)
+        self.assertEqual(fixture_api("/api/map")["total"], 2)
         self.assertEqual(fixture_api("/api/map?category=post")["total"], 0)
         context = fixture_api("/api/events?from=2024-04-05&to=2024-04-05")["items"]
         self.assertEqual(len(context), 2)
         self.assertTrue(all("latitude" not in event for event in context))
         self.assertNotIn("media", next(event for event in context if event["id"] == "qa-alder"))
         self.assertIn("media", next(event for event in context if event["id"] == "qa-birch"))
+        trips = fixture_api("/api/trips")
+        self.assertEqual(trips["total"], 1)
+        self.assertTrue(trips["items"][0]["inferred"])
+        paged_ids = {point["event_id"] for point in fixture_api("/api/map")["items"]}
+        self.assertNotIn(trips["items"][0]["from"]["event_id"], paged_ids)
+        self.assertEqual(fixture_api("/api/trips?category=post")["total"], 0)
 
     def test_candidate_cannot_mutate_get_tokens_download_files_or_follow_symlinks(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -45,7 +51,7 @@ class AcceptanceBoundaryTests(unittest.TestCase):
             origin = f"http://127.0.0.1:{server.server_port}"
             try:
                 with urlopen(origin + "/api/events") as response:
-                    self.assertEqual(json.load(response)["total"], 2)
+                    self.assertEqual(json.load(response)["total"], 3)
                 for path in ("/api/session", "/api/files/id/download"):
                     with self.subTest(path=path), self.assertRaises(HTTPError) as error:
                         urlopen(origin + path)

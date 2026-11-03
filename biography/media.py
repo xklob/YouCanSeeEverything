@@ -26,6 +26,8 @@ from urllib.parse import unquote, urlsplit
 from .config import settings
 from .locations import _connection
 from .storage import FileSnapshot,hash_file,fsync_directory
+from .media_candidates import (ensure_candidate_schema,record_media_candidate,refresh_media_candidates,
+    enqueue_file_candidates,enqueue_manifest_candidates,backfill_media_candidates,media_candidate_status)
 
 INDEX_VERSION = 2
 ASSOCIATION_VERSION = 3
@@ -238,6 +240,7 @@ def ensure_schema(conn_or_path=None):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(media_event_state)")}
         if "evidence_count" not in columns:
             conn.execute("ALTER TABLE media_event_state ADD COLUMN evidence_count INTEGER NOT NULL DEFAULT 0")
+        ensure_candidate_schema(conn)
 
 
 def sniff_media(path: Path, *, original_path="") -> tuple[str | None,str | None]:
@@ -346,6 +349,7 @@ def index_media_files(path=None, *, source_id=None, file_ids=None, refresh=False
             file_count += 1
             available = Path(row["path"]).is_file()
             probe = conn.execute("SELECT mime,kind,probe_status FROM media_object_index WHERE object_hash=?",(row["object_hash"],)).fetchone()
+            had_media=conn.execute('SELECT 1 FROM media_file_index WHERE file_id=?',(row['id'],)).fetchone() is not None
             if probe is None or refresh or probe["probe_status"] == "unavailable" or not available or (row['indexed_version']!=INDEX_VERSION and probe['mime'] is None):
                 mime,kind = sniff_media(Path(row["path"]),original_path=row["original_path"])
                 conn.execute("""INSERT INTO media_object_index(object_hash,mime,kind,probe_status) VALUES(?,?,?,?)
@@ -364,8 +368,9 @@ def index_media_files(path=None, *, source_id=None, file_ids=None, refresh=False
                 for length in range(2,min(len(parts),8)+1):
                     conn.execute("INSERT OR IGNORE INTO media_path_suffixes(file_id,source_id,scope,suffix) VALUES(?,?,?,?)",
                                  (row["id"],row["source_id"],scope,"/".join(parts[-length:])))
-                touched_sources.add(row["source_id"])
                 media_count += 1
+            if mime or had_media:touched_sources.add(row['source_id'])
+            enqueue_file_candidates(conn,row['id'])
             if available:
                 conn.execute("INSERT OR REPLACE INTO media_file_state(file_id,version) VALUES(?,?)",(row["id"],INDEX_VERSION))
             else:
@@ -418,7 +423,7 @@ def _filename_list(value) -> list[str]:
     return result
 
 
-def index_explicit_manifests(path=None, *, source_id=None) -> dict:
+def index_explicit_manifests(path=None, *, source_id=None,file_ids=None) -> dict:
     """Index bounded retained manifests that explicitly name event IDs and files.
 
     A supported entry has references[].fullname/native_id/source_native_id and a
@@ -432,13 +437,23 @@ def index_explicit_manifests(path=None, *, source_id=None) -> dict:
         if source_id:
             clauses.append("f.source_id=?")
             args.append(source_id)
+        if file_ids is not None:
+            selected=list(dict.fromkeys(file_ids))
+            if not selected:return {'manifest_files':0,'manifest_references':0}
+            if len(selected)>800:
+                total={'manifest_files':0,'manifest_references':0}
+                for start in range(0,len(selected),800):
+                    part=index_explicit_manifests(conn,source_id=source_id,file_ids=selected[start:start+800])
+                    for key in total:total[key]+=part[key]
+                return total
+            clauses.append('f.id IN ('+','.join('?' for _ in selected)+')');args.extend(selected)
         rows = conn.execute("""SELECT f.id,f.source_id,f.original_path,o.path FROM files f
             JOIN objects o ON o.sha256=f.object_hash
             LEFT JOIN media_manifest_state st ON st.file_id=f.id WHERE """ + " AND ".join(clauses), args)
         counts = {"manifest_files": 0, "manifest_references": 0}
         touched = set()
         for row in rows:
-            if posixpath.basename(row["original_path"].replace("\\", "/")) != "manifest.json":
+            if posixpath.basename(row["original_path"].rsplit('!',1)[-1].replace("\\", "/")) != "manifest.json":
                 continue
             physical = Path(row["path"])
             if not physical.is_file() or physical.is_symlink():
@@ -479,11 +494,14 @@ def index_explicit_manifests(path=None, *, source_id=None) -> dict:
                 # Source content and error payloads stay private. Unsupported
                 # manifests are retained; they never authorize a guessed link.
                 entries = []
+            old_keys={(old['source_id'],old['native_id']) for old in conn.execute('SELECT source_id,native_id FROM media_manifest_refs WHERE manifest_file_id=?',(row['id'],))}
             conn.execute("DELETE FROM media_manifest_refs WHERE manifest_file_id=?", (row["id"],))
             conn.executemany("INSERT OR IGNORE INTO media_manifest_refs VALUES(?,?,?,?,?,?,?,?)", entries)
             conn.execute("INSERT OR REPLACE INTO media_manifest_state VALUES(?,?,?)", (row["id"], MANIFEST_VERSION, status))
             counts["manifest_references"] += len(entries)
-            if entries:
+            for source,native in old_keys|{(entry[2],entry[3]) for entry in entries}:
+                enqueue_manifest_candidates(conn,source,native)
+            if entries or old_keys:
                 touched.add(row["source_id"])
         for source in touched:
             conn.execute("""INSERT INTO media_source_generation(source_id,generation) VALUES(?,1)
@@ -678,8 +696,13 @@ def _resolve(conn,event,evidence,reference):
 
 
 def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
-                     index_files=True) -> dict:
-    """Reconcile explicit refs after a batch/import; unresolved refs stay visible."""
+                     index_files=True,limit=1000) -> dict:
+    """Drain a bounded sparse candidate queue, never discover by event scan.
+
+    Explicit event_ids refresh touched records and shared evidence. Historical
+    discovery is a separate resumable backfill; a drained queue does not claim
+    the historical catalog or unimported original media is fully covered.
+    """
     with _connection(path) as conn:
         ensure_schema(conn)
         conn.create_function("biography_media_metadata_sha256", 1,
@@ -687,30 +710,42 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
         indexed = index_media_files(conn,source_id=source_id) if index_files else {"files":0,"media_files":0}
         manifests = index_explicit_manifests(conn,source_id=source_id) if index_files else {"manifest_files":0,"manifest_references":0}
         indexed.update(manifests)
-        clauses,args = [],[]
+        clauses,args = [],[];has_more=False
         if source_id:
-            clauses.append("e.source_id=?")
+            clauses.append("c.source_id=?")
             args.append(source_id)
         if event_ids is not None:
             event_ids = list(dict.fromkeys(event_ids))
             if not event_ids:
-                return {**indexed,"events":0,"resolved":0,"unresolved":0}
+                return {**indexed,"events":0,"resolved":0,"unresolved":0,'has_more':False,
+                        'candidate_discovery':media_candidate_status(conn)}
             if len(event_ids)>800:
                 totals = {**indexed,"events":0,"resolved":0,"unresolved":0}
                 for start in range(0,len(event_ids),800):
                     part = reconcile_media(conn,event_ids=event_ids[start:start+800],source_id=source_id,index_files=False)
                     for key in ("events","resolved","unresolved"):
                         totals[key] += part[key]
-                return totals
+                return {**totals,'has_more':False,'candidate_discovery':media_candidate_status(conn)}
+            refresh_media_candidates(conn,event_ids)
             clauses.append("e.id IN (" + ",".join("?" for _ in event_ids) + ")")
             args.extend(event_ids)
         elif not refresh:
-            clauses.append("(st.event_id IS NULL OR st.version<>? OR (st.needs_refresh=1 AND st.generation<>coalesce(g.generation,0)) OR st.evidence_count<>(SELECT count(*) FROM evidence ev WHERE ev.event_id=e.id) OR st.metadata_sha256<>biography_media_metadata_sha256(e.metadata))")
+            clauses.append("(c.dirty=1 OR st.event_id IS NULL OR st.version<>? OR (st.needs_refresh=1 AND st.generation<>coalesce(g.generation,0)) OR st.evidence_count<>(SELECT count(*) FROM evidence ev WHERE ev.event_id=e.id) OR st.metadata_sha256<>biography_media_metadata_sha256(e.metadata))")
             args.append(ASSOCIATION_VERSION)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = conn.execute("""SELECT e.*,coalesce(g.generation,0) AS media_generation FROM events e
+        # CROSS JOIN fixes the driving table: candidates first, catalog IDs via
+        # their existing primary key, even while the catalog has millions of rows.
+        query="""SELECT e.*,coalesce(g.generation,0) AS media_generation FROM media_candidates c
+            CROSS JOIN events e ON e.id=c.event_id
             LEFT JOIN media_event_state st ON st.event_id=e.id
-            LEFT JOIN media_source_generation g ON g.source_id=e.source_id""" + where,args)
+            LEFT JOIN media_source_generation g ON g.source_id=c.source_id""" + where+' ORDER BY c.event_id'
+        if event_ids is None:
+            limit=max(1,min(5000,int(limit)));query+=' LIMIT ?';args.append(limit+1)
+        rows=conn.execute(query,args).fetchall()
+        if event_ids is None:
+            has_more=len(rows)>limit;rows=rows[:limit]
+            eligible=refresh_media_candidates(conn,[row['id'] for row in rows])
+            rows=[row for row in rows if row['id'] in eligible]
         counts = {**indexed,"events":0,"resolved":0,"unresolved":0}
         for event in rows:
             try:
@@ -725,11 +760,11 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
             resolved_hashes = set()
             ordinal = 0
             # Native-ID manifests may arrive later in the same source import.
-            needs_refresh = bool(event["native_id"])
+            needs_refresh = True
             if event["category"] in {"media","document"}:
                 for source_file in evidence:
                     own = conn.execute("SELECT * FROM media_file_index WHERE file_id=?",(source_file["id"],)).fetchone()
-                    if own is not None and (event['category']=='media' or own['mime'] in CONVERTIBLE_IMAGE_TYPES) and own["object_hash"] not in resolved_hashes:
+                    if own is not None and own["object_hash"] not in resolved_hashes:
                         conn.execute("INSERT INTO event_media_refs(event_id,ordinal,reference,caption,file_id,status,match_basis) VALUES(?,?,?,?,?,?,?)",
                                      (event["id"],ordinal,source_file["original_path"],event["title"],own["file_id"],"resolved","direct_source_evidence"))
                         ordinal += 1
@@ -754,8 +789,9 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
             digest = hashlib.sha256((event["metadata"] or "{}").encode()).hexdigest()
             conn.execute("INSERT OR REPLACE INTO media_event_state(event_id,version,generation,needs_refresh,metadata_sha256,evidence_count) VALUES(?,?,?,?,?,?)",
                          (event["id"],ASSOCIATION_VERSION,event["media_generation"],int(needs_refresh),digest,evidence_count))
+            conn.execute('UPDATE media_candidates SET dirty=0 WHERE event_id=?',(event['id'],))
             counts["events"] += 1
-        return counts
+        return {**counts,'has_more':has_more,'candidate_discovery':media_candidate_status(conn)}
 
 
 def media_for_events(event_ids, path=None, *, include_unresolved=False) -> dict:
@@ -818,7 +854,8 @@ def media_file_info(file_id,path=None,*,objects_root=None,preview_root=None):
 
 
 __all__ = ["ensure_schema","index_media_files","index_explicit_manifests","explicit_references","reconcile_media",
-           "media_for_events","media_for_event","media_file_info","sniff_media","SAFE_MIME_TYPES"]
+           "media_for_events","media_for_event","media_file_info","sniff_media","SAFE_MIME_TYPES",
+           "record_media_candidate","refresh_media_candidates","backfill_media_candidates","media_candidate_status"]
 
 
 if __name__=='__main__':

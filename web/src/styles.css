@@ -5237,3 +5237,9 @@ button:hover {
   margin-left: auto;
   margin-right: 14px;
 }
+
+.saved-summary-list {display:grid;gap:8px}
+.saved-summary-list>button {display:grid;gap:5px;text-align:left;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel)}
+.saved-summary-list>button[aria-pressed=true] {border-color:#4778bc;background:#eff5ff}
+.saved-summary-list span,.saved-summary-list small {color:var(--muted);overflow-wrap:anywhere}
+.summary-trip-context {padding:12px;border:1px solid var(--border);border-radius:8px}

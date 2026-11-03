@@ -269,7 +269,8 @@ def test_unknown_persistent_table_is_never_silently_omitted(tmp_path):
         snapshots.export_snapshot(database, tmp_path / "snapshot")
 
 
-@pytest.mark.parametrize("table", ["event_locations", "media_manifest_state", "media_manifest_refs"])
+@pytest.mark.parametrize("table", ["event_locations", "media_manifest_state", "media_manifest_refs",
+                                   "media_candidates", "media_native_keys", "media_candidate_backfill"])
 def test_misnamed_custom_table_cannot_masquerade_as_a_derived_cache(tmp_path, table):
     database, _, _, _, _ = seed(tmp_path)
     with sqlite3.connect(database) as connection:
@@ -296,6 +297,35 @@ def test_known_legacy_media_cache_is_omitted_without_migrating_live_catalog(tmp_
     with sqlite3.connect(restored) as connection:
         assert "evidence_count" in {row[1] for row in connection.execute("PRAGMA table_info(media_event_state)")}
         assert connection.execute("SELECT count(*) FROM media_event_state").fetchone()[0] == 0
+
+
+def test_sparse_media_discovery_is_omitted_and_restored_as_incomplete(tmp_path):
+    from biography import media
+    database,_,_,_,_=seed(tmp_path)
+    with sqlite3.connect(database) as connection:
+        connection.row_factory=sqlite3.Row
+        media.ensure_schema(connection)
+        connection.execute("UPDATE events SET native_id='synthetic-native',metadata=? WHERE id='event-0'",
+                           (json.dumps({'photos':[{'uri':'missing.png'}]}),))
+    media.backfill_media_candidates(database,max_batches=10)
+    before=media.media_candidate_status(database)
+    assert before['discovery_complete_for_watermark']
+    output=tmp_path/'snapshot'
+    snapshots.export_snapshot(database,output)
+    manifest=json.loads((output/'manifest.json').read_text())
+    sparse={'media_candidates','media_native_keys','media_candidate_backfill'}
+    assert sparse.issubset(manifest['derived_tables_not_exported'])
+    restored=tmp_path/'restored.sqlite3'
+    snapshots.restore_snapshot(output,restored)
+    after=media.media_candidate_status(restored)
+    assert after['status']=='not_started' and not after['discovery_complete_for_watermark']
+    with sqlite3.connect(restored) as connection:
+        for table in sparse:
+            assert connection.execute('SELECT count(*) FROM '+table).fetchone()[0]==0
+        assert connection.execute("SELECT native_id FROM events WHERE id='event-0'").fetchone()[0]=='synthetic-native'
+    with sqlite3.connect(database) as connection:
+        assert connection.execute('SELECT count(*) FROM media_candidates').fetchone()[0]==1
+        assert connection.execute('SELECT count(*) FROM media_native_keys').fetchone()[0]==1
 
 
 def test_media_manifest_caches_are_omitted_and_older_snapshots_still_restore(tmp_path):

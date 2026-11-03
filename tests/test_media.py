@@ -157,6 +157,8 @@ class MediaTests(unittest.TestCase):
             for file_id in files:
                 conn.execute("INSERT INTO evidence(event_id,file_id,locator,parser) VALUES(?,?,?,?)",
                              (identity,file_id,"fixture:1","fixture"))
+            media_module.ensure_schema(conn)
+            media_module.record_media_candidate(conn,identity,source,native,None,category,metadata)
 
     def test_meta_explicit_relative_media_resolves_and_unrelated_source_does_not(self):
         self.file("document","export.zip!messages/thread/message_1.json",b"{}")
@@ -294,7 +296,7 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(media_for_event("tweet", self.database), [])
         with connect(self.database) as conn:
             conn.execute("UPDATE events SET metadata=? WHERE id='tweet'", (json.dumps({"Media File Names": "image.png"}),))
-        self.assertEqual(reconcile_media(self.database)["resolved"], 1)
+        self.assertEqual(reconcile_media(self.database,event_ids=['tweet'])["resolved"], 1)
         self.assertEqual(media_for_event("tweet", self.database)[0]["file_id"], "image")
         self.assertEqual(reconcile_media(self.database)["events"], 0)
 

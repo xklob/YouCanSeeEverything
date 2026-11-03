@@ -339,6 +339,25 @@ export interface SummaryCache {
   current_coverage: SummaryCoverage;
   result: PeriodSummary | null;
 }
+export interface TripSummaryContext {
+  trip_id: string; source_id: string; source: string;
+  departure_at: string; arrival_at: string; window_start: string; window_end: string;
+  time_basis: string; notice: string; coincident_notice: string;
+  anchor_event_ids: string[]; coincident_event_ids: string[];
+  anchors_complete: boolean; journey_coverage_complete: boolean;
+}
+export type SavedNarrative = Omit<PeriodSummary, "kind" | "period"> & {
+  kind: "period_summary" | "trip_summary"; period?: string | null;
+  trip_context?: TripSummaryContext;
+};
+export interface SavedSummaryEntry {
+  key: string; kind: SavedNarrative["kind"]; title: string; period: string | null;
+  trip_id: string | null; focus: string; model: string; source_ids: string[];
+  generated_at: string; citation_count: number; evidence_count: number;
+  freshness: "not_checked";
+}
+export interface SavedSummaryPage { items: SavedSummaryEntry[]; limit: number; offset: number; has_more: boolean }
+export interface SavedSummaryResult { status: "saved" | "missing"; freshness?: "not_checked"; result: SavedNarrative | null }
 
 let tokenPromise: Promise<string> | undefined;
 async function sessionToken(): Promise<string> {

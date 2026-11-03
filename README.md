@@ -31,11 +31,12 @@ Put exports in service folders under the profile's `export_root`.
 uv run biography plan
 uv run biography import --source "Example Service"
 uv run biography daily-build
+uv run biography media-build
 ```
 
 Original files are retained by content hash. Identical bytes share one copy. Records keep links to their sources. Unsupported files remain available for later extraction.
 
-The day index resumes where it stopped. Run `daily-build` again after more imports or to continue a large index.
+Day indexing and media discovery resume where they stopped. Repeat `daily-build` and `media-build` to continue, or after more imports.
 
 `--move` deletes export copies only after verified retention. Use it on export folders. Active notes, repositories and application histories should be snapshotted first.
 
@@ -43,9 +44,9 @@ The day index resumes where it stopped. Run `daily-build` again after more impor
 
 - **Records:** search and filter imported entries; view media and source files.
 - **Days:** group entries by day, summarize measurement samples, and expand the underlying records.
-- **Map and Trips:** browse recorded locations and inferred connections. Dashed lines connect known stops; the actual route may be unknown.
+- **Map and Trips:** browse recorded locations, inferred connections and cited trip summaries. Records from the same dates are shown as context; they may be unrelated to the trip.
 - **Imports:** view progress, extraction status, observed dates and gaps.
-- **Ask:** ask questions or generate a cited summary for a day or month. Answers describe selected evidence, not the entire archive.
+- **Ask:** ask questions, generate day or month summaries, and browse saved summaries. Opening a saved result does not run a model.
 
 Records load before archive totals finish counting. Cached counts are labeled. Days may cover only part of the archive while the day index is building.
 

@@ -10,6 +10,7 @@ import { api, count, formatDate } from "./api";
 import { readablePreview } from "./ReadableData";
 import type { TripConnection, TripStop } from "./maps/types";
 import "./TripsWorkspace.css";
+import TripSummary from "./TripSummary";
 
 type EvidenceStop = TripStop & { provenance_total?: number };
 type Journey = {
@@ -368,6 +369,7 @@ export default function TripsWorkspace({
                   </p>
                 </>
               )}
+              {selected && <TripSummary key={selected.id} tripId={selected.id} departure={selected.departure_at} arrival={selected.arrival_at} onOpenEvent={onOpenEvent} />}
               {detailLoading && <p role="status">Loading recorded stops…</p>}
               {detailError && (
                 <p className="trips-error" role="alert">

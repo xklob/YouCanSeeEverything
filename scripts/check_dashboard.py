@@ -228,7 +228,8 @@ class CandidateServer(ThreadingHTTPServer):
 
     def api(self, path: str) -> dict:
         # Do not expose a session token or download private file objects to candidate code.
-        if urlsplit(path).path != "/api/daily/categories" and not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|journeys|map-config|coverage|days|rollups|summaries)(/[^/?]+)?", urlsplit(path).path):
+        special_read = re.fullmatch(r"/api/summaries/saved/[^/?]+", urlsplit(path).path)
+        if not special_read and urlsplit(path).path != "/api/daily/categories" and not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|journeys|map-config|coverage|days|rollups|summaries)(/[^/?]+)?", urlsplit(path).path):
             raise ValueError("Endpoint is outside the read-only acceptance API")
         if urlsplit(path).path == "/api/map-config":
             # The QA proxy port is not the configured browser-key origin. Never
@@ -335,6 +336,74 @@ class CandidateHandler(BaseHTTPRequestHandler):
         self.respond(200, target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream")
 
 
+def run_summary_read_only(page, report, passed, screenshot):
+    """Open persisted real output and trip options, keeping every request GET."""
+    from playwright.sync_api import expect
+
+    report["workflow"] = "live_saved_summary_and_trip_options_read_only"
+    nav = page.get_by_role("complementary", name="Main navigation")
+    nav.get_by_role("button", name=re.compile(r"^Ask\b")).click()
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/api/summaries/library") as listing_response:
+        page.get_by_text("Saved summaries", exact=True).click()
+    listing = listing_response.value.json()
+    candidates = [row for row in listing["items"] if row["kind"] == "period_summary" and row["citation_count"] > 0]
+    if not candidates:
+        raise AssertionError("Live acceptance requires a saved period summary with citations")
+    chosen = candidates[0]
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/api/summaries/saved/"+quote(chosen["key"], safe="")) as saved_response:
+        page.get_by_role("button", name=re.compile("^"+re.escape(chosen["title"]))).click()
+    result = saved_response.value.json()
+    assert result["status"] == "saved" and result["freshness"] == "not_checked"
+    narrative = result["result"]
+    saved = page.get_by_role("region", name="Saved summary", exact=True)
+    expect(saved.get_by_role("heading", name=narrative["title"], exact=True)).to_be_visible()
+    expect(saved.get_by_text("Saved · Sources not checked", exact=True)).to_be_visible()
+    passed("real_saved_period_opens_without_checking_sources_or_generating", period=chosen.get("period"), saved_items=len(listing["items"]))
+    screenshot("saved-period-summary.png")
+
+    citations = saved.get_by_role("button", name=re.compile(r"^Open cited record [1-9][0-9]*$"))
+    expect(citations.first).to_be_visible()
+    ordinal = int(citations.first.get_attribute("aria-label").rsplit(" ", 1)[-1])
+    event_id = narrative["citations"][ordinal-1]
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/api/events/"+quote(event_id, safe="")) as evidence_response:
+        citations.first.click()
+    evidence = evidence_response.value.json()
+    assert evidence["id"] == event_id and evidence.get("provenance")
+    drawer = page.get_by_role("dialog")
+    expect(drawer).to_be_visible()
+    expect(drawer.get_by_role("link", name=re.compile("Open original file")).first).to_have_attribute(
+        "href", "/api/files/"+quote(evidence["provenance"][0]["file_id"], safe="")+"/download")
+    gallery = drawer.get_by_role("region", name="Attached images and videos")
+    attached = evidence.get("media") or []
+    if attached:
+        expect(gallery).to_be_visible()
+    else:
+        expect(gallery).to_have_count(0)
+    passed("real_saved_citation_opens_matching_original_record", associated_media=len(attached))
+    screenshot("saved-citation-evidence.png")
+    page.keyboard.press("Escape")
+    expect(drawer).to_have_count(0)
+
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/api/journeys") as trips_response:
+        nav.get_by_role("button", name="Trips", exact=True).click()
+    journeys = trips_response.value.json()
+    if not journeys.get("items"):
+        raise AssertionError("Live acceptance requires a real inferred trip")
+    selected = page.get_by_role("region", name="Selected trip", exact=True)
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/api/summaries/trip") as cache_response:
+        selected.get_by_text("Summarize this trip", exact=True).click()
+    cache = cache_response.value.json()
+    assert cache["status"] in {"saved", "missing"}
+    expect(selected.get_by_role("combobox", name="Trip summary sources", exact=True)).to_be_visible()
+    expect(selected.get_by_role("combobox", name="Trip summary model", exact=True)).to_be_visible()
+    expect(selected.get_by_role("textbox", name="Trip summary focus", exact=True)).to_be_visible()
+    expect(selected.get_by_text("Opening does not run a model.", exact=False)).to_be_visible()
+    expect(selected.get_by_text("Other records in these dates do not establish trip activity or presence.", exact=False)).to_be_visible()
+    expect(selected.get_by_role("button", name="Generate trip summary", exact=True)).to_be_visible()
+    passed("real_trip_summary_options_open_cache_only_with_temporal_scope", cache_status=cache["status"])
+    screenshot("trip-summary-options.png")
+
+
 def run(args: argparse.Namespace, report: dict) -> None:
     from playwright.sync_api import sync_playwright, expect
 
@@ -343,7 +412,15 @@ def run(args: argparse.Namespace, report: dict) -> None:
     dist = args.dist.resolve()
     if not (dist / "index.html").is_file():
         raise ValueError("Candidate dist must contain index.html")
-    server = CandidateServer(dist, None if args.fixture else api_origin(args.api_url))
+    summary_workflows = getattr(args, "summary_workflows", False)
+    summary_read_only = getattr(args, "summary_read_only", False)
+    if summary_workflows:
+        if not args.fixture:
+            raise ValueError("Summary workflow generation is restricted to synthetic fixtures")
+        from summary_fixtures import summary_fixture_api
+        server = CandidateServer(dist, None, fixture_handler=summary_fixture_api)
+    else:
+        server = CandidateServer(dist, None if args.fixture else api_origin(args.api_url))
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     origin = f"http://127.0.0.1:{server.server_port}"
@@ -446,7 +523,25 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 expect(page.get_by_role("region", name="Timeline results")).to_have_attribute("aria-busy", "false")
                 return payload
 
-            page.goto(origin, wait_until="networkidle")
+            page.goto(origin, wait_until="domcontentloaded" if summary_read_only else "networkidle")
+            if summary_read_only:
+                run_summary_read_only(page, report, passed, screenshot)
+                assert not report["page_errors"] and not report["browser_console_errors"], "Saved summary browser runtime errors occurred"
+                assert not report["blocked_requests"] and not server.violations, "Read-only summary browsing attempted prohibited access"
+                passed("live_summary_browsing_has_no_runtime_errors_mutations_or_outbound_requests")
+                context.close()
+                browser.close()
+                return
+            if summary_workflows:
+                from summary_fixtures import run_summary_acceptance
+                run_summary_acceptance(page, origin, report, passed)
+                screenshot("summaries.png")
+                assert not report["page_errors"] and not report["browser_console_errors"], "Summary browser runtime errors occurred"
+                assert not report["blocked_requests"] and not server.violations, "Summary workflow escaped its synthetic network boundary"
+                passed("summary_workflows_have_no_runtime_errors_or_real_generation")
+                context.close()
+                browser.close()
+                return
             workspace = page.get_by_role("region", name="Map and same-day timeline", exact=True)
             expect(workspace).to_be_visible()
             expect(workspace.get_by_role("heading", name=re.compile(r"^(Locations|Places in your history)$"))).to_be_visible()
@@ -726,7 +821,14 @@ def main() -> int:
     mode.add_argument("--api-url", default="http://127.0.0.1:8000", help="Existing loopback API, GET only")
     parser.add_argument("--output", type=Path, default=Path(".local/browser-acceptance"), help="Private artifact directory")
     parser.add_argument("--timeout", type=int, default=20, help="Browser assertion timeout in seconds")
+    workflows = parser.add_mutually_exclusive_group()
+    workflows.add_argument("--summary-workflows", action="store_true", help="Fixture-only saved-library and simulated trip generation acceptance")
+    workflows.add_argument("--summary-read-only", action="store_true", help="Browse live saved period/citation and trip options without generation")
     args = parser.parse_args()
+    if args.summary_workflows and not args.fixture:
+        parser.error("--summary-workflows requires --fixture")
+    if args.summary_read_only and args.fixture:
+        parser.error("--summary-read-only requires live read-only API mode")
     os.umask(0o077)
     args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(args.output, 0o700)
@@ -734,7 +836,7 @@ def main() -> int:
     started = time.monotonic()
     try:
         run(args, report)
-        if not args.fixture:
+        if not args.fixture and not args.summary_read_only:
             # Actual imports can legitimately contain no map/media yet. Always exercise those
             # branches against safe synthetic records before accepting an automatic revision.
             fixture_args = argparse.Namespace(**vars(args))

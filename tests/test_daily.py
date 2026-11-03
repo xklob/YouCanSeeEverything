@@ -306,7 +306,7 @@ def test_daily_and_rollup_originals_include_readonly_existing_media_links(catalo
             conn.execute('INSERT INTO files(id,source_id,original_path,object_hash,bytes,created_at) VALUES(?,?,?,?,?,?)',(identity,'source-a',name,digest,len(content),'now'))
     with transaction(catalog[0]) as conn:
         for identity,file in [('photo','photo-file'),('reading','document')]:conn.execute('INSERT INTO evidence VALUES(?,?,?,?)',(identity,file,'fixture:1','fixture'))
-    reconcile_media(catalog[0]);build(catalog)
+    reconcile_media(catalog[0],event_ids=['photo','reading']);build(catalog)
     detail=daily.daily_detail('2024-06-01',*catalog)
     assert detail['items'][0]['media'][0]['url']=='/api/files/photo-file/media'
     raw=daily.rollup_records(detail['rollups'][0]['id'],*catalog)

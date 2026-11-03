@@ -108,6 +108,10 @@ def register_source(name: str, roots: list[str], size: int, order: int, path=Non
     return sid
 
 def add_events(conn, source_id, file_id, object_hash, result):
+    from .media import ensure_schema,record_media_candidate
+    ensure_schema(conn)
+    own_media=conn.execute('SELECT mime FROM media_file_index WHERE file_id=?',(file_id,)).fetchone()
+    own_mime=own_media[0] if own_media else None
     count = 0
     for index, event in enumerate(result.events):
         title = str(event.get("title") or "Untitled record")
@@ -132,4 +136,9 @@ def add_events(conn, source_id, file_id, object_hash, result):
         if git_identity and category=='git_commit':
             conn.execute("UPDATE events SET title=?,body=?,category=?,metadata=? WHERE id=? AND category='project_context'",(title,body,category,json.dumps(metadata,ensure_ascii=False),eid))
         conn.execute("INSERT OR IGNORE INTO evidence(event_id,file_id,locator,parser) VALUES(?,?,?,?)",(eid,file_id,locator,result.parser))
+        # Discovery happens while parsed metadata is already in memory. A file
+        # MIME lookup is shared by the whole batch, including large CSV exports.
+        record_media_candidate(conn,eid,source_id,str(native) if native is not None else None,
+            file_id,category,metadata,direct_media=bool(own_mime and category in {'media','document'}),
+            is_new=bool(cursor.rowcount))
     return count

@@ -30,7 +30,8 @@ TABLES = ("sources", "imports", "objects", "files", "events", "evidence", "jobs"
 DERIVED_TABLES = frozenset({"event_locations", "location_index_state", "media_object_index",
                           "media_file_index", "media_path_suffixes", "media_file_state",
                           "media_source_generation", "event_media_refs", "media_event_state",
-                          "media_manifest_state", "media_manifest_refs"})
+                          "media_manifest_state", "media_manifest_refs", "media_candidates",
+                          "media_native_keys", "media_candidate_backfill"})
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
 
 

@@ -52,6 +52,7 @@ def worker_lock(data_dir=None):
 
 def index_stored(stored,source_id,import_id,source_name,db_path=None,*,index_content=True):
     from .parsers import parse_file
+    from .media import index_media_files
     if stored.source_path:
         try:
             relative=Path(stored.source_path).relative_to(settings.export_root/source_name)
@@ -65,6 +66,9 @@ def index_stored(stored,source_id,import_id,source_name,db_path=None,*,index_con
         if existing and existing['parse_status'] not in ('pending','error'):return 0
         conn.execute('''INSERT OR IGNORE INTO files(id,source_id,import_id,original_path,object_hash,bytes,locator,metadata,created_at)
           VALUES(?,?,?,?,?,?,?,?,?)''',(fid,source_id,import_id,stored.original_path,stored.sha256,stored.size,chain,json.dumps({'archive_chain':stored.archive_chain,'disposition':stored.disposition,'media_type':stored.media_type,'index_content':index_content}),now()))
+        # Sniff each retained file once before its records are registered. This
+        # lets the event hook recognize direct media without per-record I/O.
+        index_media_files(conn,file_ids=[fid])
     parts=set(re.split(r'[/\\!]',stored.original_path))
     native_document=Path(stored.original_path).suffix.lower() in {'.docx','.odt','.epub','.xlsx','.pptx'}
     supporting_history=(source_name in {'GitHub & local Git','Ethereum mainnet'} and Path(stored.original_path).name not in {'commits.jsonl','transactions.jsonl','token-transfers.jsonl','internal-transactions.jsonl'})
@@ -156,7 +160,9 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
         from .media import reconcile_media
         reapply(db_path,source_id=sid)
         reconcile_locations(db_path,source_id=sid)
-        reconcile_media(db_path,source_id=sid)
+        # File/manifest indexing enqueues sparse candidates; bounded maintenance
+        # resolves them without extending source completion into an event scan.
+        reconcile_media(db_path,source_id=sid,event_ids=[])
         return {'id':iid,'source':dataset['name'],'status':state,'files':completed,'events_added':events,'storage_exceptions':failures,'parse_errors':parse_errors}
     except Exception as error:
         state='paused' if isinstance(error,ImportPaused) else 'failed'
@@ -198,7 +204,7 @@ def _reindex(source_name=None,db_path=None):
         from .media import reconcile_media
         reapply(db_path,source_id=sid)
         reconcile_locations(db_path,source_id=sid)
-        reconcile_media(db_path,source_id=sid)
+        reconcile_media(db_path,source_id=sid,event_ids=[])
     return results
 
 def reindex_files(file_ids,db_path=None):

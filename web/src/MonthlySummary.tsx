@@ -1,19 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  ArrowUpRight,
   CircleAlert,
   LoaderCircle,
   Sparkles,
 } from "lucide-react";
 import {
   api,
-  count,
-  formatDate,
   humanize,
   type Job,
   type PeriodSummary,
   type SummaryCache,
 } from "./api";
+import SummaryView from "./SummaryView";
 
 export default function MonthlySummary({
   day,
@@ -153,23 +151,6 @@ export default function MonthlySummary({
       setSubmitting(false);
     }
   };
-  const cited = (ids: string[]) =>
-    ids.map((id) => (
-      <button
-        key={id}
-        className="summary-citation"
-        onClick={() => onOpenEvent(id)}
-        aria-label={`Open cited record ${result?.citations.indexOf(id)! + 1}`}
-      >
-        <span>
-          {result && result.citations.includes(id)
-            ? result.citations.indexOf(id) + 1
-            : "Source"}
-        </span>
-        <ArrowUpRight size={9} />
-      </button>
-    ));
-  const coverage = result?.coverage || cache?.current_coverage;
   return (
     <details className="monthly-summary-panel">
       <summary>
@@ -262,72 +243,7 @@ export default function MonthlySummary({
             </button>
           </div>
         )}
-        {result && (
-          <article className="period-summary-result">
-            <header>
-              <h4>{result.title}</h4>
-              <span>
-                {result.model} · {formatDate(result.cache.generated_at)}
-              </span>
-            </header>
-            {result.sections?.length ? (
-              result.sections.map((section, index) => (
-                <section key={index}>
-                  <h5>{section.heading}</h5>
-                  {section.sentences.map((sentence, index) => (
-                    <p key={index}>
-                      {sentence.text}
-                      <span className="sentence-citations">
-                        {cited(sentence.citations)}
-                      </span>
-                    </p>
-                  ))}
-                </section>
-              ))
-            ) : (
-              <>
-                <p>{result.answer}</p>
-                <div className="sentence-citations">
-                  {cited(result.citations)}
-                </div>
-              </>
-            )}
-            {result.limitations?.length > 0 && (
-              <ul className="summary-limitations">
-                {result.limitations.map((note, index) => (
-                  <li key={index}>{note}</li>
-                ))}
-              </ul>
-            )}
-          </article>
-        )}
-        {coverage && (
-          <details className="summary-context-coverage">
-            <summary>Summary evidence coverage</summary>
-            <p>
-              {count(coverage.selected_events)} selected records from{" "}
-              {count(coverage.total_events_in_scope)} in scope;{" "}
-              {count(coverage.candidate_events)} retrieval candidates.{" "}
-              {count(coverage.undated_events_excluded)} undated records
-              excluded.
-            </p>
-            <p>
-              Date basis: {humanize(coverage.time_basis)}.{" "}
-              {coverage.retrieval_limited
-                ? "Only selected evidence was summarized."
-                : "Evidence selection is shown below."}
-            </p>
-            {coverage.sources.map((item) => (
-              <p key={item.source_id}>
-                {item.source}: {count(item.selected_events)} selected /{" "}
-                {count(item.total_events)} in scope · {humanize(item.status)}
-              </p>
-            ))}
-            {coverage.limitations?.map((note, index) => (
-              <p key={index}>{note}</p>
-            ))}
-          </details>
-        )}
+        <SummaryView result={result} coverage={result?.coverage || cache?.current_coverage} onOpenEvent={onOpenEvent} />
       </div>
     </details>
   );

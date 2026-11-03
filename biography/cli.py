@@ -27,6 +27,10 @@ def main():
     daily.add_argument('--max-seconds',type=float,default=300)
     daily.add_argument('--batch-size',type=int,default=2000)
     sub.add_parser('daily-status',help='Show day index progress')
+    media=sub.add_parser('media-build',help='Discover and link media in bounded, resumable batches')
+    media.add_argument('--max-seconds',type=float,default=30)
+    media.add_argument('--batch-size',type=int,default=500)
+    sub.add_parser('media-status',help='Show media discovery and linking progress')
     backup=sub.add_parser('backup',help='Retain a fixed catalog, original files and completed import manifests')
     backup.add_argument('destination',type=Path)
     verify=sub.add_parser('backup-verify',help='Read back and verify a backup')
@@ -35,7 +39,7 @@ def main():
     full_restore.add_argument('backup',type=Path)
     full_restore.add_argument('destination',type=Path)
     args=parser.parse_args()
-    if args.command not in {'backup','backup-verify','backup-restore','daily-build','daily-status','restore'}:
+    if args.command not in {'backup','backup-verify','backup-restore','daily-build','daily-status','media-status','restore'}:
         init_db()
     if args.command=='init':print(json.dumps({'database':str(settings.database)}))
     elif args.command in ('plan','import'):
@@ -85,6 +89,17 @@ def main():
     elif args.command=='daily-status':
         from .daily import daily_status
         print(json.dumps(daily_status(settings.database,settings.daily_database),indent=2))
+    elif args.command=='media-build':
+        from .media import backfill_media_candidates,reconcile_media
+        if args.max_seconds<=0 or not 1<=args.batch_size<=800:
+            parser.error('Choose a positive duration and a batch size from 1 to 800.')
+        discovery=backfill_media_candidates(settings.database,batch_size=args.batch_size,
+                                           max_batches=100,max_seconds=args.max_seconds)
+        linked=reconcile_media(settings.database,index_files=False,limit=args.batch_size)
+        print(json.dumps({'discovery':discovery,'linking':linked},indent=2))
+    elif args.command=='media-status':
+        from .media import media_candidate_status
+        print(json.dumps(media_candidate_status(settings.database),indent=2))
     elif args.command=='backup':
         from .backups import create_backup
         result=create_backup(settings.database,settings.data_dir,args.destination,

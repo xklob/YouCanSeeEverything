@@ -54,6 +54,7 @@ import {
   type Source,
   type DailyCategories,
   type StatsSnapshot,
+  type SavedNarrative,
 } from "./api";
 import MapWorkspace from "./MapWorkspace";
 import MediaGallery from "./MediaGallery";
@@ -62,6 +63,8 @@ import DailyWorkspace from "./DailyWorkspace";
 import CoverageWorkspace from "./CoverageWorkspace";
 import ReadableData, { CitedProse, readablePreview } from "./ReadableData";
 import TripsWorkspace from "./TripsWorkspace";
+import SavedSummaries from "./SavedSummaries";
+import SummaryView from "./SummaryView";
 
 type View = "timeline" | "sources" | "coverage" | "assistant" | "trips";
 type Presentation = "map" | "daily" | "timeline";
@@ -1588,6 +1591,7 @@ function Assistant({ onChange }: { onChange: () => void }) {
           <p>Ask about records or change the app.</p>
         </div>
       </div>
+      <SavedSummaries onOpenEvent={setSelectedEvidence} />
       <form className="prompt-composer" onSubmit={submit}>
         <div className="composer-top">
           <div className="mode-switch" role="group" aria-label="Assistant mode">
@@ -1753,6 +1757,8 @@ function JobResult({
     );
   if (result && typeof result === "object") {
     const value = result as Record<string, unknown>;
+    if ((value.kind === "period_summary" || value.kind === "trip_summary") && Array.isArray(value.sections) && value.coverage && value.cache)
+      return <SummaryView result={result as SavedNarrative} onOpenEvent={onEvidence} />;
     if (typeof value.answer === "string") {
       const citations = Array.isArray(value.citations)
         ? value.citations.filter((id): id is string => typeof id === "string")

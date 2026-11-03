@@ -196,6 +196,32 @@ def saved_summary(period:str,source:str='',model:str='gpt-6.1-sol',focus:str=Que
                               source_ids=[source] if source else [],focus=focus,model=model)
     except (ValueError,AgentError) as error:raise HTTPException(400,str(error)) from error
 
+@app.get('/api/summaries/library')
+def summary_library(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0)):
+    from .synthesis import list_saved
+    return list_saved(settings.summaries_dir,limit=limit,offset=offset)
+
+@app.get('/api/summaries/saved/{key}')
+def summary_from_library(key:str):
+    from .synthesis import saved_summary as read_saved
+    try:result=read_saved(key,settings.summaries_dir)
+    except ValueError as error:raise HTTPException(400,'Invalid saved summary key.') from error
+    if result is None:raise HTTPException(404,'Saved summary not found.')
+    return result
+
+@app.get('/api/summaries/trip')
+def saved_trip_summary(trip_id:str,source:str='',model:str='gpt-6.1-sol',focus:str=Query('',max_length=4000)):
+    from .trip_synthesis import trip_summary_status
+    from .agents import AgentError
+    try:return trip_summary_status(trip_id,settings.summaries_dir,settings.database,
+                                   source_ids=[source] if source else [],focus=focus,model=model)
+    except (ValueError,AgentError) as error:raise HTTPException(400,str(error)) from error
+
+@app.get('/api/media/status')
+def media_index_status():
+    from .media import media_candidate_status
+    return media_candidate_status(settings.database)
+
 @app.get('/api/files/{file_id}/download')
 def download_file(file_id:str):
     conn=connect()
@@ -239,7 +265,7 @@ def get_job(job_id:str):
     if not row:raise HTTPException(404,'Task not found.')
     return job_value(row)
 
-def assistant_worker(job_id,prompt,mode,period=None,source_ids=None,model='gpt-6.1-sol'):
+def assistant_worker(job_id,prompt,mode,period=None,source_ids=None,model='gpt-6.1-sol',trip_id=None):
     try:
         with transaction() as conn:conn.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?",(now(),job_id))
         from . import agents,revisions,retrieval,synthesis
@@ -251,6 +277,10 @@ def assistant_worker(job_id,prompt,mode,period=None,source_ids=None,model='gpt-6
         elif mode=='summarize':
             result=synthesis.summarize(period,settings.summaries_dir,settings.database,
                                        source_ids=source_ids,focus=prompt,model=model)
+        elif mode=='summarize_trip':
+            from .trip_synthesis import summarize_trip
+            result=summarize_trip(trip_id,settings.summaries_dir,settings.database,
+                                  source_ids=source_ids,focus=prompt,model=model)
         else:
             result=agents.change_dashboard(prompt,settings.project_root,settings.revisions_dir,model=model)
             checker=settings.project_root/'scripts'/'check_dashboard.py'
@@ -274,25 +304,31 @@ class AssistantRequest(BaseModel):
     period:str|None=None
     source_ids:list[str]=Field(default_factory=list,max_length=100)
     model:str='gpt-6.1-sol'
+    trip_id:str|None=Field(default=None,max_length=64)
 
 @app.post('/api/assistant',status_code=202)
 def assistant(request:AssistantRequest):
     from . import agents,retrieval,synthesis
-    if request.mode not in {'ask','change','summarize'}:raise HTTPException(400,'Unknown task mode.')
+    if request.mode not in {'ask','change','summarize','summarize_trip'}:raise HTTPException(400,'Unknown task mode.')
     try:
         agents._model(request.model)
-        if request.mode=='summarize':
-            synthesis._period(request.period)
+        if request.mode in {'summarize','summarize_trip'}:
+            if request.mode=='summarize':synthesis._period(request.period)
+            elif not request.trip_id or not re.fullmatch(r'[0-9a-f]{64}',request.trip_id):
+                raise ValueError('Choose an existing trip.')
+            elif request.period is not None:
+                raise ValueError('Trip summary dates come from the recorded stops; omit the period.')
             if len(request.prompt)>4000:raise ValueError('A summary focus must be at most 4,000 characters.')
         elif not request.prompt.strip():raise ValueError('Enter a question or change.')
-        if request.mode!='change':retrieval.selection(request.prompt,period=request.period,source_ids=request.source_ids)
+        if request.mode!='change':retrieval.selection('' if request.mode=='summarize_trip' else request.prompt,
+                                                     period=request.period,source_ids=request.source_ids)
     except (ValueError,agents.AgentError) as error:raise HTTPException(400,str(error)) from error
     jid=uuid.uuid4().hex
     with transaction() as conn:
         pending=conn.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
         if pending>=3:raise HTTPException(409,'The local assistant queue is full.')
         conn.execute('INSERT INTO jobs(id,kind,status,prompt,created_at,updated_at) VALUES(?,?,?,?,?,?)',(jid,request.mode,'queued',request.prompt,now(),now()))
-    EXECUTOR.submit(assistant_worker,jid,request.prompt,request.mode,request.period,request.source_ids,request.model)
+    EXECUTOR.submit(assistant_worker,jid,request.prompt,request.mode,request.period,request.source_ids,request.model,request.trip_id)
     return {'id':jid,'status':'queued'}
 
 @app.post('/api/jobs/{job_id}/undo')

@@ -178,3 +178,30 @@ def test_interrupted_serial_import_records_a_pause_and_preserves_input(tmp_path,
         assert json.loads(row['checkpoint'])['raw_complete'] is False
         assert conn.execute('SELECT status FROM sources').fetchone()[0]=='paused'
     assert raw.read_bytes()==b'An immutable fictional note'
+
+
+def test_processed_inputs_distinguish_removed_copies_from_excluded_content_holds(tmp_path, monkeypatch):
+    path, source, _ = catalog(tmp_path)
+    inputs = tmp_path / 'exports' / 'Synthetic export'
+    inputs.mkdir(parents=True)
+    note = inputs / 'note.txt'
+    note.write_bytes(b'An immutable fictional note')
+    archive_path = inputs / 'review.zip'
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('message.txt', 'A fictional message')
+        archive.writestr('excluded.ppk', 'Synthetic excluded attachment, not a key')
+    original = archive_path.read_bytes()
+    monkeypatch.setattr(pipeline, 'settings', Settings(data_dir=tmp_path/'vault',
+        state_dir=tmp_path/'state',export_root=inputs.parent,reserve_bytes=0))
+    result = pipeline.run_dataset({'id':source,'name':'Synthetic export','root':str(inputs)},
+        db_path=path,move=True)
+    assert result['status'] == 'partial'
+    assert not note.exists()
+    assert archive_path.read_bytes() == original
+    with db.transaction(path) as conn:
+        row = conn.execute('SELECT completed_files,checkpoint FROM imports WHERE id=?', (result['id'],)).fetchone()
+        assert row['completed_files'] == 2
+        assert json.loads(row['checkpoint'])['source_cleanup'] == {'removed': 1, 'retained': 1}
+        retained = conn.execute("SELECT o.path FROM files f JOIN objects o ON o.sha256=f.object_hash WHERE f.original_path='review.zip'").fetchone()
+    from pathlib import Path
+    assert Path(retained['path']).read_bytes() == original

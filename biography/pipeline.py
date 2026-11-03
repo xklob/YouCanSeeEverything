@@ -134,6 +134,7 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
         conn.execute('INSERT INTO imports(id,source_id,status,total_files,total_bytes,started_at) VALUES(?,?,?,?,?,?)',(iid,sid,'running',len(paths),sum(p.stat().st_size for p in paths),now()))
         conn.execute("UPDATE sources SET status='importing',updated_at=? WHERE id=?",(now(),sid))
     completed=byte_count=events=failures=0
+    source_cleanup={'removed':0,'retained':0} if move else None
     raw_complete=False
     def index_item(stored):
         allowed=dataset.get('index_files')
@@ -149,7 +150,7 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
                 if time.monotonic()-heartbeat>2:
                     heartbeat=time.monotonic()
                     with write_transaction(db_path) as conn:
-                        conn.execute('UPDATE imports SET events=?,checkpoint=? WHERE id=?',(events,json.dumps(activity.checkpoint()),iid))
+                        conn.execute('UPDATE imports SET events=?,checkpoint=? WHERE id=?',(events,json.dumps({**activity.checkpoint(),'source_cleanup':source_cleanup}),iid))
                 if update.get('event')=='object_verified' and update.get('file'):
                     values=dict(update['file']);values['path']=Path(values['path'])
                     events+=index_item(StoredFile(**values))
@@ -159,9 +160,12 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
                 logical_path=str(source.relative_to(root)),discard_container=str(source) in outer_exports)
             for stored in report.files:events+=index_item(stored)
             if report.status!='complete':failures+=max(1,len(report.exceptions))
+            if source_cleanup is not None:
+                source_cleanup['removed']+=sum(bool(item.get('deleted')) for item in report.source_reports)
+                source_cleanup['retained']+=int(source.exists())
             completed+=1;byte_count+=source_size
             with write_transaction(db_path) as conn:
-                conn.execute('UPDATE imports SET completed_files=?,completed_bytes=?,events=?,checkpoint=? WHERE id=?',(completed,byte_count,events,json.dumps({'last_source':str(source),'last_manifest':str(report.manifest_path),'storage_status':report.status}),iid))
+                conn.execute('UPDATE imports SET completed_files=?,completed_bytes=?,events=?,checkpoint=? WHERE id=?',(completed,byte_count,events,json.dumps({'last_source':str(source),'last_manifest':str(report.manifest_path),'storage_status':report.status,'source_cleanup':source_cleanup}),iid))
             if progress:progress({'source':dataset['name'],'completed_files':completed,'total_files':len(paths),'events':events,'status':report.status})
         with write_transaction(db_path) as conn:
             parse_errors=conn.execute("SELECT count(*) FROM files WHERE source_id=? AND parse_status IN ('error','needs_fallback','partial')",(sid,)).fetchone()[0]

@@ -265,6 +265,7 @@ export interface CoverageReport {
     files: { completed: number; total: number; fraction: number | null };
     bytes: { completed: number; total: number; fraction: number | null };
     events_reported: number;
+    source_cleanup?: { removed: number; retained: number } | null;
     activity?: {
       phase: string;
       label: string;

@@ -130,6 +130,14 @@ it('shows an invalidated daily view as needing an update even if its previous bu
   expect(screen.getByText(/Browse Records for the current archive/)).toBeTruthy();
 });
 
+it('distinguishes processed inputs from copies actually removed', async () => {
+  const data = {...report, active_imports: [{...report.active_imports[0], source_cleanup: {removed: 0, retained: 5}}]};
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json(data)));
+  render(<CoverageWorkspace refreshKey={0} onBrowseSource={() => {}} />);
+  expect(await screen.findByText(/0 export copies removed after verification; 5 kept for review/)).toBeTruthy();
+  expect(screen.getByRole('progressbar', {name: 'Example archive: input files'}).getAttribute('aria-valuenow')).toBe('50');
+});
+
 it("sorts the full coverage source inventory without changing execution queue order", async () => {
   const user = userEvent.setup();
   const sample = report.sources[0];

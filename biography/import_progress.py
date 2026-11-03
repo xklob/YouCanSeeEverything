@@ -80,3 +80,16 @@ def public_activity(checkpoint, *, now=None):
     return {'phase': value['phase'], 'label': PHASES[value['phase']], 'filename': filename,
             'retained_entries': number('retained_entries'), 'progress': progress,
             'updated_at': stamp, 'seconds_since_update': age}
+
+
+def public_cleanup(checkpoint):
+    """Explicit completed-input cleanup counts; old checkpoints stay unknown."""
+    try:
+        value = json.loads(checkpoint) if isinstance(checkpoint, str) else checkpoint
+    except (ValueError, TypeError):
+        return None
+    value = value.get('source_cleanup') if isinstance(value, dict) else None
+    if not isinstance(value, dict) or not all(type(value.get(key)) is int and
+            0 <= value[key] <= 2**63 - 1 for key in ('removed', 'retained')):
+        return None
+    return {key:value[key] for key in ('removed', 'retained')}

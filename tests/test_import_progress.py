@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from biography.import_progress import InputProgress, public_activity
+from biography.import_progress import InputProgress, public_activity, public_cleanup
 from test_coverage import catalog, read
 
 
@@ -38,6 +38,7 @@ def test_coverage_exposes_current_input_without_rewriting_completed_input_totals
     checkpoint = {'current_source': 'C:\\PRIVATE_ROOT_SENTINEL\\export.zip',
         'current_source_bytes': 2000, 'phase': 'source_hash', 'phase_bytes': 1000,
         'retained_entries': 80, 'updated_at': '2025-01-01T00:00:00Z',
+        'source_cleanup': {'removed': 0, 'retained': 1},
         'raw_diagnostic': 'PRIVATE_DIAGNOSTIC_SENTINEL'}
     with sqlite3.connect(path) as conn:
         conn.execute('UPDATE imports SET checkpoint=? WHERE id=?', (json.dumps(checkpoint), 'import-running'))
@@ -47,6 +48,7 @@ def test_coverage_exposes_current_input_without_rewriting_completed_input_totals
     assert active['bytes']['fraction'] == .9
     assert active['activity']['progress']['fraction'] == .5
     assert active['activity']['filename'] == 'export.zip'
+    assert active['source_cleanup'] == {'removed': 0, 'retained': 1}
     assert 'PRIVATE_ROOT_SENTINEL' not in json.dumps(report)
     assert 'PRIVATE_DIAGNOSTIC_SENTINEL' not in json.dumps(report)
 
@@ -57,12 +59,19 @@ def test_unknown_and_invalid_checkpoints_do_not_invent_activity(value):
 
 
 def test_legacy_checkpoint_keeps_known_phase_without_inventing_a_heartbeat():
+    assert public_cleanup({}) is None
     result = public_activity({'current_source': '/private/example.zip', 'phase': 'bytes_written'})
     assert result['label'] == 'Retaining archive contents'
     assert result['progress'] is None
     assert result['updated_at'] is None
     assert result['seconds_since_update'] is None
     assert result['retained_entries'] is None
+
+
+@pytest.mark.parametrize('value',[None, 'not json', [], {'source_cleanup': {'removed': True, 'retained': 1}},
+    {'source_cleanup': {'removed': 1}}, {'source_cleanup': {'removed': -1, 'retained': 2}}])
+def test_missing_or_invalid_cleanup_counters_stay_unknown(value):
+    assert public_cleanup(value) is None
 
 
 def test_invalid_counters_and_future_heartbeats_stay_unknown():

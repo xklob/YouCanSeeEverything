@@ -19,7 +19,7 @@ import time
 from .config import settings
 from .session_sources import sanitize_visible
 from .query_stats import get_catalog_stats
-from .import_progress import public_activity
+from .import_progress import public_activity, public_cleanup
 
 
 ACTIVE = {"queued", "pending", "running", "importing", "processing", "indexing"}
@@ -312,6 +312,7 @@ def coverage_overview(path=None, *, include_months=False, month_limit=120,
             "status": row["status"], "files": _progress(row["completed_files"], row["total_files"]),
             "bytes": _progress(row["completed_bytes"], row["total_bytes"]), "events_reported": row["events"],
             "activity": public_activity(row["checkpoint"]),
+            "source_cleanup": public_cleanup(row["checkpoint"]),
             "started_at": row["started_at"], "error": _safe_error(row["error"], row["status"])})
     report["totals"] = totals
     return report

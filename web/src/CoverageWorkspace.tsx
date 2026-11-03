@@ -227,6 +227,10 @@ export default function CoverageWorkspace({
                       {count(item.events_reported)} records reported by this
                       import
                     </p>
+                    {item.source_cleanup && <p className="coverage-description">
+                      Processed inputs: {count(item.source_cleanup.removed)} export copies removed after verification;{' '}
+                      {count(item.source_cleanup.retained)} kept for review.
+                    </p>}
                     {item.activity && (
                       <div className="coverage-current" aria-label={`${item.source}: current input`}>
                         <strong>{item.activity.label}</strong>

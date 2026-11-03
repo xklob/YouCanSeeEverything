@@ -54,6 +54,9 @@ Existing catalogs need an initial count with `counts-build`; repeat it until com
 
 `--move` deletes export copies only after verified retention. Use it on export folders. Active notes, repositories and application histories should be snapshotted first.
 
+Import cards report processed inputs and verified export-copy removal separately.
+Exports with excluded or unresolved contents remain on disk for review.
+
 ## Browse
 
 - **Records:** search and filter imported entries; view media and source files.

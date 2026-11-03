@@ -35,7 +35,8 @@ def main():
     full_restore.add_argument('backup',type=Path)
     full_restore.add_argument('destination',type=Path)
     args=parser.parse_args()
-    init_db()
+    if args.command not in {'backup','backup-verify','backup-restore','daily-build','daily-status','restore'}:
+        init_db()
     if args.command=='init':print(json.dumps({'database':str(settings.database)}))
     elif args.command in ('plan','import'):
         from .pipeline import dataset_inventory,register_queue,run_dataset,worker_lock

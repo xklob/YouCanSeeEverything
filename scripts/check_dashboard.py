@@ -53,7 +53,7 @@ def fixture_coverage(sources: list[dict]) -> dict:
     rows = []
     for source in sources:
         rows.append({**source, "queue_order": 1, "notes": ["Synthetic acceptance source."],
-            "files": dict(total=4, bytes=1024, by_parse_status={"parsed": 1, "metadata_only": 1, "retained_only": 1, "partial": 1},
+            "files": dict(total=4, bytes=1024, by_parse_status={"parsed": 1, "metadata_only": 1, "retained": 1, "partial": 1},
                           parsed=1, partial=1, metadata_only=1, retained_only=1, empty=0, excluded=0, pending=0, needs_review=1),
             "records": dict(status="current", total=source["event_count"], dated=source["event_count"], undated=0,
                             first_observed=source["first_event"], last_observed=source["last_event"], measured_at=measured_at),

@@ -53,7 +53,7 @@ AI features use the Codex CLI's existing ChatGPT sign-in. Selected source excerp
 
 ## Storage and backups
 
-Keep the profile, database, source vault, credentials and personal screenshots outside this repository. Use a private repository for configuration and reviewed metadata. A metadata snapshot does not include original media. See [backup and restore](docs/backups.md).
+Keep personal data and configuration outside this repository. Metadata snapshots exclude original media. See [backup and restore](docs/backups.md) and [private Git LFS packages](docs/lfs-backups.md).
 
 ## Screenshots
 

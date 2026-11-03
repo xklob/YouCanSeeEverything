@@ -635,6 +635,7 @@ function Timeline({
   ]);
 
   const grouped = useMemo(() => {
+    if (sort === "imported") return page?.items.length ? [{key: "imported", label: "Import order", items: page.items}] : [];
     const groups: { key: string; label: string; items: LifeEvent[] }[] = [];
     for (const event of page?.items ?? []) {
       const key = event.occurred_at?.slice(0, 7) || "unknown";
@@ -656,7 +657,7 @@ function Timeline({
       group.items.push(event);
     }
     return groups;
-  }, [page]);
+  }, [page, sort]);
   const years = useMemo(
     () =>
       [

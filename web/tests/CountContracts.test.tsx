@@ -204,3 +204,31 @@ it("shows a counted lower bound until exact totals arrive, with per-source scope
   expect(card.textContent).not.toContain('(counting)');
   localStorage.clear();
 });
+
+it("preserves import order across interleaved months instead of regrouping the page", async () => {
+  localStorage.clear();
+  const rows = [
+    {...record,id:'a',title:'Sort fixture A',occurred_at:'2024-03-01'},
+    {...record,id:'b',title:'Sort fixture B',occurred_at:'2024-01-01'},
+    {...record,id:'c',title:'Sort fixture C',occurred_at:'2024-03-02'},
+  ];
+  vi.stubGlobal('fetch',vi.fn(async(input)=>{
+    const path=String(input);
+    if(path==='/api/overview')return Response.json(snapshot());
+    if(path==='/api/sources')return Response.json({items:[source()]});
+    if(path.startsWith('/api/events?')) {
+      const params=new URL(path,'http://localhost').searchParams;
+      return Response.json({items:params.get('direction')==='asc'?rows:[...rows].reverse(),total:3,has_more:false,limit:40,offset:0});
+    }
+    return Response.json({items:[]});
+  }));
+  const user=userEvent.setup();render(<App/>);
+  await user.click(within(screen.getByRole('group',{name:'Archive view'})).getByRole('button',{name:'Records',exact:true}));
+  await screen.findByRole('button',{name:/Sort fixture C/});
+  await user.selectOptions(screen.getByLabelText('Records sort'),'imported');
+  const titles=()=>screen.getAllByRole('button',{name:/Sort fixture/}).map(button=>button.querySelector('h3')?.textContent);
+  await waitFor(()=>expect(titles()).toEqual(['Sort fixture C','Sort fixture B','Sort fixture A']));
+  await user.selectOptions(screen.getByLabelText('Records direction'),'asc');
+  await waitFor(()=>expect(titles()).toEqual(['Sort fixture A','Sort fixture B','Sort fixture C']));
+  localStorage.clear();
+});

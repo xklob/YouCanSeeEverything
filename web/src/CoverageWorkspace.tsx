@@ -82,7 +82,11 @@ export default function CoverageWorkspace({
     report?.indexing.daily.watermark_rowid ?? report?.indexing.daily.watermark;
   useEffect(() => {
     const controller = new AbortController();
+    let inFlight = false;
+    let timer: number | undefined;
     const load = async () => {
+      if (controller.signal.aborted || inFlight) return;
+      inFlight = true;
       try {
         const data = await api<CoverageReport>("/coverage", {
           signal: controller.signal,
@@ -94,16 +98,18 @@ export default function CoverageWorkspace({
       } catch (cause) {
         if (!controller.signal.aborted) setError((cause as Error).message);
       } finally {
+        inFlight = false;
         if (!controller.signal.aborted) setLoading(false);
+        if (!controller.signal.aborted)
+          timer = window.setTimeout(() => {
+            void load();
+          }, 30000);
       }
     };
     void load();
-    const timer = window.setInterval(() => {
-      void load();
-    }, 15000);
     return () => {
       controller.abort();
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
     };
   }, [refreshKey, retry]);
   return (

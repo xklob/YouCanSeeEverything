@@ -15,6 +15,7 @@ import {
   count,
   formatDate,
   humanize,
+  hasMore,
   type LifeEvent,
   type MapLocation,
   type Page,
@@ -818,7 +819,15 @@ export default function MapWorkspace({
                     ))}
                   </div>
                   <div className="day-pagination">
-                    <span>{count(sameDay.total)} records this day</span>
+                    <span>
+                      {typeof sameDay.total === "number"
+                        ? `${count(sameDay.total)} records this day`
+                        : `${count(sameDay.items.length)} shown`}
+                      {sameDay.total_status === "stale" ||
+                      sameDay.total_status === "cached"
+                        ? " · cached count"
+                        : ""}
+                    </span>
                     {dayOffset > 0 && (
                       <button
                         onClick={() =>
@@ -828,7 +837,7 @@ export default function MapWorkspace({
                         Previous
                       </button>
                     )}
-                    {dayOffset + 20 < sameDay.total && (
+                    {hasMore(sameDay) && (
                       <button
                         onClick={() => setDayOffset((value) => value + 20)}
                       >

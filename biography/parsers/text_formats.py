@@ -96,7 +96,9 @@ def csv_events(path: Path, source: str, limit: int, *, logical_path: Path | None
             # DictReader's None key stores overflow cells. Preserve them clearly.
             record = {str(k) if k is not None else "extra_columns": v for k, v in row.items()}
             locator = f"csv:row:{index + 2}"
-            if "Text Content" in record and "Date" in record:
+            if all(key in record for key in ("activity_probabilities_start", "activity_probabilities_end", "activity_probabilities")):
+                yield event("Activity probability sample", "Recorded activity probability estimates, not confirmed activities.", locator, when=record.get("activity_probabilities_start"), end=record.get("activity_probabilities_end"), category="measurement", metadata=record, limit=limit)
+            elif "Text Content" in record and "Date" in record:
                 link = record.get("Link", "")
                 match = re.search(r"/status/(\d+)", link)
                 text = record["Text Content"]

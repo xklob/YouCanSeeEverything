@@ -44,6 +44,8 @@ import {
   count,
   formatDate,
   humanize,
+  hasMore,
+  shownRange,
   type ImportRun,
   type Job,
   type LifeEvent,
@@ -51,6 +53,7 @@ import {
   type Page,
   type Source,
   type DailyCategories,
+  type StatsSnapshot,
 } from "./api";
 import MapWorkspace from "./MapWorkspace";
 import MediaGallery from "./MediaGallery";
@@ -127,6 +130,32 @@ function Status({ value }: { value: string }) {
     </span>
   );
 }
+function CountFreshness({ stats }: { stats?: StatsSnapshot }) {
+  if (!stats || stats.status === "current" || stats.status === "ready")
+    return null;
+  const text =
+    stats.status === "cached" || stats.status === "stale"
+      ? "Cached counts"
+      : stats.status === "partial"
+        ? "Partial counts"
+        : stats.status === "refreshing"
+          ? "Counts updating"
+          : stats.status === "pending"
+            ? "Counts pending"
+            : "Counts unavailable";
+  return (
+    <span
+      className="count-freshness"
+      title={
+        stats.measured_at
+          ? `Measured ${formatDate(stats.measured_at)}`
+          : undefined
+      }
+    >
+      {text}
+    </span>
+  );
+}
 
 export default function App() {
   const [view, setView] = useState<View>("timeline");
@@ -147,32 +176,47 @@ export default function App() {
 
   useEffect(() => {
     let live = true;
+    let inFlight = false;
+    let timer: number | undefined;
+    const controller = new AbortController();
     const load = async () => {
-      const responses = await Promise.allSettled([
-        api<Overview>("/overview"),
-        api<{ items: Source[] }>("/sources"),
-        api<{ items: ImportRun[] }>("/imports"),
-      ]);
-      if (!live) return;
-      const [summary, library, progress] = responses;
-      if (summary.status === "fulfilled") setOverview(summary.value);
-      if (library.status === "fulfilled") setSources(library.value.items);
-      if (progress.status === "fulfilled") setImports(progress.value.items);
-      const errors = responses.filter((result) => result.status === "rejected");
-      setLibraryError(
-        errors.length
-          ? "Some archive information could not be loaded. Check that the local server is running."
-          : "",
-      );
-      setLibraryLoading(false);
+      if (!live || inFlight) return;
+      inFlight = true;
+      try {
+        const responses = await Promise.allSettled([
+          api<Overview>("/overview", { signal: controller.signal }),
+          api<{ items: Source[] }>("/sources", { signal: controller.signal }),
+          api<{ items: ImportRun[] }>("/imports", {
+            signal: controller.signal,
+          }),
+        ]);
+        if (!live) return;
+        const [summary, library, progress] = responses;
+        if (summary.status === "fulfilled") setOverview(summary.value);
+        if (library.status === "fulfilled") setSources(library.value.items);
+        if (progress.status === "fulfilled") setImports(progress.value.items);
+        const errors = responses.filter(
+          (result) => result.status === "rejected",
+        );
+        setLibraryError(
+          errors.length
+            ? "Some archive information could not be loaded. Check that the local server is running."
+            : "",
+        );
+        setLibraryLoading(false);
+      } finally {
+        inFlight = false;
+        if (live)
+          timer = window.setTimeout(() => {
+            void load();
+          }, 30000);
+      }
     };
     void load();
-    const timer = window.setInterval(() => {
-      void load();
-    }, 15000);
     return () => {
       live = false;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
+      controller.abort();
     };
   }, [refreshKey]);
 
@@ -230,7 +274,7 @@ export default function App() {
           >
             <MapIcon size={18} />
             <span>Records</span>
-            {overview && (
+            {typeof overview?.total_events === "number" && (
               <span className="nav-count">{count(overview.total_events)}</span>
             )}
           </button>
@@ -285,9 +329,19 @@ export default function App() {
                 <Database size={13} />
               </span>
               <span>{source.name}</span>
-              <span className="source-shortcut-count">
-                {count(source.event_count)}
-              </span>
+              {typeof source.event_count === "number" && (
+                <span
+                  className="source-shortcut-count"
+                  title={
+                    source.stats?.status === "stale" ||
+                    source.stats?.status === "cached"
+                      ? "Cached count"
+                      : undefined
+                  }
+                >
+                  {count(source.event_count)}
+                </span>
+              )}
             </button>
           ))}
           {!sources.length && (
@@ -643,10 +697,15 @@ function Timeline({
         <i />
         <span>
           <CalendarDays size={14} />
-          {overview?.date_range?.start
+          {overview?.date_range &&
+          (overview.date_range.start || overview.date_range.end)
             ? `${formatDate(overview.date_range.start, "year")} – ${formatDate(overview.date_range.end, "year")}`
-            : "No dated records"}
+            : overview?.stats?.status === "current" ||
+                overview?.stats?.status === "ready"
+              ? "No dated records"
+              : "Dates pending"}
         </span>
+        <CountFreshness stats={overview?.stats} />
         <button onClick={onShowSources}>
           View sources <ArrowUpRight size={14} />
         </button>
@@ -709,7 +768,10 @@ function Timeline({
                 : (overview?.categories ?? [])
               ).map((item) => (
                 <option key={item.name} value={item.name}>
-                  {humanize(item.name)} ({count(item.count)})
+                  {humanize(item.name)}
+                  {typeof item.count === "number"
+                    ? ` (${count(item.count)})`
+                    : ""}
                 </option>
               ))}
             </select>
@@ -834,11 +896,21 @@ function Timeline({
               <span>
                 {loading
                   ? "Finding your records…"
-                  : `${count(page?.total)} ${debouncedQuery || activeFilterCount ? "matching " : ""}records`}
+                  : typeof page?.total === "number"
+                    ? `${count(page.total)} ${debouncedQuery || activeFilterCount ? "matching " : ""}records`
+                    : `${count(page?.items.length)} shown`}
                 {debouncedQuery && !loading && (
                   <span className="query-label"> for “{debouncedQuery}”</span>
                 )}
               </span>
+              {page?.total_status && page.total_status !== "current" && (
+                <CountFreshness
+                  stats={{
+                    status: page.total_status,
+                    measured_at: page.counted_at ?? null,
+                  }}
+                />
+              )}
               <button
                 className="sort-button"
                 onClick={() =>
@@ -934,13 +1006,9 @@ function Timeline({
                 </div>
               )
             )}
-            {!loading && !error && page && page.total > PAGE_SIZE && (
+            {!loading && !error && page && (offset > 0 || hasMore(page)) && (
               <div className="pagination">
-                <span>
-                  {count(offset + 1)}–
-                  {count(Math.min(offset + PAGE_SIZE, page.total))} of{" "}
-                  {count(page.total)}
-                </span>
+                <span>{shownRange(page)}</span>
                 <div>
                   <button
                     disabled={offset === 0}
@@ -953,7 +1021,7 @@ function Timeline({
                     Previous
                   </button>
                   <button
-                    disabled={offset + PAGE_SIZE >= page.total}
+                    disabled={!hasMore(page)}
                     onClick={() => {
                       setOffset((value) => value + PAGE_SIZE);
                       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -991,17 +1059,30 @@ function Timeline({
                     onClick={() => setYear(year)}
                   >
                     <span>{year}</span>
-                    <span
-                      className="year-activity"
-                      style={{
-                        width: `${Math.max(8, Math.min(50, ((overview?.activity.filter((item) => item.month.startsWith(year)).reduce((sum, item) => sum + item.count, 0) ?? 0) / Math.max(1, overview?.total_events ?? 1)) * 150))}px`,
-                      }}
-                    />
+                    {typeof overview?.total_events === "number" &&
+                      overview.total_events > 0 &&
+                      overview.activity.every(
+                        (item) => typeof item.count === "number",
+                      ) && (
+                        <span
+                          className="year-activity"
+                          style={{
+                            width: `${Math.max(8, Math.min(50, ((overview?.activity.filter((item) => item.month.startsWith(year)).reduce((sum, item) => sum + (item.count ?? 0), 0) ?? 0) / Math.max(1, overview?.total_events ?? 1)) * 150))}px`,
+                          }}
+                        />
+                      )}
                   </button>
                 ))}
               </div>
             ) : (
-              <p className="rail-empty">No indexed years.</p>
+              <p className="rail-empty">
+                {overview?.stats?.activity_status === "not_computed"
+                  ? "Use date filters."
+                  : overview?.stats?.status === "current" ||
+                      overview?.stats?.status === "ready"
+                    ? "No indexed years."
+                    : "Year counts pending."}
+              </p>
             )}
             <div className="rail-note">
               <BookOpen size={19} strokeWidth={1.4} />
@@ -1277,6 +1358,7 @@ function SourceLibrary({
           <p>Original files and import status.</p>
         </div>
       </div>
+      <CountFreshness stats={overview?.stats} />
       <div className="library-summary">
         <div>
           <Database size={19} />
@@ -1345,10 +1427,14 @@ function SourceLibrary({
                 </div>
                 <div className="source-date-range">
                   <CalendarDays size={13} />
-                  {source.first_event
+                  {source.first_event || source.last_event
                     ? `${formatDate(source.first_event)} – ${formatDate(source.last_event)}`
-                    : "No dated records yet"}
+                    : source.stats?.status === "current" ||
+                        source.stats?.status === "ready"
+                      ? "No dated records"
+                      : "Dates pending"}
                 </div>
+                <CountFreshness stats={source.stats} />
                 {source.notes &&
                   (typeof source.notes === "string"
                     ? source.notes

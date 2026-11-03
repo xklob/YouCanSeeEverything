@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS evidence (
  locator TEXT NOT NULL, parser TEXT NOT NULL,
  PRIMARY KEY(event_id,file_id,locator)
 );
+CREATE INDEX IF NOT EXISTS evidence_file ON evidence(file_id,event_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(title,body,content='events',content_rowid='rowid',tokenize='unicode61 remove_diacritics 2');
 CREATE TRIGGER IF NOT EXISTS events_ai AFTER INSERT ON events BEGIN
  INSERT INTO events_fts(rowid,title,body) VALUES(new.rowid,new.title,new.body);

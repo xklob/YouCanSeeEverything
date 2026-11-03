@@ -49,11 +49,12 @@ export interface Source {
   name: string;
   status: string;
   file_count: number;
-  event_count: number;
+  event_count: number | null;
   bytes: number;
   first_event?: string | null;
   last_event?: string | null;
   notes?: string | string[] | null;
+  stats?: StatsSnapshot;
 }
 export interface ImportRun {
   id: string;
@@ -79,20 +80,35 @@ export interface Job {
   can_undo?: boolean;
 }
 export interface Overview {
-  total_events: number;
-  sources_count: number;
-  files_count: number;
-  stored_bytes: number;
+  total_events: number | null;
+  sources_count: number | null;
+  files_count: number | null;
+  stored_bytes: number | null;
   date_range: { start: string | null; end: string | null };
-  activity: { month: string; count: number }[];
-  categories: { name: string; count: number }[];
-  undated_count?: number;
+  activity: { month: string; count: number | null }[];
+  categories: { name: string; count: number | null }[];
+  undated_count?: number | null;
+  stats?: StatsSnapshot;
+}
+export type TotalStatus =
+  "current" | "cached" | "stale" | "pending" | "unavailable";
+export interface StatsSnapshot {
+  status: TotalStatus | "partial" | "ready" | "refreshing";
+  measured_at: string | null;
+  watermark?: unknown;
+  refreshing?: boolean;
+  activity_status?: string;
+  categories_status?: string;
+  error?: unknown;
 }
 export interface Page<T> {
   items: T[];
-  total: number;
+  total: number | null;
   limit: number;
   offset: number;
+  has_more?: boolean;
+  total_status?: TotalStatus;
+  counted_at?: string | null;
 }
 export interface ProjectionStatus {
   status?: string;
@@ -156,6 +172,7 @@ export interface DailyRollup {
   notes?: string[];
 }
 export interface DaysPage extends Page<DaySummary> {
+  total: number;
   projection: ProjectionStatus;
   q_scope?: string;
 }
@@ -164,6 +181,7 @@ export interface DailyCategories {
   projection: ProjectionStatus;
 }
 export interface DayDetail extends Page<DailyRecord> {
+  total: number;
   day: string;
   summary: DaySummary;
   rollups: DailyRollup[];
@@ -172,6 +190,7 @@ export interface DayDetail extends Page<DailyRecord> {
   rollups_truncated?: boolean;
 }
 export interface RollupPage extends Page<DailyRecord> {
+  total: number;
   rollup: DailyRollup;
   projection: ProjectionStatus;
 }
@@ -392,13 +411,33 @@ export function formatDate(value?: string | null, precision?: string): string {
     timeZone: "UTC",
   });
 }
-export function bytes(value: number): string {
-  if (!value) return "0 B";
+export function bytes(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+    return "Unknown";
+  if (value === 0) return "0 B";
   const unit = Math.min(Math.floor(Math.log(value) / Math.log(1024)), 4);
   return `${(value / 1024 ** unit).toLocaleString("en-US", { maximumFractionDigits: unit ? 1 : 0 })} ${["B", "KB", "MB", "GB", "TB"][unit]}`;
 }
-export function count(value?: number): string {
-  return (value ?? 0).toLocaleString("en-US");
+export function count(value?: number | null): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toLocaleString("en-US")
+    : "Unknown";
+}
+export function hasMore(
+  page: Pick<Page<unknown>, "total" | "items" | "offset" | "has_more">,
+): boolean {
+  return typeof page.has_more === "boolean"
+    ? page.has_more
+    : typeof page.total === "number" &&
+        page.offset + page.items.length < page.total;
+}
+export function shownRange(
+  page: Pick<Page<unknown>, "items" | "offset" | "total" | "total_status">,
+): string {
+  if (!page.items.length) return "No records shown";
+  const start = page.items.length ? page.offset + 1 : 0;
+  const end = page.offset + page.items.length;
+  return `${count(start)}–${count(end)}${typeof page.total === "number" ? (page.total_status === "cached" || page.total_status === "stale" ? ` · cached total ${count(page.total)}` : ` of ${count(page.total)}`) : " shown"}`;
 }
 export function humanize(value: string): string {
   return value

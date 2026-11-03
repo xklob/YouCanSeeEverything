@@ -5219,3 +5219,21 @@ button:hover {
   color: #8ca2bf;
   font-size: 11px;
 }
+.count-freshness {
+  font-size: 8px;
+  color: #8e9fb6;
+  line-height: 1.8;
+  white-space: nowrap;
+}
+.source-card > .count-freshness {
+  display: block;
+  margin-top: 10px;
+}
+.library-page > .count-freshness {
+  display: block;
+  margin: -10px 0 16px;
+}
+.results-heading > .count-freshness {
+  margin-left: auto;
+  margin-right: 14px;
+}

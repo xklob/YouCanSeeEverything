@@ -378,6 +378,101 @@ def test_public_blockchain_token_query_addresses_remain_visible():
         assert clean_text(text) == text
 
 
+def test_google_fit_data_points_stream_and_preserve_nanosecond_intervals(tmp_path, monkeypatch):
+    pytest.importorskip("ijson")
+    point = {"fitValue": [{"value": {"intVal": 7}}], "originDataSourceId": "raw:example:stream-a", "dataTypeName": "com.google.step_count.delta", "startTimeNanos": 1704067200123456789, "endTimeNanos": 1704067201123456789, "modifiedTimeMillis": 1793491200000, "rawTimestampNanos": 0}
+    value = {"Data Source": "derived:example:stream-a", "Data Points": [point, dict(point)]}
+    path = tmp_path / "fitness.json"
+    path.write_text(json.dumps(value))
+    def no_whole_file_json_load(*args, **kwargs):
+        raise AssertionError("Fit point arrays must use the streaming reader")
+    monkeypatch.setattr(json, "load", no_whole_file_json_load)
+    result = parse_file(path, "All Data/fitness.json", "Google")
+    assert result.status == "parsed" and result.parser == "google.fit_points"
+    assert len(result.events) == 2
+    first, repeated = result.events
+    assert first["occurred_at"] == "2024-01-01T00:00:00.123456Z"
+    assert first["end_at"] == "2024-01-01T00:00:01.123456Z"
+    assert first["metadata"]["startTimeNanos"] == point["startTimeNanos"]
+    assert first["metadata"]["endTimeNanos"] == point["endTimeNanos"]
+    assert first["metadata"]["Data Source"] == value["Data Source"]
+    assert first["metadata"]["data_source_id"] == point["originDataSourceId"]
+    assert first["category"] == "measurement"
+    assert first["source_native_id"] is repeated["source_native_id"] is None
+    assert first["locator"] != repeated["locator"]
+
+
+def test_google_fit_missing_start_never_uses_modified_or_raw_capture_time(tmp_path):
+    point = {"fitValue": [], "dataTypeName": "com.google.heart_rate.bpm", "endTimeNanos": 1704067200000000000, "modifiedTimeMillis": 1793491200000, "rawTimestampNanos": 1793491200000000000}
+    result = export(tmp_path, "fitness.json", {"Data Points": [point]}, "Google")
+    assert result.events[0]["occurred_at"] is None
+    assert result.events[0]["end_at"] == "2024-01-01T00:00:00Z"
+
+
+def test_fit_context_uses_top_level_source_not_a_nested_lookalike(tmp_path):
+    point = {"fitValue": [{"value": {"intVal": 7}, "Data Source": "nested-lookalike"}], "dataTypeName": "com.google.step_count.delta", "startTimeNanos": 1704067200000000000}
+    result = export(tmp_path, "fitness.json", {"Data Points": [point], "Data Source": "actual-top-level-stream"}, "Google")
+    assert result.events[0]["metadata"]["export_context"]["data_source"] == "actual-top-level-stream"
+    assert result.events[0]["metadata"]["export_context"]["data_source_status"] == "available"
+
+
+def test_late_fit_source_outside_bounded_prefix_is_explicitly_unavailable(tmp_path):
+    pytest.importorskip("ijson")
+    point = {"fitValue": [{"value": {"intVal": 7}, "Data Source": "nested-lookalike"}], "dataTypeName": "com.google.step_count.delta", "startTimeNanos": 1704067200000000000}
+    path = tmp_path / "fitness.json"
+    path.write_text(json.dumps({"Data Points": [point] * 500, "Data Source": "late-top-level-stream"}))
+    result = parse_file(path, path.name, "Google")
+    assert len(result.events) == 500
+    context = result.events[0]["metadata"]["export_context"]
+    assert context["data_source"] is None
+    assert context["data_source_status"] == "unavailable_in_bounded_header"
+    assert "data_source_id" not in result.events[0]["metadata"]
+
+
+def test_nanosecond_conversion_does_not_round_into_a_false_microsecond():
+    assert parse_date(1704067200123456789, unit="ns")[0] == "2024-01-01T00:00:00.123456Z"
+    assert parse_date(-1, unit="ns")[0] == "1969-12-31T23:59:59.999999Z"
+
+
+def test_data_points_named_collection_requires_actual_fit_point_fields(tmp_path):
+    result = export(tmp_path, "ordinary.json", {"Data Points": [{"name": "A generic record"}]})
+    assert result.events[0]["category"] == "document"
+    assert result.events[0]["occurred_at"] is None
+
+
+def test_activity_probability_interval_uses_explicit_times_not_utc_offset_twice(tmp_path):
+    path = tmp_path / "UserActivityProbabilities_2099-01-01.csv"
+    path.write_text('activity_probabilities_start,activity_probabilities_end,utc_offset,activity_probabilities\n2024-01-01T12:00:00Z,2024-01-01T12:00:30Z,-05:00,"still: 0.3; walking: 0.7"\n')
+    record = parse_file(path, path.name, "Google").events[0]
+    assert record["occurred_at"] == "2024-01-01T12:00:00Z"
+    assert record["end_at"] == "2024-01-01T12:00:30Z"
+    assert record["metadata"]["activity_probabilities_start"] == "2024-01-01T12:00:00Z"
+    assert record["metadata"]["utc_offset"] == "-05:00"
+    assert record["category"] == "measurement"
+    assert record["title"] == "Activity probability sample"
+    assert "confirmed activities" in record["body"]
+
+
+@pytest.mark.parametrize("start,expected", [("2024-01-01T12:00:00", "2024-01-01"), ("12:00:00", None), ("", None)])
+def test_activity_probability_missing_timezone_or_date_stays_honest(tmp_path, start, expected):
+    path = tmp_path / "UserActivityProbabilities_2099-01-01.csv"
+    path.write_text(f'activity_probabilities_start,activity_probabilities_end,utc_offset,activity_probabilities\n{start},,-05:00,unknown\n')
+    record = parse_file(path, path.name, "Google").events[0]
+    assert record["occurred_at"] == expected
+    if expected:
+        assert record["metadata"]["timezone_unknown"] is True
+        assert record["time_precision"] == "day"
+
+
+def test_ppk_policy_does_not_read_key_contents(tmp_path, monkeypatch):
+    def forbidden_open(*args, **kwargs):
+        raise AssertionError("Credential content must not be opened")
+    monkeypatch.setattr(Path, "open", forbidden_open)
+    result = parse_file(tmp_path / "opaque-object", "attachments/private.PPK", "Meta")
+    assert result.status == "excluded"
+    assert len(result.events) == 0
+
+
 def test_eventbrite_orders_and_etsy_purchases_use_meaningful_dates(tmp_path):
     order = export(tmp_path, "orders.json", [{"event_data": {"event_name": "Concert", "start_date": "2024-05-01 19:00:00", "end_date": "2024-05-01 22:00:00", "venue": "Venue"}}], "Eventbrite").events[0]
     assert order["title"] == "Concert"

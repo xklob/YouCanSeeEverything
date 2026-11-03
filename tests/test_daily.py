@@ -289,12 +289,17 @@ def test_mutation_started_during_classification_cannot_commit_a_fresh_batch(cata
     daily.end_daily_mutation(tokens[0],catalog_path=catalog[0],sidecar_path=catalog[1])
 
 
-def test_daily_and_rollup_originals_include_readonly_existing_media_links(catalog,tmp_path):
+@pytest.mark.parametrize('filename,content,original_mime',[
+    ('photo.png',b'\x89PNG\r\n\x1a\nsynthetic','image/png'),
+    ('photo.data',b'II*\x00synthetic','image/tiff'),
+    ('photo.data',b'\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1','image/heic'),
+])
+def test_daily_and_rollup_originals_include_readonly_existing_media_links(catalog,tmp_path,filename,content,original_mime):
     import hashlib
     from biography.media import reconcile_media
     event(catalog,'photo',category='media')
-    event(catalog,'reading',metadata={**metric(),'photos':[{'uri':'photo.png'}]})
-    for identity,name,content in [('photo-file','export.zip!photo.png',b'\x89PNG\r\n\x1a\nsynthetic'),('document','export.zip!samples.json',b'{}')]:
+    event(catalog,'reading',metadata={**metric(),'photos':[{'uri':filename}]})
+    for identity,name,content in [('photo-file','export.zip!'+filename,content),('document','export.zip!samples.json',b'{}')]:
         digest=hashlib.sha256(content).hexdigest();path=tmp_path/digest;path.write_bytes(content)
         with transaction(catalog[0]) as conn:
             conn.execute('INSERT INTO objects VALUES(?,?,?,?)',(digest,len(content),str(path),'now'))
@@ -306,6 +311,9 @@ def test_daily_and_rollup_originals_include_readonly_existing_media_links(catalo
     assert detail['items'][0]['media'][0]['url']=='/api/files/photo-file/media'
     raw=daily.rollup_records(detail['rollups'][0]['id'],*catalog)
     assert raw['items'][0]['media'][0]['url']=='/api/files/photo-file/media'
+    for item in (detail['items'][0],raw['items'][0]):
+        assert item['media'][0]['original_mime']==original_mime
+        assert item['media'][0]['mime']==('image/png' if original_mime=='image/png' else 'image/jpeg')
     assert raw['items'][0]['provenance'][0]['path']=='export.zip!samples.json'
 
 
@@ -358,3 +366,51 @@ def test_daily_categories_use_classified_types_and_observed_record_counts(catalo
     assert result['projection']['processed_records']==3
     with sqlite3.connect(catalog[0]) as conn:
         assert dict(conn.execute('SELECT category,count(*) FROM events GROUP BY category'))=={'record':2,'post':1}
+
+
+def test_read_connection_honors_timeout_and_closes_when_setup_is_locked(catalog,monkeypatch):
+    with daily._readonly(catalog[0],timeout=.25) as conn:
+        assert conn.execute('PRAGMA busy_timeout').fetchone()[0]==250
+        assert conn.execute('PRAGMA query_only').fetchone()[0]==1
+    class LockedConnection:
+        closed=False
+        def execute(self,sql):raise sqlite3.OperationalError('database is locked')
+        def close(self):self.closed=True
+    fake=LockedConnection()
+    monkeypatch.setattr(daily.sqlite3,'connect',lambda *args,**kwargs:fake)
+    with pytest.raises(sqlite3.OperationalError):
+        with daily._readonly(catalog[0]):pass
+    assert fake.closed
+
+
+def test_source_lock_preserves_extended_code_and_actual_query_stage(catalog,monkeypatch):
+    from contextlib import contextmanager
+    for identity in ('a','b','c'):event(catalog,identity,category='post')
+    build(catalog,batch_size=2,max_batches=1)
+    original=daily._readonly
+    @contextmanager
+    def blocked_names(path,timeout=3):
+        with original(path,timeout=timeout) as conn:
+            class Reader:
+                def execute(self,sql,*args):
+                    if str(path)==str(catalog[0]) and sql=='SELECT id,name FROM sources':
+                        error=sqlite3.OperationalError('database is locked');error.sqlite_errorcode=sqlite3.SQLITE_BUSY|0x100;error.sqlite_errorname='SQLITE_BUSY_RECOVERY';raise error
+                    return conn.execute(sql,*args)
+            yield Reader()
+    monkeypatch.setattr(daily,'_readonly',blocked_names)
+    with pytest.raises(ImportPaused) as paused:build(catalog)
+    details=paused.value.details
+    assert details['stage']=='source_names' and details['sqlite_errorcode']==sqlite3.SQLITE_BUSY|0x100
+    assert details['sqlite_errorname']=='SQLITE_BUSY_RECOVERY' and details['busy_timeout_seconds']==5
+    assert details['read_seconds']>=0
+    monkeypatch.setattr(daily,'_readonly',original)
+    assert daily.daily_status(*catalog)['checkpoint_rowid']==2
+    assert build(catalog)['processed_records']==3
+
+
+def test_batch_progress_reports_read_and_projection_time_without_snapshot_pin(catalog):
+    event(catalog,'a',category='post');progress=[]
+    result=build(catalog,progress=progress.append)
+    assert result['checkpoint_rowid']==1 and len(progress)==1
+    assert progress[0]['source_read_seconds']>=0 and progress[0]['projection_seconds']>=0
+    assert set(progress[0]['source_stage_seconds'])=={'catalog_open','source_names','event_rows','source_evidence','catalog_close'}

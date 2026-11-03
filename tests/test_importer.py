@@ -5,6 +5,7 @@ import unittest
 import warnings
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from biography.importer import ingest_path, read_manifest, ProgressCallbackError
 from biography.storage import ImportPaused, IntegrityError, SourceChangedError
@@ -25,6 +26,24 @@ class ImporterTests(unittest.TestCase):
         kwargs.setdefault("discard_container", True)
         return ingest_path(source or self.source, self.vault, reserve_bytes=0,
                            space_guard=lambda _: None, **kwargs)
+
+    def test_ppk_attachment_is_not_opened_and_keeps_source_container(self):
+        archive = self.source / "export.zip"
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("attachments/synthetic.PPK", b"synthetic fixture, not a real private key")
+            zipped.writestr("notes.txt", b"ordinary retained content")
+        original_open = zipfile.ZipFile.open
+        def guarded_open(instance, name, *args, **kwargs):
+            filename = name.filename if isinstance(name, zipfile.ZipInfo) else str(name)
+            if filename.casefold().endswith(".ppk"):
+                raise AssertionError("Excluded key attachment content must not be opened")
+            return original_open(instance, name, *args, **kwargs)
+        with patch.object(zipfile.ZipFile, "open", guarded_open):
+            report = self.ingest(archive, delete_source=True, allowed_root=self.source)
+        assert archive.exists()
+        assert not any(item.original_path.casefold().endswith(".ppk") for item in report.files)
+        entries = [row for row in read_manifest(report.manifest_path) if row["kind"] == "archive_entry"]
+        assert any(row["disposition"] == "excluded_container_required" and row["path"].casefold().endswith(".ppk") for row in entries)
 
     def test_duplicate_archive_names_hidden_files_and_empty_files_survive(self):
         archive = self.source / "export.zip"

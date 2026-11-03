@@ -111,7 +111,7 @@ def _excluded_name(name: str, excluded_directory_names: set[str]) -> bool:
     parts = [p.casefold() for p in name.replace("\\", "/").split("/")]
     return (bool(set(parts) & excluded_directory_names)
             or (bool(parts) and (parts[-1] in EXCLUDED_FILENAMES
-                                 or parts[-1].endswith((".pem", ".key", ".p12", ".pfx"))
+                                 or parts[-1].endswith((".pem", ".key", ".p12", ".pfx", ".ppk"))
                                  or parts[-1].startswith(".env."))))
 
 

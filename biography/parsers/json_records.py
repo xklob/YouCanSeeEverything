@@ -14,6 +14,47 @@ from .common import clean_text, document_text, event, parse_date, pick, safe_val
 from .normalized_history import ethereum_record, git_commit
 
 
+def _fit_export_context(head: str) -> tuple[Any, str]:
+    """Inspect only a bounded prefix and only top-level export fields."""
+    decoder = json.JSONDecoder()
+    cursor = len(head) - len(head.lstrip())
+    if cursor >= len(head) or head[cursor] != "{":
+        return None, "not_a_top_level_object"
+    cursor += 1
+    data_source = None
+    source_found = False
+    try:
+        while cursor < len(head):
+            while cursor < len(head) and head[cursor].isspace():
+                cursor += 1
+            if cursor >= len(head) or head[cursor] == "}":
+                break
+            key, cursor = decoder.raw_decode(head, cursor)
+            while cursor < len(head) and head[cursor].isspace():
+                cursor += 1
+            if cursor >= len(head) or head[cursor] != ":":
+                return None, "incomplete_bounded_header"
+            cursor += 1
+            while cursor < len(head) and head[cursor].isspace():
+                cursor += 1
+            if key == "Data Points" and source_found:
+                return data_source, "available"
+            value, cursor = decoder.raw_decode(head, cursor)
+            if key == "Data Source":
+                data_source, source_found = value, True
+            while cursor < len(head) and head[cursor].isspace():
+                cursor += 1
+            if cursor < len(head) and head[cursor] == ",":
+                cursor += 1
+            elif cursor < len(head) and head[cursor] == "}":
+                break
+            else:
+                return None, "incomplete_bounded_header"
+    except (json.JSONDecodeError, RecursionError):
+        return None, "unavailable_in_bounded_header"
+    return (data_source, "available") if source_found else (None, "not_present_in_bounded_header")
+
+
 def json_items(path: Path) -> Iterator[tuple[str, Any]]:
     """Read one logical record at a time, including large known export wrappers."""
     with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
@@ -36,15 +77,19 @@ def json_items(path: Path) -> Iterator[tuple[str, Any]]:
         return
     # These containers have record semantics. Stream them rather than loading a
     # whole multi-gigabyte Google Takeout file into memory.
-    wrappers = ("timelineObjects", "semanticSegments", "locations", "items", "events", "activities", "records", "tweets")
+    wrappers = ("timelineObjects", "semanticSegments", "locations", "Data Points", "items", "events", "activities", "records", "tweets")
     wrapper = next((k for k in wrappers if f'"{k}"' in head and initial.startswith("{")), None)
+    fit_source = None
+    fit_context_status = "not_applicable"
+    if wrapper == "Data Points":
+        fit_source, fit_context_status = _fit_export_context(head)
     if wrapper and ijson:
         count = 0
         with path.open("rb") as handle:
             try:
                 for index, item in enumerate(ijson.items(handle, wrapper + ".item", use_float=True)):
                     count += 1
-                    yield f"$.{wrapper}[{index}]", item
+                    yield f"$.{wrapper}[{index}]", {"_fit_point": item, "_fit_data_source": fit_source, "_fit_context_status": fit_context_status} if wrapper == "Data Points" else item
             except ijson.JSONError as exc:
                 raise ValueError("Invalid JSON container stream") from exc
         if count:
@@ -62,7 +107,7 @@ def json_items(path: Path) -> Iterator[tuple[str, Any]]:
         key = next((k for k in wrappers if isinstance(value.get(k), list) and value[k]), None)
         if key:
             for index, item in enumerate(value[key]):
-                yield f"$.{key}[{index}]", item
+                yield f"$.{key}[{index}]", {"_fit_point": item, "_fit_data_source": value.get("Data Source"), "_fit_context_status": "available" if "Data Source" in value else "not_present"} if key == "Data Points" else item
             return
     yield "$", value
 
@@ -150,6 +195,13 @@ def adapt(record: Any, locator: str, source: str, path: str, limit: int) -> tupl
     """Dispatch by structural evidence; source names alone never imply a schema."""
     if not isinstance(record, dict):
         return "json.document", [event(Path(path).stem, document_text(record, limit), locator, limit=limit)]
+    if isinstance(record.get("_fit_point"), dict):
+        point = record["_fit_point"]
+        if "fitValue" in point and any(key in point for key in ("startTimeNanos", "endTimeNanos")):
+            return "google.fit_points", [google_fit_point(point, locator, limit, data_source=record.get("_fit_data_source"), context_status=record.get("_fit_context_status"))]
+        record = point
+    if "fitValue" in record and "dataTypeName" in record and any(key in record for key in ("startTimeNanos", "endTimeNanos")):
+        return "google.fit_points", [google_fit_point(record, locator, limit)]
     if record.get("kind") in {"t1", "t3"} and isinstance(record.get("data"), dict):
         record = record["data"]
     if record.get("kind") == "git_commit":
@@ -275,6 +327,27 @@ def meta_message(record: dict, locator: str, context: dict, limit: int) -> dict:
     # Meta exports often have no message ID. Timestamp is not an ID: multiple
     # distinct messages can have the same millisecond timestamp.
     return event(sender, body, locator, native_id=pick(record, "message_id", "id"), when=record.get("timestamp_ms"), unit="ms", category="message", metadata=metadata, limit=limit)
+
+
+def google_fit_point(record: dict, locator: str, limit: int, *, data_source=None, context_status=None) -> dict:
+    """One explicit Fit point; stream/interval/value fields remain source data.
+
+    Modified/acquisition timestamps are never substituted for occurrence time,
+    and equal repeated points retain separate locators without synthetic IDs.
+    """
+    metadata = dict(record)
+    if data_source is not None and "Data Source" not in metadata:
+        metadata["Data Source"] = data_source
+    metadata["export_context"] = {"data_source": data_source, "data_source_status": context_status or "not_provided", "bounded_prefix_bytes": 65536}
+    stream = record.get("originDataSourceId") or data_source
+    if isinstance(stream, str) and stream:
+        metadata["data_source_id"] = stream
+    data_type = record.get("dataTypeName")
+    description = data_type.removeprefix("com.google.").replace("_", " ").replace(".", " · ") if isinstance(data_type, str) else "data point"
+    metadata["timestamp_unit"] = "ns"
+    metadata["source_timestamp_fields"] = {"start": "startTimeNanos", "end": "endTimeNanos"}
+    title = "Google Fit · " + description
+    return event(title, "Recorded Google Fit measurement.", locator, native_id=pick(record, "dataPointId", "pointId"), when=record.get("startTimeNanos"), end=record.get("endTimeNanos"), category="measurement", metadata=metadata, unit="ns", limit=limit)
 
 
 _ACTIVITY_LABELS = {

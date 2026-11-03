@@ -538,3 +538,61 @@ it("keeps an explicit provider choice across map view remounts without storing a
     ),
   ).toBe(false);
 });
+
+it("paginates same-day records using has_more when the total is unavailable", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, options) => {
+    const path = String(input);
+    if (!path.startsWith("/api/events?")) return original(input, options);
+    requests.push(path);
+    const offset = Number(
+      new URL(path, "http://localhost").searchParams.get("offset"),
+    );
+    return new Response(
+      JSON.stringify({
+        items: [
+          {
+            id: "day-record",
+            title: "Day evidence with an unknown total",
+            body: "A retained source record.",
+            source: "Calendar",
+            category: "activity",
+          },
+        ],
+        total: null,
+        total_status: "pending",
+        counted_at: null,
+        has_more: offset === 0,
+        limit: 20,
+        offset,
+      }),
+    );
+  });
+  const user = userEvent.setup();
+  render(
+    <MapWorkspace
+      filters={filters}
+      refreshKey={0}
+      onOpenEvent={vi.fn()}
+      onShowTimeline={vi.fn()}
+    />,
+  );
+  await screen.findByText("Day evidence with an unknown total");
+  expect(screen.getByText("1 shown")).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "Next", exact: true }));
+  await waitFor(() =>
+    expect(
+      requests.some(
+        (path) => path.startsWith("/api/events?") && path.includes("offset=20"),
+      ),
+    ).toBe(true),
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Next", exact: true }),
+    ).toBeNull(),
+  );
+  expect(
+    screen.getByRole("button", { name: "Previous", exact: true }),
+  ).toBeTruthy();
+});

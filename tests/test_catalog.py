@@ -22,7 +22,7 @@ def test_reimport_preserves_evidence_without_duplicate_events(tmp_path):
     page=list_events(path,q='original evidence',start='2024-03-03',end='2024-03-03')
     assert page['total']==1
     assert len(event_detail(page['items'][0]['id'],path)['provenance'])==2
-    assert overview(path)['date_range']['start']=='2024-03-03'
+    assert page['items'][0]['occurred_at']=='2024-03-03'
 
 def test_repeated_real_events_and_changed_native_variants_survive(tmp_path):
     path=tmp_path/'catalog.sqlite3';sid=fixture(path)

@@ -1,10 +1,13 @@
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from biography.db import connect, init_db
+from biography import media as media_module
 from biography.media import (explicit_references,index_media_files,media_file_info,
                              media_for_event,media_for_events,reconcile_media,sniff_media)
 
@@ -25,6 +28,115 @@ class MediaTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def image_bytes(self,format='TIFF',size=(48,32)):
+        from PIL import Image
+        if format=='HEIF':
+            from pillow_heif import register_heif_opener
+            register_heif_opener(thumbnails=False)
+        data=io.BytesIO();Image.new('RGB',size,(30,90,150)).save(data,format=format)
+        return data.getvalue()
+
+    def test_tiff_data_preview_is_cached_jpeg_and_original_bytes_stay_exact(self):
+        from PIL import Image
+        original=self.image_bytes();physical=self.file('tiff','maps/image.data',original)
+        self.event('photo',{},['tiff'],category='document');reconcile_media(self.database)
+        self.assertEqual(sniff_media(physical)[0],'image/tiff')
+        self.assertEqual(media_for_event('photo',self.database)[0]['mime'],'image/jpeg')
+        with connect(self.database) as conn:
+            before=conn.execute('SELECT name FROM sqlite_schema ORDER BY name').fetchall();conn.execute('PRAGMA query_only=ON')
+            first=media_file_info('tiff',conn,objects_root=self.objects)
+            self.assertEqual(conn.execute('SELECT name FROM sqlite_schema ORDER BY name').fetchall(),before)
+        self.assertIsNotNone(first);self.assertEqual(first['mime'],'image/jpeg');self.assertTrue(first['derived'])
+        self.assertNotEqual(first['path'],physical)
+        with Image.open(first['path']) as image:self.assertEqual(image.size,(48,32))
+        self.assertEqual(physical.read_bytes(),original)
+        with patch.object(media_module,'_run_preview_worker',side_effect=AssertionError('Cache must not reconvert')):
+            second=media_file_info('tiff',self.database,objects_root=self.objects)
+        self.assertEqual(second['path'],first['path'])
+
+    def test_heic_magic_in_data_file_decodes_to_safe_jpeg(self):
+        from PIL import Image
+        original=self.image_bytes('HEIF');physical=self.file('heic','maps/image.data',original)
+        index_media_files(self.database);self.assertEqual(sniff_media(physical)[0],'image/heic')
+        preview=media_file_info('heic',self.database,objects_root=self.objects)
+        self.assertIsNotNone(preview);self.assertEqual(preview['mime'],'image/jpeg')
+        with Image.open(preview['path']) as image:self.assertEqual(image.size,(48,32))
+        self.assertEqual(physical.read_bytes(),original)
+
+    def test_corrupt_tiff_is_retained_and_rejection_is_cached(self):
+        original=b'II*\x00corrupt source';physical=self.file('broken','image.data',original);index_media_files(self.database)
+        self.assertIsNone(media_file_info('broken',self.database,objects_root=self.objects))
+        with patch.object(media_module,'_run_preview_worker',side_effect=AssertionError('Rejected bytes must not repeatedly decode')):
+            self.assertIsNone(media_file_info('broken',self.database,objects_root=self.objects))
+        self.assertEqual(physical.read_bytes(),original)
+
+    def test_valid_image_over_pixel_or_input_budget_is_not_decoded_unbounded(self):
+        original=self.image_bytes();physical=self.file('large','large.data',original);index_media_files(self.database)
+        with patch.object(media_module,'PREVIEW_MAX_SOURCE_PIXELS',100):
+            self.assertIsNone(media_file_info('large',self.database,objects_root=self.objects))
+        with patch.object(media_module,'PREVIEW_MAX_SOURCE_BYTES',10),patch.object(media_module,'_run_preview_worker',side_effect=AssertionError('Input budget must reject first')):
+            self.assertIsNone(media_file_info('large',self.database,objects_root=self.objects))
+        self.assertEqual(physical.read_bytes(),original)
+
+    def test_corrupt_cached_jpeg_is_regenerated_from_immutable_original(self):
+        original=self.image_bytes();physical=self.file('image','image.data',original);index_media_files(self.database)
+        preview=media_file_info('image',self.database,objects_root=self.objects)
+        self.assertIsNotNone(preview);preview['path'].write_bytes(b'\xff\xd8\xffcorrupt cache')
+        with patch.object(media_module,'_run_preview_worker',wraps=media_module._run_preview_worker) as called:
+            repaired=media_file_info('image',self.database,objects_root=self.objects)
+        self.assertEqual(called.call_count,1);self.assertIsNotNone(repaired)
+        self.assertNotEqual(repaired['path'].read_bytes(),b'\xff\xd8\xffcorrupt cache')
+        self.assertEqual(physical.read_bytes(),original)
+
+    def test_converter_timeout_does_not_publish_partial_preview_or_change_original(self):
+        import subprocess
+        original=self.image_bytes();physical=self.file('image','image.data',original);index_media_files(self.database)
+        def timed_out(source,destination,*args):
+            destination.write_bytes(b'partial output');raise subprocess.TimeoutExpired('synthetic decoder',1)
+        with patch.object(media_module,'_run_preview_worker',side_effect=timed_out):
+            self.assertIsNone(media_file_info('image',self.database,objects_root=self.objects))
+        self.assertEqual(list((self.root/'media-previews').rglob('*.part')),[])
+        self.assertEqual(physical.read_bytes(),original)
+
+    def test_corrupt_ready_metadata_is_regenerated_instead_of_crashing(self):
+        self.file('image','image.data',self.image_bytes());index_media_files(self.database)
+        preview=media_file_info('image',self.database,objects_root=self.objects)
+        metadata_path=preview['path'].with_suffix('.json')
+        for corrupt in ([],{'width':None},{'height':0},{'frame':'invalid'}):
+            metadata=json.loads(metadata_path.read_text())
+            if isinstance(corrupt,dict):metadata.update(corrupt)
+            else:metadata=corrupt
+            metadata_path.write_text(json.dumps(metadata))
+            with patch.object(media_module,'_run_preview_worker',wraps=media_module._run_preview_worker) as called:
+                self.assertIsNotNone(media_file_info('image',self.database,objects_root=self.objects))
+            self.assertEqual(called.call_count,1)
+
+    def test_signal_and_runtime_decoder_failure_are_retryable(self):
+        import subprocess
+        self.file('image','image.data',self.image_bytes());index_media_files(self.database)
+        for returncode in (-9,3):
+            with patch.object(media_module.subprocess,'run',return_value=subprocess.CompletedProcess([],returncode)):
+                self.assertIsNone(media_file_info('image',self.database,objects_root=self.objects))
+            self.assertEqual(list((self.root/'media-previews').rglob('*.json')),[])
+        self.assertIsNotNone(media_file_info('image',self.database,objects_root=self.objects))
+
+    def test_new_index_version_reprobes_old_unsupported_tiff_cache(self):
+        original=self.image_bytes();self.file('image','image.data',original)
+        with connect(self.database) as conn:
+            media_module.ensure_schema(conn)
+            conn.execute('INSERT INTO media_object_index VALUES(?,?,?,?)',(hashlib.sha256(original).hexdigest(),None,None,'not_previewable'))
+            conn.execute('INSERT INTO media_file_state VALUES(?,?)',('image',1))
+        self.assertEqual(index_media_files(self.database)['media_files'],1)
+        self.assertIsNotNone(media_file_info('image',self.database,objects_root=self.objects))
+
+    def test_read_helpers_work_on_query_only_catalog_without_creating_schema(self):
+        with connect(self.database) as conn:
+            before=conn.execute("SELECT name FROM sqlite_schema ORDER BY name").fetchall()
+            conn.execute('PRAGMA query_only=ON')
+            self.assertEqual(media_for_events(['missing'],conn),{'missing':[]})
+            self.assertIsNone(media_file_info('missing',conn,objects_root=self.objects))
+            self.assertEqual(conn.execute("SELECT name FROM sqlite_schema ORDER BY name").fetchall(),before)
 
     def file(self,identity,original,content=PNG,*,source="source-a"):
         digest = hashlib.sha256(content).hexdigest()

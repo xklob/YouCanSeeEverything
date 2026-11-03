@@ -68,7 +68,8 @@ def test_only_bounded_page_rows_are_classified(tmp_path, monkeypatch):
         return original(event, provenance)
     monkeypatch.setattr(classification, "classify_event", wrapped)
     page = queries.list_events(path, limit=2, offset=3)
-    assert page["total"] == 12
+    assert page["total"] is None
+    assert page["has_more"] is True
     assert seen == [item["id"] for item in page["items"]]
     assert len(seen) == 2
     seen.clear()

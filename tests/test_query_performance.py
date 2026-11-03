@@ -33,7 +33,8 @@ def test_null_last_tied_timestamps_and_offset_pages_are_deterministic(catalog,so
     paged=[]
     for offset in range(0,len(expected),2):
         page=queries.list_events(catalog,sort=sort,limit=2,offset=offset)
-        assert page['total']==len(expected)
+        assert page['total'] in (None,len(expected))
+        assert page['has_more']==(offset+2<len(expected))
         paged.extend(item['id'] for item in page['items'])
     assert paged==expected
     assert len(set(paged))==len(expected)
@@ -59,14 +60,14 @@ def test_actual_page_sql_uses_chronological_index_without_temporary_sort(catalog
     assert not any('TEMP B-TREE' in detail for detail in plan)
 
 
-def test_count_and_display_page_share_one_wal_snapshot(catalog,monkeypatch):
+def test_complete_page_count_describes_its_snapshot_during_concurrent_write(catalog,monkeypatch):
     original_connect=queries.connect
     wrote=False
     def wrapped_connect(path=None):
         conn=original_connect(path)
         def trace(sql):
             nonlocal wrote
-            if not wrote and sql.startswith('SELECT e.*,s.name AS source'):
+            if not wrote and sql.startswith('SELECT v.event_id'):
                 wrote=True
                 with transaction(catalog) as writer:
                     writer.execute("""INSERT INTO events(id,source_id,title,occurred_at,category,created_at)
@@ -80,3 +81,37 @@ def test_count_and_display_page_share_one_wal_snapshot(catalog,monkeypatch):
     assert len(result['items'])==6
     assert 'concurrent' not in {item['id'] for item in result['items']}
     assert queries.list_events(catalog)['total']==7
+
+
+def test_page_never_counts_synchronously_and_empty_overrun_is_not_a_total(catalog,monkeypatch):
+    statements=[]
+    def traced_connect(path=None):
+        conn=connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+    monkeypatch.setattr(queries,'connect',traced_connect)
+    monkeypatch.setattr(queries,'get_count',lambda *args:{'total':None,'total_status':'pending','counted_at':None})
+    page=queries.list_events(catalog,limit=2)
+    assert page['total'] is None and page['has_more'] is True
+    overrun=queries.list_events(catalog,limit=2,offset=100)
+    assert overrun['items']==[] and overrun['total'] is None and not overrun['has_more']
+    assert not any('count(' in sql.lower() for sql in statements)
+
+
+def test_overview_and_sources_leave_event_measurement_to_cache(catalog,monkeypatch):
+    statements=[]
+    def traced_connect(path=None):
+        conn=connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+    monkeypatch.setattr(queries,'connect',traced_connect)
+    monkeypatch.setattr(queries,'get_catalog_stats',lambda path:{
+        'total_events':None,'undated_count':None,'date_range':{'start':None,'end':None},
+        'activity':None,'categories':[{'name':'note','count':None}],
+        'by_source':None,'stats':{'status':'pending'}})
+    summary=queries.overview(catalog)
+    assert summary['total_events'] is None and summary['activity']==[]
+    assert summary['categories']==[{'name':'note','count':None}]
+    source=queries.sources(catalog)['items'][0]
+    assert source['event_count'] is None and source['first_event'] is None
+    assert not any('FROM events' in sql for sql in statements)

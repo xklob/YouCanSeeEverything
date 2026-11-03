@@ -22,8 +22,9 @@ from .config import settings
 from .parsers.common import clean_text
 
 
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 MAX_CANDIDATES = 640
+MAX_SEARCH_POOL = 8_192
 MAX_EVIDENCE = 48
 MAX_CONTEXT_CHARS = 64_000
 MAX_EXCERPT_CHARS = 2_000
@@ -109,8 +110,7 @@ def selection(prompt: str = "", *, period=None, source_ids=None, start=None, end
                     candidates.add(f"{int(match[2]):04d}-{_MONTHS[match[1]]:02d}")
                 if not candidates:
                     years = set(re.findall(r"\b(?:19|20)\d{2}\b", text))
-                    if len(years) == 1:
-                        candidates = years
+                    candidates = years
                 if len(candidates) == 1:
                     chosen = next(iter(candidates))
                     first, last = _period_bounds(chosen)
@@ -171,14 +171,21 @@ def _known_sources(conn, chosen: dict, prompt="") -> list[dict]:
 
 
 def _coverage(conn, chosen: dict, known: list[dict]) -> dict:
-    condition, args = _where(chosen)
-    aggregate = {row["source_id"]: dict(row) for row in conn.execute("SELECT e.source_id,count(*) total_events,sum(e.occurred_at IS NOT NULL) dated_events,min(e.occurred_at) first_event,max(e.occurred_at) last_event FROM events e WHERE " + condition + " GROUP BY e.source_id", args)}
-    # The catalog can contain many GiB of document bodies. The composite
-    # source/time index answers these counts without fetching those bodies.
-    undated = {source["id"]: conn.execute("SELECT count(*) FROM events INDEXED BY events_source WHERE source_id=? AND occurred_at IS NULL", (source["id"],)).fetchone()[0] for source in known}
+    # Seek each source/date range in the covering index. With a date-only
+    # predicate, the planner can otherwise choose the time index and fetch
+    # body-bearing rows merely to group by source. count(1) is interruptible;
+    # SQLite's global count(*) shortcut is not.
+    aggregate, undated = {}, {}
+    for source in known:
+        condition, args = _where({**chosen, "source_ids": [source["id"]]})
+        aggregate[source["id"]] = dict(conn.execute(
+            "SELECT count(1) total_events,coalesce(sum(e.occurred_at IS NOT NULL),0) dated_events,min(e.occurred_at) first_event,max(e.occurred_at) last_event FROM events e INDEXED BY events_source WHERE " + condition, args
+        ).fetchone())
+        undated[source["id"]] = conn.execute("SELECT count(1) FROM events INDEXED BY events_source WHERE source_id=? AND occurred_at IS NULL", (source["id"],)).fetchone()[0]
     file_counts = {}
-    for row in conn.execute("SELECT source_id,parse_status,count(*) n FROM files GROUP BY source_id,parse_status"):
-        file_counts.setdefault(row["source_id"], {})[row["parse_status"]] = row["n"]
+    if known:
+        for row in conn.execute("SELECT source_id,parse_status,count(1) n FROM files WHERE source_id IN (" + ",".join("?" for _ in known) + ") GROUP BY source_id,parse_status", [source["id"] for source in known]):
+            file_counts.setdefault(row["source_id"], {})[row["parse_status"]] = row["n"]
     sources = []
     for source in known:
         row = aggregate.get(source["id"], {})
@@ -193,11 +200,11 @@ def _coverage(conn, chosen: dict, known: list[dict]) -> dict:
 
 
 def _watermark(conn, chosen, coverage) -> dict:
-    # A combined aggregate defeats SQLite's COUNT/MAX fast paths and can scan
-    # the full body-bearing table. Keep independent lookups independent.
-    totals = {}
-    for table, count_key, row_key in (("events", "events", "event_rowid"), ("files", "files", "file_rowid"), ("evidence", "evidence", "evidence_rowid")):
-        totals[count_key] = conn.execute("SELECT count(*) FROM " + table).fetchone()[0]
+    # A catalog cut needs a few b-tree seeks, not global counts over millions
+    # of unrelated samples. Exact scope counts and selected-record hashes
+    # provide the relevant coverage/freshness evidence separately.
+    totals = {"events": None, "files": None, "evidence": None, "counts_status": "not_measured"}
+    for table, row_key in (("events", "event_rowid"), ("files", "file_rowid"), ("evidence", "evidence_rowid")):
         totals[row_key] = conn.execute("SELECT max(rowid) FROM " + table).fetchone()[0]
     try:
         from .classification import CLASSIFIER_VERSION
@@ -221,12 +228,6 @@ def _terms(prompt: str) -> list[str]:
 
 def _quoted(term: str) -> str:
     return '"' + term.replace('"', '""') + '"'
-
-
-def _spread(values: list, count: int) -> list:
-    if len(values) <= count:
-        return values
-    return [values[round(index * (len(values) - 1) / (count - 1))] for index in range(count)]
 
 
 _META_HINTS = "json_object(" + ",".join("'" + key + "',json_extract(e.metadata,'$." + key + "')" for key in ("role", "conversation_title", "document_kind", "timezone_unknown", "original_datetime", "timestamp_role")) + ")"
@@ -274,6 +275,81 @@ def _raw_sample(row: dict, provenance: list) -> bool:
         return False
 
 
+def _temporal_order(values: list) -> list:
+    """Visit both bounds, then progressively finer calendar positions."""
+    if len(values) <= 2:
+        return values
+    result = [values[0], values[-1]]
+    ranges = [(1, len(values) - 2)]
+    while ranges:
+        following = []
+        for first, last in ranges:
+            if first > last:
+                continue
+            middle = (first + last) // 2
+            result.append(values[middle])
+            following.extend(((first, middle - 1), (middle + 1, last)))
+        ranges = following
+    return result
+
+
+def _search_pool(conn, chosen: dict, coverage: dict) -> tuple[list[int], dict[str, list[int]]]:
+    """Index-only range seeks before any body or full-text work.
+
+    Small source/date ranges are searched in full. Larger ones get bounded
+    leading/trailing samples in evenly spaced calendar windows. This is an
+    explicit lexical-search limit, never a claim of exhaustive retrieval.
+    """
+    available = sorted((source for source in coverage["sources"] if source["total_events"]), key=lambda source: source["source_id"])
+    if not available:
+        return [], {}
+    quota = max(1, MAX_SEARCH_POOL // len(available))
+    per_source = {}
+    for source in available:
+        condition, args = _where({**chosen, "source_ids": [source["source_id"]]})
+        rows = {}
+
+        def take(extra, params, size, direction):
+            if size <= 0:
+                return
+            sql = "SELECT e.rowid,e.occurred_at FROM events e INDEXED BY events_source WHERE " + condition + extra + " ORDER BY e.occurred_at " + direction + " LIMIT ?"
+            for row in conn.execute(sql, args + params + [size]):
+                rows[row["rowid"]] = row["occurred_at"]
+
+        if source["total_events"] <= quota:
+            take("", [], quota, "ASC")
+        else:
+            undated_budget = quota // 4 if source["dated_events"] else quota
+            undated_quota = min(undated_budget, source["undated_source_events"]) if not chosen["start"] and not chosen["end_exclusive"] else 0
+            if undated_quota:
+                take(" AND e.occurred_at IS NULL", [], undated_quota, "ASC")
+            dated_quota = quota - undated_quota
+            if source["first_event"] and source["last_event"]:
+                first = date.fromisoformat(source["first_event"][:10])
+                last = date.fromisoformat(source["last_event"][:10]) + timedelta(days=1)
+                days = max(1, (last - first).days)
+                windows = min(8, days, max(1, dated_quota // 2))
+                allowance = dated_quota // windows
+                for index in range(windows):
+                    start = (first + timedelta(days=index * days // windows)).isoformat()
+                    end = (first + timedelta(days=(index + 1) * days // windows)).isoformat()
+                    extra = " AND e.occurred_at>=? AND e.occurred_at<?"
+                    take(extra, [start, end], (allowance + 1) // 2, "ASC")
+                    take(extra, [start, end], allowance // 2, "DESC")
+        ordered = sorted(rows, key=lambda identity: (rows[identity] or "", identity))[:quota]
+        per_source[source["source_id"]] = _temporal_order(ordered)
+    # Interleave sources so a capped matching pass cannot be consumed by the
+    # first archive merely because it was opened first.
+    ordered = []
+    for index in range(max(map(len, per_source.values()), default=0)):
+        ordered.extend(values[index] for values in per_source.values() if index < len(values))
+    return ordered[:MAX_SEARCH_POOL], per_source
+
+
+def _values_cte(ids: list[int]) -> str:
+    return "WITH scoped(rowid) AS (VALUES " + ",".join("(?)" for _ in ids) + ") "
+
+
 def retrieve(prompt: str, path=None, *, period=None, source_ids=None, start=None, end=None, limit=MAX_EVIDENCE) -> dict:
     if not isinstance(prompt, str) or len(prompt) > 8_000:
         raise ValueError("Questions must be at most 8,000 characters.")
@@ -285,7 +361,11 @@ def retrieve(prompt: str, path=None, *, period=None, source_ids=None, start=None
         known = _known_sources(conn, chosen, prompt)
         coverage = _coverage(conn, chosen, known)
         fixed = _watermark(conn, chosen, coverage)
-        condition, args = _where(chosen)
+        search_ids, per_source = _search_pool(conn, chosen, coverage)
+        search_limited = len(search_ids) < coverage["total_events_in_scope"]
+        coverage["lexical_search_pool"] = {"records": len(search_ids), "limit": MAX_SEARCH_POOL, "limited": search_limited, "strategy": "source/date index ranges; large ranges sampled across calendar windows"}
+        if search_limited:
+            coverage["limitations"].append("The source/date scope exceeds the bounded lexical search pool; only sampled records were text-searched. Narrow dates or sources for deeper coverage.")
 
         def collect(name, sql, params, cap, weight):
             if len(pool) >= MAX_CANDIDATES:
@@ -304,38 +384,37 @@ def retrieve(prompt: str, path=None, *, period=None, source_ids=None, start=None
                     record.update(score=score, excerpt_strategy="query_centered" if name.startswith("lexical") else "leading", retrieval_passes=[name])
                     pool[identity] = record
 
-        search_sql = "SELECT " + _COLUMNS + ",substr(snippet(events_fts,1,'','',' […] ',60),1,3000) AS body FROM events_fts JOIN events e ON e.rowid=events_fts.rowid JOIN sources s ON s.id=e.source_id WHERE events_fts MATCH ? AND " + condition + " ORDER BY rank LIMIT ?"
-        if terms:
-            collect("lexical_all_terms", search_sql, [" AND ".join(map(_quoted, terms))] + args, 72, 20)
-            collect("lexical_any_term", search_sql, [" OR ".join(map(_quoted, terms))] + args, 96, 8)
+        # CROSS JOIN fixes the bounded rowid pool as the driver. Each FTS lookup
+        # receives both MATCH and an exact rowid; no global BM25/rank scan is
+        # needed for common words in a tiny historical date window.
+        search_sql = (_values_cte(search_ids) if search_ids else "") + "SELECT " + _COLUMNS + ",substr(snippet(events_fts,1,'','',' […] ',60),1,3000) AS body FROM scoped CROSS JOIN events e ON e.rowid=scoped.rowid JOIN sources s ON s.id=e.source_id CROSS JOIN events_fts ON events_fts.rowid=e.rowid WHERE events_fts MATCH ? LIMIT ?"
+        if terms and search_ids:
+            collect("lexical_all_terms", search_sql, search_ids + [" AND ".join(map(_quoted, terms))], 72, 20)
+            collect("lexical_any_term", search_sql, search_ids + [" OR ".join(map(_quoted, terms))], 96, 8)
             for term in terms[:6]:
-                collect("lexical_term", search_sql, [_quoted(term)] + args, 20, 5)
+                collect("lexical_term", search_sql, search_ids + [_quoted(term)], 20, 5)
             expanded = list(dict.fromkeys(value for term in terms for value in _EXPANSIONS.get(term, ())))
             if expanded:
-                collect("lexical_related_terms", search_sql, [" OR ".join(map(_quoted, expanded))] + args, 48, 3)
+                collect("lexical_related_terms", search_sql, search_ids + [" OR ".join(map(_quoted, expanded))], 48, 3)
 
         # Dates are selected before loading text. Each source contributes a
         # bounded pool across category/time buckets, including historical years.
         span = (date.fromisoformat(chosen["end_exclusive"]) - date.fromisoformat(chosen["start"])).days if chosen["start"] and chosen["end_exclusive"] else None
         bucket_chars = 10 if span is not None and span <= 62 else 7 if span is not None and span <= 730 else 4
-        available_sources = sorted((item for item in coverage["sources"] if item["total_events"]), key=lambda item: (-item["total_events"], item["source_id"]))[:24]
+        available_sources = [item for item in coverage["sources"] if per_source.get(item["source_id"])]
         context_quota = max(4, min(40, (MAX_CANDIDATES - len(pool)) // max(1, len(available_sources))))
         for source in available_sources:
             if not source["total_events"]:
                 continue
-            buckets = [row[0] for row in conn.execute(f"SELECT DISTINCT substr(e.occurred_at,1,{bucket_chars}) FROM events e WHERE " + condition + " AND e.source_id=? AND e.occurred_at IS NOT NULL ORDER BY 1", args + [source["source_id"]])]
-            buckets = _spread(buckets, 8)
-            bucket_condition = f"substr(e.occurred_at,1,{bucket_chars}) IN (" + ",".join("?" for _ in buckets) + ")" if buckets else "0"
-            if not chosen["start"] and not chosen["end_exclusive"]:
-                bucket_condition = "(" + bucket_condition + " OR e.occurred_at IS NULL)"
+            source_ids = per_source[source["source_id"]]
             raw_marks = ",".join("?" for _ in RAW_CATEGORIES)
-            sql = f"""WITH ranked AS (
+            sql = _values_cte(source_ids) + f""", ranked AS (
                 SELECT e.id,row_number() OVER(PARTITION BY e.category,substr(e.occurred_at,1,{bucket_chars}) ORDER BY e.occurred_at DESC,e.id) AS bucket_rank
-                FROM events e WHERE {condition} AND e.source_id=? AND ({bucket_condition}) AND e.category NOT IN ({raw_marks})
+                FROM scoped CROSS JOIN events e ON e.rowid=scoped.rowid WHERE e.category NOT IN ({raw_marks})
                 ) SELECT {_COLUMNS},substr(e.body,1,3000) AS body FROM ranked r
-                JOIN events e ON e.id=r.id JOIN sources s ON s.id=e.source_id WHERE r.bucket_rank<=2
+                CROSS JOIN events e ON e.id=r.id JOIN sources s ON s.id=e.source_id WHERE r.bucket_rank<=2
                 ORDER BY r.bucket_rank,CASE WHEN e.category IN ('note','journal','post','message','event','git_commit','travel','place_visit') THEN 0 ELSE 1 END,e.occurred_at,e.id LIMIT ?"""
-            collect("source_time_context", sql, args + [source["source_id"], *buckets, *sorted(RAW_CATEGORIES)], context_quota, 2)
+            collect("source_time_context", sql, source_ids + sorted(RAW_CATEGORIES), context_quota, 2)
 
         provenance = _provenance(conn, list(pool))
         candidates, raw_omitted = [], 0

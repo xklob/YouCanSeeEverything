@@ -214,17 +214,28 @@ def _reindex_files(file_ids,db_path=None):
     from .enrichment import reapply
     from .locations import reconcile_locations
     from .media import reconcile_media
-    results=[];sources=set()
-    for file_id in dict.fromkeys(file_ids):
+    results=[];sources=set();selected=list(dict.fromkeys(file_ids))
+    # Installed separately by normal schema setup. Do not silently create a
+    # large index while holding a reindex write transaction.
+    with transaction(db_path) as conn:
+        indexes={r[1] for r in conn.execute('PRAGMA index_list(evidence)')}
+        if 'evidence_file' not in indexes:
+            raise RuntimeError('The evidence_file index must be installed before targeted reindexing')
+    for file_id in selected:
         with transaction(db_path) as conn:
             row=conn.execute('''SELECT f.*,o.path,s.name source FROM files f
                 JOIN objects o ON o.sha256=f.object_hash JOIN sources s ON s.id=f.source_id WHERE f.id=?''',(file_id,)).fetchone()
             if row is None:raise ValueError('Retained file not found')
-            event_ids=[r[0] for r in conn.execute('SELECT event_id FROM evidence WHERE file_id=?',(file_id,))]
-            conn.execute('DELETE FROM evidence WHERE file_id=?',(file_id,))
-            for start in range(0,len(event_ids),800):
-                batch=event_ids[start:start+800]
+            while True:
+                batch=[r[0] for r in conn.execute('SELECT DISTINCT event_id FROM evidence INDEXED BY evidence_file WHERE file_id=? ORDER BY event_id LIMIT 800',(file_id,))]
+                if not batch:break
+                conn.execute('DELETE FROM evidence WHERE file_id=? AND event_id IN ('+','.join('?' for _ in batch)+')',[file_id,*batch])
                 conn.execute('DELETE FROM events WHERE id IN ('+','.join('?' for _ in batch)+') AND NOT EXISTS (SELECT 1 FROM evidence WHERE event_id=events.id)',batch)
+                # Shared old events survive. Their remaining evidence may now
+                # resolve differently even if the replacement parser emits no
+                # matching event, so refresh just this bounded old-ID batch.
+                reconcile_locations(conn,event_ids=batch)
+                reconcile_media(conn,event_ids=batch,index_files=False)
             conn.execute("UPDATE files SET parse_status='pending' WHERE id=?",(file_id,))
         meta=json.loads(row['metadata'])
         stored=StoredFile(row['object_hash'],row['bytes'],Path(row['path']),row['original_path'],'',meta.get('archive_chain',[]),meta.get('media_type'),meta.get('disposition','retained_leaf'))
@@ -232,8 +243,20 @@ def _reindex_files(file_ids,db_path=None):
         results.append({'file_id':file_id,'events_added':count});sources.add(row['source_id'])
     for sid in sources:
         reapply(db_path,source_id=sid)
-        reconcile_locations(db_path,source_id=sid)
-        reconcile_media(db_path,source_id=sid)
+        # Index retained media/manifest files once, without selecting any events.
+        reconcile_media(db_path,source_id=sid,event_ids=[])
+    for file_id in selected:
+        after=None
+        while True:
+            with transaction(db_path) as conn:
+                batch=[r[0] for r in conn.execute(
+                    'SELECT DISTINCT event_id FROM evidence INDEXED BY evidence_file WHERE file_id=?'+
+                    (' AND event_id>?' if after is not None else '')+' ORDER BY event_id LIMIT 800',
+                    (file_id,after) if after is not None else (file_id,))]
+            if not batch:break
+            reconcile_locations(db_path,event_ids=batch)
+            reconcile_media(db_path,event_ids=batch,index_files=False)
+            after=batch[-1]
     return results
 
 def replay_manifests(data_dir=None,db_path=None):

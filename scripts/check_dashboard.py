@@ -219,22 +219,23 @@ def fixture_api(path: str) -> dict:
 class CandidateServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, dist: Path, upstream: str | None):
+    def __init__(self, dist: Path, upstream: str | None, *, fixture_handler=fixture_api):
         self.dist, self.upstream = dist, upstream
+        self.fixture_handler = fixture_handler
         self.violations: list[dict] = []
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
         super().__init__(("127.0.0.1", 0), CandidateHandler)
 
     def api(self, path: str) -> dict:
         # Do not expose a session token or download private file objects to candidate code.
-        if urlsplit(path).path != "/api/daily/categories" and not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|map-config|coverage|days|rollups|summaries)(/[^/?]+)?", urlsplit(path).path):
+        if urlsplit(path).path != "/api/daily/categories" and not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|journeys|map-config|coverage|days|rollups|summaries)(/[^/?]+)?", urlsplit(path).path):
             raise ValueError("Endpoint is outside the read-only acceptance API")
         if urlsplit(path).path == "/api/map-config":
             # The QA proxy port is not the configured browser-key origin. Never
             # fetch or forward a live key, or initialize a billable map provider.
             return {"provider": "openstreetmap", "google_maps_configured": False}
         if self.upstream is None:
-            return fixture_api(path)
+            return self.fixture_handler(path)
         with self.opener.open(Request(self.upstream + path, method="GET"), timeout=15) as response:
             if response.status != 200:
                 raise ValueError("Upstream API did not return HTTP 200")

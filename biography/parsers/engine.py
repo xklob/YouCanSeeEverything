@@ -29,7 +29,7 @@ def parse(path: Path, original_path: str, source: str, *, max_text_chars: int, e
     excluded = {str(name).casefold() for name in excluded_directory_names}
     if any(part.casefold() in excluded for part in re.split(r"[/\\]", original_path)):
         return ParseResult(parser="policy.excluded", status="excluded", notes=["Directory excluded by configured source policy"])
-    if CREDENTIAL_FILE.search(original_path) or CREDENTIAL_FILE.search(path.name):
+    if CREDENTIAL_FILE.search(original_path) or CREDENTIAL_FILE.search(path.name) or original_path.casefold().endswith(".ppk") or path.suffix.casefold() == ".ppk":
         return ParseResult(parser="policy.credentials", status="excluded", notes=["Credential material is excluded from history"])
     if path.is_symlink():
         return ParseResult(parser="policy.symlink", status="excluded", notes=["Symlink requires explicit source inventory handling"])

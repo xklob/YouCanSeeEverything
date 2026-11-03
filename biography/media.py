@@ -11,16 +11,23 @@ import hashlib
 import csv
 import io
 import json
+import fcntl
+import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
 from urllib.parse import unquote, urlsplit
 
 from .config import settings
 from .locations import _connection
+from .storage import FileSnapshot,hash_file,fsync_directory
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 ASSOCIATION_VERSION = 3
 MANIFEST_VERSION = 1
 MANIFEST_BYTE_LIMIT = 8 * 1024 * 1024
@@ -28,7 +35,159 @@ SAFE_MIME_TYPES = {
     "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp",
     "video/mp4", "video/quicktime", "video/webm", "video/ogg",
     "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav", "audio/flac", "audio/aac", "audio/amr",
+    "image/tiff", "image/heic", "image/heif",
 }
+CONVERTIBLE_IMAGE_TYPES = {"image/tiff", "image/heic", "image/heif"}
+PREVIEW_VERSION = 1
+PREVIEW_MAX_SOURCE_BYTES = 128*1024**2
+PREVIEW_MAX_SOURCE_PIXELS = 40_000_000
+PREVIEW_MAX_DIMENSION = 16384
+PREVIEW_MAX_EDGE = 2048
+PREVIEW_MAX_OUTPUT_BYTES = 8*1024**2
+PREVIEW_MEMORY_BYTES = 1024**3
+PREVIEW_CPU_SECONDS = 8
+PREVIEW_WALL_SECONDS = 12
+
+
+def _preview_policy():
+    return {'version':PREVIEW_VERSION,'source_bytes':PREVIEW_MAX_SOURCE_BYTES,'pixels':PREVIEW_MAX_SOURCE_PIXELS,
+        'dimension':PREVIEW_MAX_DIMENSION,'edge':PREVIEW_MAX_EDGE,'output_bytes':PREVIEW_MAX_OUTPUT_BYTES,
+        'memory_bytes':PREVIEW_MEMORY_BYTES,'cpu_seconds':PREVIEW_CPU_SECONDS}
+
+
+def _valid_preview_metadata(value,policy):
+    return isinstance(value,dict) and value.get('frame')=='primary_or_first' and all(
+        type(value.get(key)) is int and 0<value[key]<=policy['edge'] for key in ('width','height'))
+
+
+def _preview_worker(source,destination,metadata_path,policy):
+    """One resource-limited local decoder process; never write the source."""
+    try:
+        import resource
+        import warnings
+        resource.setrlimit(resource.RLIMIT_AS,(policy['memory_bytes'],policy['memory_bytes']))
+        resource.setrlimit(resource.RLIMIT_CPU,(policy['cpu_seconds'],policy['cpu_seconds']))
+        resource.setrlimit(resource.RLIMIT_FSIZE,(policy['output_bytes'],policy['output_bytes']))
+        from PIL import Image,ImageOps,UnidentifiedImageError
+        from pillow_heif import register_heif_opener
+        register_heif_opener(thumbnails=False,depth_images=False,aux_images=False)
+        Image.MAX_IMAGE_PIXELS=policy['pixels']
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('error',Image.DecompressionBombWarning)
+                with Image.open(source,formats=['TIFF','HEIF']) as image:
+                    width,height=image.size
+                    if width<1 or height<1 or width*height>policy['pixels'] or max(width,height)>policy['dimension']:
+                        return 2
+                    # A preview shows the primary/first frame only. All pages,
+                    # metadata and original pixels remain in the retained object.
+                    image.seek(0)
+                    oriented=ImageOps.exif_transpose(image)
+                    oriented.thumbnail((policy['edge'],policy['edge']),Image.Resampling.LANCZOS,reducing_gap=3)
+                    if 'A' in oriented.getbands():
+                        rgba=oriented.convert('RGBA');rendered=Image.new('RGB',rgba.size,'white');rendered.paste(rgba,mask=rgba.getchannel('A'))
+                    else:rendered=oriented.convert('RGB')
+                    rendered.save(destination,format='JPEG',quality=85,optimize=False,progressive=True)
+                    Path(metadata_path).write_text(json.dumps({'width':rendered.width,'height':rendered.height,'frame':'primary_or_first'}))
+        except (UnidentifiedImageError,Image.DecompressionBombError,Image.DecompressionBombWarning):
+            return 2
+        return 0
+    except Exception:
+        # Dependency, I/O and resource failures are retryable. Only explicit
+        # format/pixel-budget rejection above is safe to cache negatively.
+        return 3
+
+
+def _run_preview_worker(source,destination,metadata_path,policy,timeout):
+    result=subprocess.run([sys.executable,'-m','biography.media','--preview-worker',str(source),str(destination),
+        str(metadata_path),json.dumps(policy,separators=(',',':'))],cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=timeout,check=False)
+    if result.returncode==2:return {'status':'rejected'}
+    if result.returncode or not metadata_path.is_file() or metadata_path.stat().st_size>4096:return None
+    value=json.loads(metadata_path.read_text())
+    if not _valid_preview_metadata(value,policy):return None
+    return value
+
+
+def _cache_json(path,value):
+    descriptor,name=tempfile.mkstemp(prefix='metadata-',suffix='.part',dir=path.parent)
+    temporary=Path(name)
+    try:
+        with os.fdopen(descriptor,'w') as output:
+            json.dump(value,output,sort_keys=True);output.flush();os.fsync(output.fileno())
+        os.replace(temporary,path);fsync_directory(path.parent)
+    finally:temporary.unlink(missing_ok=True)
+
+
+def _try_preview_lock(paths,deadline):
+    while True:
+        for path in paths:
+            descriptor=os.open(path,os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0),0o600)
+            try:fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB);return descriptor
+            except BlockingIOError:os.close(descriptor)
+        if time.monotonic()>=deadline:return None
+        time.sleep(.025)
+
+
+def _image_preview(source,source_sha,cache_root):
+    """Lazy immutable-object preview. Filesystem cache writes never touch SQL."""
+    if not re.fullmatch(r'[0-9a-f]{64}',source_sha):return None
+    policy=_preview_policy()
+    try:before=FileSnapshot.capture(source)
+    except (OSError,RuntimeError):return None
+    if before.size>policy['source_bytes']:return None
+    policy_key=hashlib.sha256(json.dumps(policy,sort_keys=True).encode()).hexdigest()[:12]
+    root=Path(cache_root);bucket=root/f'v{PREVIEW_VERSION}'/source_sha[:2]
+    try:bucket.mkdir(parents=True,exist_ok=True,mode=0o700)
+    except OSError:return None
+    target=bucket/f'{source_sha}-{policy_key}.jpg';manifest=target.with_suffix('.json')
+    expected={'source_sha256':source_sha,'source_snapshot':before.to_dict(),'policy':policy}
+    def cached():
+        if manifest.is_symlink() or not manifest.is_file() or manifest.stat().st_size>65536:return None
+        try:
+            value=json.loads(manifest.read_text())
+            if not isinstance(value,dict):return None
+            if any(value.get(key)!=item for key,item in expected.items()):return None
+            if value.get('status')=='rejected':return value
+            if value.get('status')!='ready' or target.is_symlink() or not target.is_file() or target.stat().st_size>policy['output_bytes']:return None
+            if not _valid_preview_metadata(value,policy):return None
+            if sniff_media(target)[0]!='image/jpeg' or hash_file(target)[0]!=value.get('preview_sha256'):return None
+            return value
+        except (OSError,ValueError,RuntimeError):return None
+    value=cached()
+    if value is not None:return {'path':target,**value} if value['status']=='ready' else None
+    deadline=time.monotonic()+PREVIEW_WALL_SECONDS
+    try:lock=_try_preview_lock([target.with_suffix('.lock')],min(deadline,time.monotonic()+2))
+    except OSError:return None
+    if lock is None:return None
+    slot=None;temporary=None;details=None
+    try:
+        value=cached()
+        if value is not None:return {'path':target,**value} if value['status']=='ready' else None
+        slot=_try_preview_lock([root/'converter-0.lock',root/'converter-1.lock'],min(deadline,time.monotonic()+2))
+        if slot is None:return None
+        actual,_=hash_file(source,snapshot=before)
+        if actual!=source_sha:return None
+        descriptor,name=tempfile.mkstemp(prefix='preview-',suffix='.jpg.part',dir=bucket);os.close(descriptor)
+        temporary=Path(name);details=temporary.with_suffix('.info.json')
+        try:value=_run_preview_worker(source,temporary,details,policy,max(.01,deadline-time.monotonic()))
+        except subprocess.TimeoutExpired:return None
+        if FileSnapshot.capture(source)!=before:return None
+        if value and value.get('status')=='rejected':
+            _cache_json(manifest,{**expected,'status':'rejected'});return None
+        if not _valid_preview_metadata(value,policy) or not temporary.is_file() or temporary.stat().st_size>policy['output_bytes'] or sniff_media(temporary)[0]!='image/jpeg':return None
+        preview_sha,_=hash_file(temporary)
+        with temporary.open('rb') as data:os.fsync(data.fileno())
+        os.replace(temporary,target);fsync_directory(bucket)
+        result={**expected,**value,'status':'ready','preview_sha256':preview_sha}
+        _cache_json(manifest,result)
+        return {'path':target,**result}
+    except (OSError,ValueError,RuntimeError):return None
+    finally:
+        if temporary:temporary.unlink(missing_ok=True)
+        if details:details.unlink(missing_ok=True)
+        if slot is not None:os.close(slot)
+        os.close(lock)
 
 
 def ensure_schema(conn_or_path=None):
@@ -91,6 +250,8 @@ def sniff_media(path: Path, *, original_path="") -> tuple[str | None,str | None]
     mime = None
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         mime = "image/png"
+    elif data.startswith((b'II*\x00',b'MM\x00*',b'II+\x00',b'MM\x00+')):
+        mime = 'image/tiff'
     elif data.startswith(b"\xff\xd8\xff"):
         mime = "image/jpeg"
     elif data.startswith((b"GIF87a",b"GIF89a")):
@@ -105,8 +266,10 @@ def sniff_media(path: Path, *, original_path="") -> tuple[str | None,str | None]
         brands = data[8:64]
         if b"avif" in brands or b"avis" in brands:
             mime = "image/avif"
-        elif any(brand in brands for brand in (b"heic",b"heix",b"hevc",b"hevx",b"mif1")):
-            return None,None
+        elif any(brand in brands for brand in (b"heic",b"heix",b"heim",b"heis",b"hevc",b"hevx",b"hevm",b"hevs")):
+            mime='image/heic'
+        elif any(brand in brands for brand in (b'mif1',b'msf1')):
+            mime='image/heif'
         elif b"M4A " in brands or b"M4B " in brands or PurePosixPath(original_path).suffix.lower() in {".m4a",".m4b"}:
             mime = "audio/mp4"
         elif b"qt  " in brands:
@@ -173,7 +336,7 @@ def index_media_files(path=None, *, source_id=None, file_ids=None, refresh=False
             clauses.append("(st.file_id IS NULL OR st.version<>?)")
             args.append(INDEX_VERSION)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = conn.execute("""SELECT f.id,f.source_id,f.import_id,f.original_path,f.object_hash,o.path
+        rows = conn.execute("""SELECT f.id,f.source_id,f.import_id,f.original_path,f.object_hash,o.path,st.version AS indexed_version
             FROM files f JOIN objects o ON o.sha256=f.object_hash
             LEFT JOIN media_file_state st ON st.file_id=f.id""" + where,args)
         media_count = 0
@@ -183,11 +346,11 @@ def index_media_files(path=None, *, source_id=None, file_ids=None, refresh=False
             file_count += 1
             available = Path(row["path"]).is_file()
             probe = conn.execute("SELECT mime,kind,probe_status FROM media_object_index WHERE object_hash=?",(row["object_hash"],)).fetchone()
-            if probe is None or refresh or probe["probe_status"] == "unavailable" or not available:
+            if probe is None or refresh or probe["probe_status"] == "unavailable" or not available or (row['indexed_version']!=INDEX_VERSION and probe['mime'] is None):
                 mime,kind = sniff_media(Path(row["path"]),original_path=row["original_path"])
                 conn.execute("""INSERT INTO media_object_index(object_hash,mime,kind,probe_status) VALUES(?,?,?,?)
                     ON CONFLICT(object_hash) DO UPDATE SET mime=excluded.mime,kind=excluded.kind,probe_status=excluded.probe_status""",
-                    (row["object_hash"],mime,kind,"safe_media" if mime else "not_previewable" if available else "unavailable"))
+                    (row["object_hash"],mime,kind,"requires_preview" if mime in CONVERTIBLE_IMAGE_TYPES else "safe_media" if mime else "not_previewable" if available else "unavailable"))
             else:
                 mime,kind = probe["mime"],probe["kind"]
             conn.execute("DELETE FROM media_file_index WHERE file_id=?",(row["id"],))
@@ -563,10 +726,10 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
             ordinal = 0
             # Native-ID manifests may arrive later in the same source import.
             needs_refresh = bool(event["native_id"])
-            if event["category"] == "media":
+            if event["category"] in {"media","document"}:
                 for source_file in evidence:
                     own = conn.execute("SELECT * FROM media_file_index WHERE file_id=?",(source_file["id"],)).fetchone()
-                    if own is not None and own["object_hash"] not in resolved_hashes:
+                    if own is not None and (event['category']=='media' or own['mime'] in CONVERTIBLE_IMAGE_TYPES) and own["object_hash"] not in resolved_hashes:
                         conn.execute("INSERT INTO event_media_refs(event_id,ordinal,reference,caption,file_id,status,match_basis) VALUES(?,?,?,?,?,?,?)",
                                      (event["id"],ordinal,source_file["original_path"],event["title"],own["file_id"],"resolved","direct_source_evidence"))
                         ordinal += 1
@@ -601,7 +764,8 @@ def media_for_events(event_ids, path=None, *, include_unresolved=False) -> dict:
     if not event_ids:
         return result
     with _connection(path) as conn:
-        ensure_schema(conn)
+        if not conn.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='event_media_refs'").fetchone():
+            return result
         for start in range(0,len(event_ids),800):
             batch = event_ids[start:start+800]
             rows = conn.execute("""SELECT r.*,m.mime,m.kind FROM event_media_refs r
@@ -610,7 +774,7 @@ def media_for_events(event_ids, path=None, *, include_unresolved=False) -> dict:
             for row in rows:
                 if row["status"] == "resolved" and row["mime"] in SAFE_MIME_TYPES:
                     result[row["event_id"]].append({"file_id":row["file_id"],"url":f"/api/files/{row['file_id']}/media",
-                        "mime":row["mime"],"kind":row["kind"],"caption":row["caption"],"status":"resolved","match_basis":row["match_basis"]})
+                        "mime":'image/jpeg' if row['mime'] in CONVERTIBLE_IMAGE_TYPES else row["mime"],"original_mime":row['mime'],"kind":row["kind"],"caption":row["caption"],"status":"resolved","match_basis":row["match_basis"]})
                 elif include_unresolved:
                     result[row["event_id"]].append({"file_id":None,"url":None,"mime":None,"kind":None,
                         "caption":row["caption"],"status":row["status"],"reference":row["reference"],"match_basis":row["match_basis"]})
@@ -621,28 +785,43 @@ def media_for_event(event_id,path=None,*,include_unresolved=False):
     return media_for_events([event_id],path,include_unresolved=include_unresolved)[event_id]
 
 
-def media_file_info(file_id,path=None,*,objects_root=None):
+def media_file_info(file_id,path=None,*,objects_root=None,preview_root=None):
     """Return an approved local media path for a range-capable FileResponse."""
     with _connection(path) as conn:
-        ensure_schema(conn)
-        row = conn.execute("""SELECT f.original_path,o.path,m.mime,m.kind FROM files f
+        if not conn.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='media_file_index'").fetchone():
+            return None
+        row = conn.execute("""SELECT f.original_path,o.path,o.sha256,m.mime,m.kind FROM files f
             JOIN objects o ON o.sha256=f.object_hash JOIN media_file_index m ON m.file_id=f.id
             WHERE f.id=?""",(file_id,)).fetchone()
         if row is None:
             return None
-        original = Path(row["path"])
-        if original.is_symlink():
-            return None
-        retained = original.resolve()
-        root = Path(objects_root or settings.data_dir/"objects").resolve()
-        if not retained.is_relative_to(root) or not retained.is_file():
-            return None
-        mime,kind = sniff_media(retained,original_path=row["original_path"])
-        if mime not in SAFE_MIME_TYPES:
-            return None
-        return {"path":retained,"mime":mime,"kind":kind,
-                "filename":posixpath.basename(row["original_path"].replace("\\","/")).replace("\r","").replace("\n","")}
+        row=dict(row)
+    # Release catalog readers before any potentially slow local conversion.
+    original = Path(row["path"])
+    if original.is_symlink():
+        return None
+    retained = original.resolve()
+    root = Path(objects_root or settings.data_dir/"objects").resolve()
+    if not retained.is_relative_to(root) or not retained.is_file():
+        return None
+    mime,kind = sniff_media(retained,original_path=row["original_path"])
+    if mime not in SAFE_MIME_TYPES:
+        return None
+    filename=posixpath.basename(row["original_path"].replace("\\","/")).replace("\r","").replace("\n","")
+    if mime in CONVERTIBLE_IMAGE_TYPES:
+        cache=Path(preview_root) if preview_root is not None else settings.state_dir/'media-previews' if root==(settings.data_dir/'objects').resolve() else root.parent/'media-previews'
+        preview=_image_preview(retained,row['sha256'],cache)
+        if preview is None:return None
+        return {'path':preview['path'],'mime':'image/jpeg','kind':'image','filename':filename+'.preview.jpg',
+                'original_mime':mime,'derived':True,'width':preview['width'],'height':preview['height'],'frame':preview['frame']}
+    return {"path":retained,"mime":mime,"kind":kind,"filename":filename}
 
 
 __all__ = ["ensure_schema","index_media_files","index_explicit_manifests","explicit_references","reconcile_media",
            "media_for_events","media_for_event","media_file_info","sniff_media","SAFE_MIME_TYPES"]
+
+
+if __name__=='__main__':
+    if len(sys.argv)==6 and sys.argv[1]=='--preview-worker':
+        raise SystemExit(_preview_worker(Path(sys.argv[2]),Path(sys.argv[3]),Path(sys.argv[4]),json.loads(sys.argv[5])))
+    raise SystemExit(2)

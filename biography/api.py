@@ -85,10 +85,10 @@ def map_configuration():
     return result
 
 @app.get('/api/overview')
-def overview():return queries.overview()
+def overview():return queries.overview(settings.database)
 
 @app.get('/api/sources')
-def sources():return queries.sources()
+def sources():return queries.sources(settings.database)
 
 @app.get('/api/imports')
 def imports():return queries.imports()
@@ -145,7 +145,9 @@ def rollup_detail(rollup_id:str,limit:int=Query(50,ge=1,le=200),offset:int=Query
 
 @app.get('/api/events')
 def events(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0),sort:str='desc',undated:bool=False):
-    try:return queries.list_events(q=q,source=source,category=category,start=start,end=end,limit=limit,offset=offset,sort=sort,undated=undated)
+    try:return queries.list_events(settings.database,q=q,source=source,category=category,start=start,end=end,limit=limit,offset=offset,sort=sort,undated=undated)
+    except queries.RecordQueryTimeout as error:
+        raise HTTPException(503,'This record search took too long. Narrow the date range or source, or retry shortly.',headers={'Retry-After':'2'}) from error
     except ValueError as e:raise HTTPException(400,'Invalid date filter.') from e
 
 @app.get('/api/map')
@@ -159,7 +161,9 @@ def map_locations(q:str='',source:str='',category:str='',start:str=Query('',alia
 
 @app.get('/api/events/{event_id}')
 def event_detail(event_id:str):
-    event=queries.event_detail(event_id)
+    try:event=queries.event_detail(event_id)
+    except queries.RecordQueryTimeout as error:
+        raise HTTPException(503,'This record took too long to load. Retry shortly.',headers={'Retry-After':'2'}) from error
     if event is None:raise HTTPException(404,'Event not found.')
     return event
 

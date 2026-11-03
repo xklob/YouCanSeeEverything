@@ -176,7 +176,12 @@ def parse_date(value: Any, *, assume_utc: bool = False, unit: str | None = None)
             number = float(value)
             inferred_unit = unit or ("ns" if abs(number) >= 1e17 else "us" if abs(number) >= 1e14 else "ms" if abs(number) >= 1e11 else "s")
             divisor = {"s": 1, "ms": 1000, "us": 1_000_000, "ns": 1_000_000_000}[inferred_unit]
-            dt = datetime.fromtimestamp(number / divisor, UTC)
+            integral_source = isinstance(value, int) or isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip())
+            if integral_source and inferred_unit in {"ms", "us", "ns"}:
+                seconds, remainder = divmod(int(value), divisor)
+                dt = datetime.fromtimestamp(seconds, UTC).replace(microsecond=remainder * 1_000_000 // divisor)
+            else:
+                dt = datetime.fromtimestamp(number / divisor, UTC)
             metadata["timestamp_unit"] = inferred_unit
             precision = "microsecond" if inferred_unit in {"us", "ns"} or (inferred_unit == "s" and number != int(number)) else "millisecond" if inferred_unit == "ms" else "second"
             if inferred_unit == "ns":

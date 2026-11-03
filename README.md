@@ -47,6 +47,8 @@ The day index resumes where it stopped. Run `daily-build` again after more impor
 - **Imports:** view progress, extraction status, observed dates and gaps.
 - **Ask:** ask questions or generate a cited summary for a day or month. Answers describe selected evidence, not the entire archive.
 
+Records load before archive totals finish counting. Cached counts are labeled. Days may cover only part of the archive while the day index is building.
+
 Google Maps is the default when a key is configured. Otherwise the map uses OpenStreetMap. Either can be selected manually. See [Google Maps setup](docs/google-maps-setup.md).
 
 AI features use the Codex CLI's existing ChatGPT sign-in. Selected source excerpts are sent to that model. Dashboard edits are tested before activation and support undo. These features also require Bubblewrap and Playwright Chromium.

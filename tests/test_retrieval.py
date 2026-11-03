@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -43,7 +44,7 @@ def test_reliable_written_periods(prompt, period, first, last):
 
 def test_explicit_selection_wins_and_ambiguous_dates_do_not_silently_filter():
     assert retrieval.selection("What happened in 2020?", period="2024-05")["start"] == "2024-05-01"
-    for text in ("Compare 2023-01-01 with 2024-01-01", "Compare May 5, 2024 and June 2024", "What happened last month?"):
+    for text in ("Compare 2023-01-01 with 2024-01-01", "Compare May 5, 2024 and June 2024", "Compare my work in 2020 with 2024", "What happened last month?"):
         chosen = retrieval.selection(text)
         assert chosen["start"] is None
         assert chosen["warnings"]
@@ -65,6 +66,108 @@ def test_period_and_source_filters_are_strict_and_undated_remains_unknown(catalo
     assert result["coverage"]["sources"][0]["source_id"] == "journal"
     with pytest.raises(ValueError, match="not present"):
         retrieval.retrieve("", catalog, source_ids=["missing-source"])
+
+
+def test_empty_date_scope_does_not_search_global_fts(catalog, monkeypatch):
+    add(catalog, "ev-recent", when="2024-05-01", body="A trip to New York.")
+    queries = []
+    original = retrieval._connection
+
+    @contextmanager
+    def traced(path=None):
+        with original(path) as conn:
+            conn.set_trace_callback(queries.append)
+            yield conn
+
+    monkeypatch.setattr(retrieval, "_connection", traced)
+    result = retrieval.retrieve("New York on 1900-01-01", catalog)
+    assert result["selection"]["period"] == "1900-01-01"
+    assert result["coverage"]["total_events_in_scope"] == 0
+    assert result["evidence"] == []
+    assert not any("events_fts" in query for query in queries)
+
+
+def test_scope_metadata_uses_covering_ranges_without_global_counts(catalog, monkeypatch):
+    add(catalog, "ev-selected", when="2024-05-01")
+    add(catalog, "ev-other", source="reddit", when="2010-01-01")
+    queries, plans = [], []
+    original = retrieval._connection
+
+    @contextmanager
+    def traced(path=None):
+        with original(path) as conn:
+            def trace(query):
+                queries.append(query)
+                if query.startswith("SELECT count(1) total_events"):
+                    plans.extend(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + query))
+            conn.set_trace_callback(trace)
+            yield conn
+
+    monkeypatch.setattr(retrieval, "_connection", traced)
+    result = retrieval.catalog_state(catalog, period="2024-05", source_ids=["journal"])
+    assert result["coverage"]["total_events_in_scope"] == 1
+    assert result["watermark"]["catalog"]["events"] is None
+    assert plans and all("COVERING INDEX events_source" in plan for plan in plans)
+    assert not any(query.casefold().startswith("select count(*) from ") for query in queries)
+
+
+def test_fts_is_driven_by_selected_rowids_instead_of_global_rank(catalog, monkeypatch):
+    for index in range(60):
+        add(catalog, f"ev-noise-{index}", source="reddit", when="2010-01-01", body="A park trip with friends.")
+    add(catalog, "ev-relevant", when="2024-05-01", body="A park trip with friends.")
+    plans = []
+    original = retrieval._connection
+
+    @contextmanager
+    def traced(path=None):
+        with original(path) as conn:
+            def trace(query):
+                if query.startswith("WITH scoped") and "events_fts MATCH" in query:
+                    plans.extend(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + query))
+            conn.set_trace_callback(trace)
+            yield conn
+
+    monkeypatch.setattr(retrieval, "_connection", traced)
+    result = retrieval.retrieve("park trip in May 2024", catalog, source_ids=["journal"])
+    assert [event["id"] for event in result["evidence"]] == ["ev-relevant"]
+    access = [plan for plan in plans if "events_fts VIRTUAL TABLE" in plan]
+    assert access and all("=" in plan and "M" in plan for plan in access)
+    assert result["coverage"]["lexical_search_pool"]["records"] == 1
+
+
+def test_large_scopes_bound_text_search_and_disclose_sampled_coverage(catalog, monkeypatch):
+    monkeypatch.setattr(retrieval, "MAX_SEARCH_POOL", 16)
+    for index in range(40):
+        add(catalog, f"ev-scoped-{index}", when=f"2024-05-{index % 28 + 1:02d}", body=f"Park observation {index}.")
+    result = retrieval.retrieve("park in May 2024", catalog, source_ids=["journal"])
+    scope = result["coverage"]["lexical_search_pool"]
+    assert scope["limited"] and 0 < scope["records"] <= 16
+    assert len(result["evidence"]) <= 16
+    assert any("only sampled records were text-searched" in note for note in result["coverage"]["limitations"])
+
+
+def test_background_context_never_reorders_into_full_events_scan(catalog, monkeypatch):
+    with connect(catalog) as conn:
+        for index in range(300):
+            identity = f"ev-context-{index}"
+            conn.execute("INSERT INTO events(id,source_id,title,body,occurred_at,category,time_precision,metadata,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (identity, "journal", "Park visit", str(index), "2024-05-01", "note", "day", "{}", "2024-01-01"))
+            conn.execute("INSERT INTO evidence VALUES(?,?,?,?)", (identity, "file-journal", "$[0]", "fixture"))
+    plans = []
+    original = retrieval._connection
+
+    @contextmanager
+    def traced(path=None):
+        with original(path) as conn:
+            def trace(query):
+                if query.startswith("WITH scoped") and "ranked AS" in query:
+                    plans.extend(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + query))
+            conn.set_trace_callback(trace)
+            yield conn
+
+    monkeypatch.setattr(retrieval, "_connection", traced)
+    result = retrieval.retrieve("", catalog, period="2024-05", source_ids=["journal"])
+    assert result["evidence"]
+    assert plans and not any(plan.startswith("SCAN e ") for plan in plans)
 
 
 def test_named_source_constraint_in_question_is_not_an_all_source_search(catalog):

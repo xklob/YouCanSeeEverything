@@ -135,9 +135,10 @@ def end_daily_mutation(token,catalog_path=None,*,sidecar_path=None,reason=None):
 @contextmanager
 def _readonly(path,timeout=3):
     conn=sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True,timeout=timeout)
-    conn.row_factory=sqlite3.Row
-    conn.execute('PRAGMA query_only=ON')
-    try:yield conn
+    try:
+        conn.row_factory=sqlite3.Row
+        conn.execute('PRAGMA query_only=ON')
+        yield conn
     finally:conn.close()
 
 
@@ -149,8 +150,13 @@ def _classifier():
 
 
 def _catalog_head(path):
-    with _readonly(path) as conn:
-        row=conn.execute('SELECT rowid,id FROM events ORDER BY rowid DESC LIMIT 1').fetchone()
+    started=time.monotonic()
+    try:
+        with _readonly(path) as conn:
+            row=conn.execute('SELECT rowid,id FROM events ORDER BY rowid DESC LIMIT 1').fetchone()
+    except sqlite3.OperationalError as error:
+        error.daily_stage='catalog_head';error.daily_read_seconds=time.monotonic()-started;error.daily_busy_timeout=3
+        raise
     stat=path.stat()
     return {'max_rowid':row['rowid'] if row else 0,'last_event_id':row['id'] if row else None,'file_identity':[stat.st_dev,stat.st_ino]}
 
@@ -259,16 +265,27 @@ def _provenance(conn,rows,cache):
     return result
 
 
-def _batch(catalog,after,watermark,size,max_bytes,cache):
-    with _readonly(catalog,timeout=5) as conn:
-        conn.execute('BEGIN')
-        sources={row['id']:row['name'] for row in conn.execute('SELECT id,name FROM sources')}
-        rows=[];bytes_read=0
-        for row in conn.execute('SELECT rowid AS catalog_rowid,* FROM events WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?',(after,watermark,size)):
-            length=len(row['metadata'] or '')+len(row['body'] or '')+len(row['title'] or '')
-            if rows and bytes_read+length>max_bytes:break
-            rows.append(dict(row));bytes_read+=length
-        provenance=_provenance(conn,rows,cache)
+def _batch(catalog,after,watermark,size,max_bytes,cache,*,timings=None):
+    started=time.monotonic();stage='catalog_open';stages={}
+    try:
+        with _readonly(catalog,timeout=5) as conn:
+            stages[stage]=time.monotonic()-started;stage='source_names';part=time.monotonic()
+            conn.execute('BEGIN')
+            sources={row['id']:row['name'] for row in conn.execute('SELECT id,name FROM sources')}
+            stages[stage]=time.monotonic()-part;stage='event_rows';part=time.monotonic()
+            rows=[];bytes_read=0
+            for row in conn.execute('SELECT rowid AS catalog_rowid,* FROM events WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?',(after,watermark,size)):
+                length=len(row['metadata'] or '')+len(row['body'] or '')+len(row['title'] or '')
+                if rows and bytes_read+length>max_bytes:break
+                rows.append(dict(row));bytes_read+=length
+            stages[stage]=time.monotonic()-part;stage='source_evidence';part=time.monotonic()
+            provenance=_provenance(conn,rows,cache)
+            stages[stage]=time.monotonic()-part;stage='catalog_close';part=time.monotonic()
+        stages[stage]=time.monotonic()-part
+    except sqlite3.OperationalError as error:
+        error.daily_stage=stage;error.daily_read_seconds=time.monotonic()-started;error.daily_busy_timeout=5
+        raise
+    if timings is not None:timings.update(source_read_seconds=round(time.monotonic()-started,6),source_stage_seconds={name:round(value,6) for name,value in stages.items()})
     for row in rows:
         row['metadata']=_metadata(row['metadata'])
         row['source_name']=sources.get(row['source_id'],'Unknown source')
@@ -430,17 +447,19 @@ def build_daily(catalog_path=None,sidecar_path=None,*,batch_size=2000,max_batche
         while checkpoint<target and (max_batches is None or batches<max_batches) and (max_seconds is None or time.monotonic()-started<max_seconds):
             if _active_mutations(catalog,sidecar) or _state(conn).get('invalidated_reason'):raise ImportPaused('daily_source_mutation_active')
             _capacity(sidecar,paths,reserve_bytes,8*1024**2+batch_size*1024)
-            rows,provenance,read_bytes=_batch(catalog,checkpoint,target,batch_size,max_batch_bytes,cache)
+            timings={}
+            rows,provenance,read_bytes=_batch(catalog,checkpoint,target,batch_size,max_batch_bytes,cache,timings=timings)
             if not rows:
                 with conn:_set(conn,checkpoint_rowid=target)
                 checkpoint=target;break
+            projection_started=time.monotonic()
             with conn:
                 changes=_write_batch(conn,rows,provenance,classify)
                 if _active_mutations(catalog,sidecar):raise ImportPaused('daily_source_mutation_active')
                 checkpoint=rows[-1]['catalog_rowid'];state=_state(conn)
                 _set(conn,checkpoint_rowid=checkpoint,processed_records=state['processed_records']+len(rows),anchor_rowid=checkpoint,anchor_event_id=rows[-1]['id'],updated_at=_now(),status='building')
             batches+=1
-            if progress:progress({'event':'daily_batch','rows':len(rows),'catalog_bytes':read_bytes,'checkpoint_rowid':checkpoint,'watermark_rowid':target,'seconds':round(time.monotonic()-started,3),**changes})
+            if progress:progress({'event':'daily_batch','rows':len(rows),'catalog_bytes':read_bytes,'checkpoint_rowid':checkpoint,'watermark_rowid':target,'seconds':round(time.monotonic()-started,3),'projection_seconds':round(time.monotonic()-projection_started,6),**timings,**changes})
         with conn:
             if _active_mutations(catalog,sidecar) or _state(conn).get('invalidated_reason'):raise ImportPaused('daily_source_mutation_active')
             complete=checkpoint>=target
@@ -448,7 +467,7 @@ def build_daily(catalog_path=None,sidecar_path=None,*,batch_size=2000,max_batche
             conn.execute('UPDATE builds SET status=?,finished_at=? WHERE id=?',('complete' if complete else 'paused',_now() if complete else None,job))
         conn.execute('PRAGMA wal_checkpoint(PASSIVE)')
     except BaseException as error:
-        contention=ImportPaused('daily_database_locked',sqlite_errorcode=getattr(error,'sqlite_errorcode',None)) if _sqlite_lock(error) else None
+        contention=ImportPaused('daily_database_locked',sqlite_errorcode=getattr(error,'sqlite_errorcode',None),sqlite_errorname=getattr(error,'sqlite_errorname',None),stage=getattr(error,'daily_stage','sidecar_or_unspecified'),read_seconds=round(getattr(error,'daily_read_seconds',0),6),busy_timeout_seconds=getattr(error,'daily_busy_timeout',None)) if _sqlite_lock(error) else None
         try:
             with conn:_set(conn,status='paused' if contention or isinstance(error,(ImportPaused,KeyboardInterrupt)) else 'failed',last_error=type(error).__name__,last_pause_reason=contention.reason if contention else getattr(error,'reason',None),updated_at=_now())
         except sqlite3.Error:pass
@@ -529,13 +548,13 @@ def _events(catalog,rowids,*,provenance=True):
             attachments={}
             available={row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE name IN ('event_media_refs','media_file_index')")}
             if len(available)==2:
-                from .media import SAFE_MIME_TYPES
+                from .media import SAFE_MIME_TYPES,CONVERTIBLE_IMAGE_TYPES
                 event_ids=[row['id'] for row in rows]
                 media_rows=conn.execute('''SELECT r.event_id,r.file_id,r.caption,r.match_basis,m.mime,m.kind
                     FROM event_media_refs r JOIN media_file_index m ON m.file_id=r.file_id
                     WHERE r.status='resolved' AND r.event_id IN ('''+','.join('?' for _ in event_ids)+') ORDER BY r.event_id,r.ordinal',event_ids) if event_ids else []
                 for media in media_rows:
-                    if media['mime'] in SAFE_MIME_TYPES:attachments.setdefault(media['event_id'],[]).append({'file_id':media['file_id'],'url':f"/api/files/{media['file_id']}/media",'mime':media['mime'],'kind':media['kind'],'caption':media['caption'],'status':'resolved','match_basis':media['match_basis']})
+                    if media['mime'] in SAFE_MIME_TYPES:attachments.setdefault(media['event_id'],[]).append({'file_id':media['file_id'],'url':f"/api/files/{media['file_id']}/media",'mime':'image/jpeg' if media['mime'] in CONVERTIBLE_IMAGE_TYPES else media['mime'],'original_mime':media['mime'],'kind':media['kind'],'caption':media['caption'],'status':'resolved','match_basis':media['match_basis']})
             for row in rows:
                 row['metadata']=_metadata(row['metadata'])
                 row['provenance']=[{**item,'path':item.get('original_path'),'sha256':item.get('object_hash')} for item in links.get(row['id'],[])]

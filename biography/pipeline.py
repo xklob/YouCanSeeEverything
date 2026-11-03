@@ -9,9 +9,10 @@ import re
 import time
 import uuid
 from .config import settings
-from .db import init_db,transaction,identity,now,register_source,add_events
+from .db import init_db,transaction,write_transaction,identity,now,register_source,add_events
 
 SKIP_INDEX_DIRS={'.git','.obsidian','node_modules','__pycache__'}
+INDEX_BATCH_SIZE=500
 
 def dataset_inventory(export_root=None):
     root=Path(export_root or settings.export_root)
@@ -51,8 +52,9 @@ def worker_lock(data_dir=None):
         yield
 
 def index_stored(stored,source_id,import_id,source_name,db_path=None,*,index_content=True):
-    from .parsers import parse_file
+    from .parsers import parse_file,ParseResult
     from .media import index_media_files
+    from .storage import ImportPaused
     if stored.source_path:
         try:
             relative=Path(stored.source_path).relative_to(settings.export_root/source_name)
@@ -60,12 +62,18 @@ def index_stored(stored,source_id,import_id,source_name,db_path=None,*,index_con
         except ValueError:pass
     chain=json.dumps(stored.archive_chain,sort_keys=True)
     fid=identity(source_id,stored.original_path,chain,stored.sha256)
+    # Archive replay often encounters hundreds of thousands of completed files.
+    # Checking them needs no writer lock. Recheck after acquiring the writer.
     with transaction(db_path) as conn:
+        existing=conn.execute('SELECT parse_status FROM files WHERE id=?',(fid,)).fetchone()
+        if existing and existing['parse_status'] not in ('pending','error'):return 0
+    with write_transaction(db_path) as conn:
         conn.execute('INSERT OR IGNORE INTO objects(sha256,bytes,path,verified_at) VALUES(?,?,?,?)',(stored.sha256,stored.size,str(stored.path),now()))
         existing=conn.execute('SELECT parse_status FROM files WHERE id=?',(fid,)).fetchone()
         if existing and existing['parse_status'] not in ('pending','error'):return 0
         conn.execute('''INSERT OR IGNORE INTO files(id,source_id,import_id,original_path,object_hash,bytes,locator,metadata,created_at)
           VALUES(?,?,?,?,?,?,?,?,?)''',(fid,source_id,import_id,stored.original_path,stored.sha256,stored.size,chain,json.dumps({'archive_chain':stored.archive_chain,'disposition':stored.disposition,'media_type':stored.media_type,'index_content':index_content}),now()))
+        conn.execute("UPDATE files SET parse_status='pending' WHERE id=?",(fid,))
         # Sniff each retained file once before its records are registered. This
         # lets the event hook recognize direct media without per-record I/O.
         index_media_files(conn,file_ids=[fid])
@@ -73,22 +81,35 @@ def index_stored(stored,source_id,import_id,source_name,db_path=None,*,index_con
     native_document=Path(stored.original_path).suffix.lower() in {'.docx','.odt','.epub','.xlsx','.pptx'}
     supporting_history=(source_name in {'GitHub & local Git','Ethereum mainnet'} and Path(stored.original_path).name not in {'commits.jsonl','transactions.jsonl','token-transfers.jsonl','internal-transactions.jsonl'})
     if not index_content or (stored.disposition!='retained_leaf' and not native_document) or parts & SKIP_INDEX_DIRS or supporting_history:
-        with transaction(db_path) as conn:conn.execute("UPDATE files SET parse_status='retained',notes=? WHERE id=?",(json.dumps(['Retained source bytes; not indexed as personal activity.']),fid))
+        with write_transaction(db_path) as conn:conn.execute("UPDATE files SET parse_status='retained',notes=? WHERE id=?",(json.dumps(['Retained source bytes; not indexed as personal activity.']),fid))
         return 0
+    count=0
+    result=None
     try:
         result=parse_file(Path(stored.path),stored.original_path,source_name,excluded_directory_names=settings.excluded_directory_names)
         if result.status=='needs_fallback':
             from .adaptive import adapt_file
             result=adapt_file(Path(stored.path),stored.original_path,source_name,result,
                 settings.state_dir/'agent-jobs')
-        with transaction(db_path) as conn:
-            count=add_events(conn,source_id,fid,stored.sha256,result)
+        # Keep large files resumable and let other workers commit between
+        # batches. Stable identities and absolute fallback locators make replay
+        # idempotent after an interruption. Pending files are never complete.
+        for offset in range(0,len(result.events),INDEX_BATCH_SIZE):
+            batch=ParseResult(parser=result.parser,events=result.events[offset:offset+INDEX_BATCH_SIZE])
+            with write_transaction(db_path) as conn:
+                inserted=add_events(conn,source_id,fid,stored.sha256,batch,event_offset=offset)
+            count+=inserted
+        with write_transaction(db_path) as conn:
             conn.execute('UPDATE files SET parser=?,parse_status=?,notes=? WHERE id=?',(result.parser,result.status,json.dumps(result.notes),fid))
         return count
+    except ImportPaused:
+        raise
     except Exception as error:
-        with transaction(db_path) as conn:
+        with write_transaction(db_path) as conn:
             conn.execute("UPDATE files SET parse_status='error',notes=? WHERE id=?",(json.dumps([f'{type(error).__name__}: {str(error)[:500]}']),fid))
-        return 0
+        return count
+    finally:
+        if result is not None and hasattr(result.events,'close'):result.events.close()
 
 def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,cleanup_root=None):
     from .importer import ingest_path,StoredFile
@@ -108,7 +129,7 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
     outer_exports=set()
     if preflight.exists():
         outer_exports={a['path'] for a in json.loads(preflight.read_text()).get('archives',[]) if a.get('category')=='Meta'}
-    with transaction(db_path) as conn:
+    with write_transaction(db_path) as conn:
         conn.execute('INSERT INTO imports(id,source_id,status,total_files,total_bytes,started_at) VALUES(?,?,?,?,?,?)',(iid,sid,'running',len(paths),sum(p.stat().st_size for p in paths),now()))
         conn.execute("UPDATE sources SET status='importing',updated_at=? WHERE id=?",(now(),sid))
     completed=byte_count=events=failures=0
@@ -129,7 +150,7 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
                     events+=index_item(StoredFile(**values))
                 if time.monotonic()-heartbeat>2:
                     heartbeat=time.monotonic()
-                    with transaction(db_path) as conn:
+                    with write_transaction(db_path) as conn:
                         conn.execute('UPDATE imports SET events=?,checkpoint=? WHERE id=?',(events,json.dumps({'current_source':str(source),'phase':phase}),iid))
             report=ingest_path(source,data_dir,delete_source=move,allowed_root=Path(cleanup_root or settings.export_root),
                 reserve_bytes=settings.reserve_bytes,windows_reserve_bytes=50*1024**3,progress=storage_progress,
@@ -138,10 +159,10 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
             for stored in report.files:events+=index_item(stored)
             if report.status!='complete':failures+=max(1,len(report.exceptions))
             completed+=1;byte_count+=source_size
-            with transaction(db_path) as conn:
+            with write_transaction(db_path) as conn:
                 conn.execute('UPDATE imports SET completed_files=?,completed_bytes=?,events=?,checkpoint=? WHERE id=?',(completed,byte_count,events,json.dumps({'last_source':str(source),'last_manifest':str(report.manifest_path),'storage_status':report.status}),iid))
             if progress:progress({'source':dataset['name'],'completed_files':completed,'total_files':len(paths),'events':events,'status':report.status})
-        with transaction(db_path) as conn:
+        with write_transaction(db_path) as conn:
             parse_errors=conn.execute("SELECT count(*) FROM files WHERE source_id=? AND parse_status IN ('error','needs_fallback','partial')",(sid,)).fetchone()[0]
             remaining=sum(p.exists() for p in paths) if move else 0
             state='partial' if failures or parse_errors or remaining else 'ready'
@@ -171,7 +192,7 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
         return {'id':iid,'source':dataset['name'],'status':state,'files':completed,'events_added':events,'storage_exceptions':failures,'parse_errors':parse_errors}
     except Exception as error:
         state='paused' if isinstance(error,ImportPaused) else 'failed'
-        with transaction(db_path) as conn:
+        with write_transaction(db_path) as conn:
             checkpoint=json.loads(conn.execute('SELECT checkpoint FROM imports WHERE id=?',(iid,)).fetchone()[0] or '{}')
             checkpoint.update(raw_complete=raw_complete,phase='postprocessing' if raw_complete else 'ingestion',postprocessing_complete=False)
             if raw_complete:

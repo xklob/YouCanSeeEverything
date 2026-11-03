@@ -5,6 +5,7 @@ from pathlib import Path
 import hashlib
 import json
 import sqlite3
+import time
 from .config import settings
 
 def now():
@@ -102,6 +103,43 @@ def transaction(path=None):
     finally:
         conn.close()
 
+
+def is_busy(error):
+    code = getattr(error, 'sqlite_errorcode', None)
+    if code is not None:
+        return (code & 255) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    return str(error).lower() in {'database is locked', 'database table is locked'}
+
+
+@contextmanager
+def write_transaction(path=None, *, wait_seconds=60):
+    """Acquire a writer before reading, retrying only lock acquisition.
+
+    The body executes once. An exhausted wait pauses ingestion without turning
+    a temporary database lock into a permanent file extraction failure.
+    """
+    from .storage import ImportPaused
+    conn = connect(path)
+    deadline = time.monotonic() + max(0, wait_seconds)
+    try:
+        while True:
+            remaining = max(0, deadline - time.monotonic())
+            conn.execute(f'PRAGMA busy_timeout={int(min(1, remaining) * 1000)}')
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                break
+            except sqlite3.OperationalError as error:
+                if not is_busy(error):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ImportPaused('catalog_busy') from error
+                time.sleep(min(.05, remaining))
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
 def register_source(name: str, roots: list[str], size: int, order: int, path=None):
     sid = identity("source", settings.account_key, name)
     with transaction(path) as conn:
@@ -113,13 +151,13 @@ def register_source(name: str, roots: list[str], size: int, order: int, path=Non
           (sid,name,settings.account_key,json.dumps(roots),size,order,now(),now()))
     return sid
 
-def add_events(conn, source_id, file_id, object_hash, result):
+def add_events(conn, source_id, file_id, object_hash, result, *, event_offset=0):
     from .media import ensure_schema,record_media_candidate
     ensure_schema(conn)
     own_media=conn.execute('SELECT mime FROM media_file_index WHERE file_id=?',(file_id,)).fetchone()
     own_mime=own_media[0] if own_media else None
     count = 0
-    for index, event in enumerate(result.events):
+    for index, event in enumerate(result.events, start=event_offset):
         title = str(event.get("title") or "Untitled record")
         body = str(event.get("body") or "")
         metadata = event.get("metadata") or {}

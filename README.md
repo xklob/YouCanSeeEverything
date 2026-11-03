@@ -41,6 +41,11 @@ Day indexing and media discovery resume where they stopped. Repeat `daily-build`
 
 Location indexing runs in small batches during import and saves its progress between batches.
 
+Large files also commit records in small batches so background workers can share
+the catalog. A temporary writer lock is retried before ingestion pauses. Rerunning
+the import reuses retained files and deduplicates committed records; unfinished
+files remain pending until extraction completes.
+
 Existing catalogs need an initial count with `counts-build`; repeat it until complete. Later inserts, edits and deletions update totals automatically. While counting, the app labels the known subtotal instead of guessing the total.
 
 `--move` deletes export copies only after verified retention. Use it on export folders. Active notes, repositories and application histories should be snapshotted first.

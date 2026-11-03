@@ -176,6 +176,8 @@ class _Importer:
         if self.progress:
             try:
                 self.progress({"event": event, **data})
+            except ImportPaused:
+                raise
             except Exception as error:
                 raise ProgressCallbackError(f"Import callback failed during {event}") from error
 

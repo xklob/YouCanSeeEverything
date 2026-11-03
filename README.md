@@ -1,4 +1,4 @@
-# YouCanSeeEverything
+# You Can See Everything
 
 A local archive for personal data exports. Search records, browse days and trips, view attached media, and open the original files.
 

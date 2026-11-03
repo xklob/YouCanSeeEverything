@@ -91,6 +91,14 @@ def test_pre_turn_diagnostic_errors_are_not_tool_calls(fake_cli, state):
     assert status["startup_diagnostics"] == 1
 
 
+def test_only_numeric_usage_counters_retained(fake_cli, state):
+    fake_cli(response={"answer": "Supported", "citations": []}, event={"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 12, "credential": "must-not-be-retained", "total_tokens": True}})
+    result = agents.ask("Question", [], state)
+    status = json.loads((Path(result["artifact_dir"]) / "status.json").read_text())
+    assert status["usage"] == {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 12}
+    assert "must-not-be-retained" not in (Path(result["artifact_dir"]) / "events.json").read_text()
+
+
 def test_error_item_after_turn_started_fails(fake_cli, state):
     fake_cli(response={"answer": "Partial", "citations": []}, event={"type": "item.completed", "item": {"type": "error"}})
     with pytest.raises(agents.AgentError) as error:

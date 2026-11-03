@@ -1,22 +1,12 @@
 # YouCanSeeEverything
 
-A local personal-history archive: import exported data, search one timeline, explore places alongside events, and inspect the original evidence. FastAPI and SQLite provide the catalog and full-text search; React provides the dashboard. Unique source bytes live in a content-addressed vault outside Git.
+A local archive for personal data exports. Search records, browse days and trips, view attached media, and open the original files.
 
-This is an early, single-user application. It binds to localhost. A public source-code checkout and a separate private profile/data directory are the intended deployment arrangement.
+Python, SQLite and React. Runs on localhost for one user. Personal data stays outside the public repository.
 
-## Preview
+## Run
 
-These screenshots use entirely fictional records and generated illustrations. The map background is a labeled schematic, not provider imagery. No personal archive was used.
-
-![Unified timeline with fictional journal, calendar and location records](docs/screenshots/timeline.png)
-
-![Recorded places and dotted inferred connections with their supporting evidence](docs/screenshots/map.png)
-
-![A fictional post with inline media and its original-source evidence](docs/screenshots/evidence.png)
-
-## Run locally
-
-Requirements: Python 3.11+, Node.js 20+, `uv`, and Linux or WSL. Codex features additionally need the Codex CLI signed into ChatGPT, Bubblewrap, and Playwright Chromium. AI features use existing subscription authentication without a separately billed model API key. Google Maps is an optional, separately configured map provider.
+Requires Python 3.11+, Node.js 20+, `uv`, and Linux or WSL.
 
 ```sh
 uv sync --extra dev
@@ -25,63 +15,69 @@ npm ci
 npm run build
 cd ..
 cp profile.example.json /path/to/private/profile.json
-# Edit the private profile to point at your export and state directories.
+# Set the export and storage paths in that file.
 export BIOGRAPHY_PROFILE=/path/to/private/profile.json
 uv run biography init
 uv run biography serve
 ```
 
-Open <http://localhost:8000>. Keep the state directory under a directory named `.local`, for example `/path/to/private/.local`. Do not serve this application on a public interface; multi-user authentication and tenant isolation are not implemented.
+Open <http://localhost:8000>.
 
-## Import and retain data
+## Import
 
-Put each service's exports in its own directory under `export_root`, then inspect the inventory:
+Put exports in service folders under the profile's `export_root`.
 
 ```sh
 uv run biography plan
 uv run biography import --source "Example Service"
+uv run biography daily-build
 ```
 
-Imports copy and independently verify original bytes by SHA-256. Repeated identical bytes share one object; records retain source-file hashes and locators. Native archive attachments remain intact. Source variants are retained. Unknown dates stay unknown, and date-only values are not turned into invented precise times.
+Original files are retained by content hash. Identical bytes share one copy. Records keep links to their sources. Unsupported files remain available for later extraction.
 
-`--move` explicitly enables deletion of exact, verified source copies inside the configured export root. Never point a move import at an active notes vault, repository, or application history. Snapshot active sources first. Outer export containers are discarded only when separately classified and fully reconciled; an unresolved archive remains available for review. Space reserves pause work rather than consuming all available disk.
+The day index resumes where it stopped. Run `daily-build` again after more imports or to continue a large index.
 
-The parser supports JSON/JSONL, CSV, calendar, text/Markdown, HTML, several document formats, exercise tracks, and common export structures. An optional Codex fallback proposes bounded declarative mappings or evidence-quoted text records. Unrecognized content is retained and reported. Supporting a format does not imply complete coverage of every service or every field.
+`--move` deletes export copies only after verified retention. Use it on export folders. Active notes, repositories and application histories should be snapshotted first.
 
-## Explore and change the dashboard
+## Browse
 
-- Search and filter the timeline by source, category and date; open records to inspect provenance and download retained originals.
-- Use the map for explicit source coordinates. Same-day context is a temporal association, not a claim that a post was written at that place. OpenStreetMap is the default; the background can be hidden or switched to optional Google Maps after [local setup](docs/google-maps-setup.md).
-- Follow faint dotted connections between adjacent recorded stops. Select a connection to inspect its endpoint records, dates and straight-line distance. Gaps and implausible intervals break connections; lines do not claim the exact route traveled.
-- View explicitly associated local images and videos alongside records. Unresolved or ambiguous media references are not guessed.
-- Ask Codex questions using retrieved evidence, or request a dashboard change. Changes build in an isolated workspace, pass checks and a browser smoke test, then activate atomically. Undo restores the previous UI. UI undo does not delete imported data.
+- **Records:** search and filter imported entries; view media and source files.
+- **Days:** group entries by day, summarize measurement samples, and expand the underlying records.
+- **Map and Trips:** browse recorded locations and inferred connections. Dashed lines connect known stops; the actual route may be unknown.
+- **Imports:** view progress, extraction status, observed dates and gaps.
+- **Ask:** ask questions or generate a cited summary for a day or month. Answers describe selected evidence, not the entire archive.
 
-Model processing sends selected imported content to the signed-in cloud model. Imported text is treated as untrusted data. The model cannot execute arbitrary ingestion scripts or shell commands through the fallback. Shell and agent-log collectors create redacted, visible-message projections; they omit hidden reasoning and tool results.
+Google Maps is the default when a key is configured. Otherwise the map uses OpenStreetMap. Either can be selected manually. See [Google Maps setup](docs/google-maps-setup.md).
 
-## Keep personal state separate
+AI features use the Codex CLI's existing ChatGPT sign-in. Selected source excerpts are sent to that model. Dashboard edits are tested before activation and support undo. These features also require Bubblewrap and Playwright Chromium.
 
-The public repository contains application code, synthetic tests, and generic examples only. Set `BIOGRAPHY_PROFILE` to a JSON file in your private workspace. `BIOGRAPHY_STATE_DIR`, `BIOGRAPHY_DATA_DIR`, and `BIOGRAPHY_EXPORT_ROOT` can override profile paths.
+## Storage and backups
 
-Keep raw objects, live databases, agent logs, personal screenshots, build artifacts and credentials out of ordinary Git. A private repository can hold configuration, normalized snapshots, analysis, manifests, and dashboard customizations. A records snapshot is not a backup of original media; preserve or separately back up the content-addressed vault.
+Keep the profile, database, source vault, credentials and personal screenshots outside this repository. Use a private repository for configuration and reviewed metadata. A metadata snapshot does not include original media. See [backup and restore](docs/backups.md).
 
-## Validate
+## Screenshots
+
+Fictional records and generated artwork only. The map background is a schematic.
+
+![Records and attached media](docs/screenshots/timeline.png)
+
+<details>
+<summary>Map and source details</summary>
+
+![Map and inferred connection](docs/screenshots/map.png)
+![Record and original source](docs/screenshots/evidence.png)
+
+</details>
+
+## Check changes
 
 ```sh
 uv run pytest
-cd web
-npm test
-npm run build
-cd ..
+cd web && npm test && npm run build && cd ..
 uv run playwright install chromium
 uv run python scripts/check_dashboard.py --dist web/dist --fixture --output .local/checks
 ```
 
-Tests cover source cleanup safety, archive traversal and hardlinks, content readback, identity and timestamp behavior, parsing, localhost API boundaries, and isolated model-driven revisions. Fixture browser checks use synthetic data and block external network requests.
+Regenerate the fictional screenshots with `uv run python scripts/generate_demo_screenshots.py` after building the frontend.
 
-Regenerate the public screenshots with `uv run python scripts/generate_demo_screenshots.py` after building the frontend. Its fixture-only server generates invented records and local artwork, with no live database or external map requests.
-
-## Scope and roadmap
-
-The first release emphasizes a source-backed timeline, map, retained media, and reversible dashboard edits. Remaining product work includes richer entity resolution, semantic retrieval, OCR/transcription, broader format coverage, background scheduling, per-user isolation and authenticated deployment. Inferences must preserve uncertainty and link back to evidence.
-
-MIT licensed. Do not contribute personal exports or real credentials in examples, test fixtures, issues, or screenshots.
+MIT license. Use synthetic data in tests, examples and public screenshots.

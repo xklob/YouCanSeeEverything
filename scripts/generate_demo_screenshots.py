@@ -39,19 +39,32 @@ ILLUSTRATION = """<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="4
 
 def demo_records():
     records = [
-        dict(id="demo-post-waterfront", title="A little music by the water", body="A small room, warm synths, and the best kind of Saturday. I brought a notebook home full of melodies. More weekends like this, please.", occurred_at="2025-04-19T20:30:00Z", source_id="demo-journal", source="Journal", category="post", time_precision="second", media=[dict(file_id="demo-illustration", url="/api/files/demo-illustration/media", mime="image/png", kind="image", caption="A weekend in the Northwest · generated demo illustration")]),
-        dict(id="demo-calendar-music", title="An evening at the Lantern Room", body="Fictional calendar entry: an intimate electronic music night with friends. Doors at seven, a new favorite track by eight.", occurred_at="2025-04-19T19:00:00Z", source_id="demo-calendar", source="Calendar", category="event_booking", time_precision="second"),
-        dict(id="demo-portland", title="An afternoon in Portland", body="A fictional location record saved during a weekend away.", occurred_at="2025-04-19T14:30:00Z", source_id="demo-locations", source="Recorded places", category="location", time_precision="second"),
-        dict(id="demo-olympia", title="A pause in Olympia", body="A fictional stop recorded between two city visits.", occurred_at="2025-04-18T11:00:00Z", source_id="demo-locations", source="Recorded places", category="location", time_precision="second"),
-        dict(id="demo-seattle-water", title="A walk along the Seattle waterfront", body="A fictional waterfront location record.", occurred_at="2025-04-17T11:00:00Z", source_id="demo-locations", source="Recorded places", category="location", time_precision="second"),
-        dict(id="demo-seattle", title="A morning in Seattle", body="A fictional starting point for this illustrative weekend.", occurred_at="2025-04-17T09:00:00Z", source_id="demo-locations", source="Recorded places", category="location", time_precision="second"),
-        dict(id="demo-note-synth", title="Sketches for a new sound", body="Try a slower arpeggio, a soft bass line, and the rhythm of rain on the window. An invented studio note for this demo archive.", occurred_at="2025-04-15T18:00:00Z", source_id="demo-notes", source="Notes", category="note", time_precision="day"),
+        dict(id="demo-post-waterfront", title="Saturday concert", body="Met friends at the waterfront venue. Set started at 8.", occurred_at="2025-04-19T20:30:00Z", source_id="demo-journal", source="Journal", category="post", time_precision="second", media=[dict(file_id="demo-illustration", url="/api/files/demo-illustration/media", mime="image/png", kind="image", caption="Waterfront illustration · demo data")]),
+        dict(id="demo-calendar-music", title="Lantern Room concert", body="Doors at 7 p.m. Set starts at 8 p.m.", occurred_at="2025-04-19T19:00:00Z", source_id="demo-calendar", source="Calendar", category="event_booking", time_precision="second"),
+        dict(id="demo-portland", title="Portland stop", body="Recorded location: Portland, April 19 at 2:30 p.m.", occurred_at="2025-04-19T14:30:00Z", source_id="demo-locations", source="Recorded places", category="location", time_precision="second"),
+        dict(id="demo-olympia", title="Olympia stop", body="Recorded location: Olympia, April 18 at 11 a.m.", occurred_at="2025-04-18T11:00:00Z", source_id="demo-locations", source="Recorded places", category="location", time_precision="second"),
+        dict(id="demo-seattle-water", title="Seattle waterfront", body="Recorded location: Seattle waterfront, April 17 at 11 a.m.", occurred_at="2025-04-17T11:00:00Z", source_id="demo-locations", source="Recorded places", category="location", time_precision="second"),
+        dict(id="demo-seattle", title="Seattle stop", body="Recorded location: Seattle, April 17 at 9 a.m.", occurred_at="2025-04-17T09:00:00Z", source_id="demo-locations", source="Recorded places", category="location", time_precision="second"),
+        dict(id="demo-note-synth", title="Synth rehearsal notes", body="Recorded a four-minute arpeggio. Lower the bass level on the next take.", occurred_at="2025-04-15T18:00:00Z", source_id="demo-notes", source="Notes", category="note", time_precision="day"),
     ]
-    titles = ["A new trail, a familiar feeling", "Sunday coffee and a good book", "The first rehearsal", "Little things worth keeping", "A room full of stories", "A recipe to make again", "Rainy-day listening", "A long conversation", "A small creative breakthrough", "A weekend plan", "Notes from the neighborhood", "A good place to begin"]
-    for index, title in enumerate(titles):
+    entries = [
+        ("Trail walk", "Walked the west loop. The north entrance was closed."),
+        ("Coffee with Sam", "Meet at the cafe on Third Street at 10 a.m."),
+        ("Band rehearsal", "Rehearsal booked for 6 p.m. Bring the keyboard stand."),
+        ("Grocery list", "Rice, tomatoes, eggs, coffee."),
+        ("Library visit", "Returned two books. Check the next due date on May 6."),
+        ("Pasta recipe", "200 g pasta, one can of tomatoes, two cloves of garlic."),
+        ("Listening notes", "Compare the first and second mixes on headphones."),
+        ("Call with Morgan", "Discussed the rehearsal schedule. Follow up on Tuesday."),
+        ("Synth patch", "Saved patch 12 with a slower filter envelope."),
+        ("Train booking", "Saturday departure at 9:20 a.m. Seat reservation saved."),
+        ("Neighborhood meeting", "Meeting starts at 7 p.m. in the library room."),
+        ("Project notes", "Replace the broken switch before the next test."),
+    ]
+    for index, (title, body) in enumerate(entries):
         day = datetime(2025, 4, 12) - timedelta(days=index * 19)
         source_id, source, category = [("demo-journal", "Journal", "post"), ("demo-notes", "Notes", "note"), ("demo-calendar", "Calendar", "event_booking")][index % 3]
-        records.append(dict(id=f"demo-memory-{index}", title=title, body="An invented memory from a fictional personal archive. This sample contains no real account or personal history.", occurred_at=day.date().isoformat(), source_id=source_id, source=source, category=category, time_precision="day"))
+        records.append(dict(id=f"demo-memory-{index}", title=title, body=body, occurred_at=day.date().isoformat(), source_id=source_id, source=source, category=category, time_precision="day"))
     return records
 
 
@@ -87,13 +100,13 @@ class DemoServer(CandidateServer):
             items = []
             for source_id, name in [("demo-journal", "Journal"), ("demo-calendar", "Calendar"), ("demo-locations", "Recorded places"), ("demo-notes", "Notes")]:
                 own = [record for record in self.records if record["source_id"] == source_id]
-                items.append(dict(id=source_id, name=name, status="complete", file_count=len(own), event_count=len(own), bytes=45600, first_event=min(r["occurred_at"] for r in own), last_event=max(r["occurred_at"] for r in own), notes=["Illustrative demo data. Fictional source records."]))
+                items.append(dict(id=source_id, name=name, status="complete", file_count=len(own), event_count=len(own), bytes=45600, first_event=min(r["occurred_at"] for r in own), last_event=max(r["occurred_at"] for r in own), notes=["Demo data. Fictional source records."]))
             return {"items": items}
         if parsed.path.startswith("/api/events/"):
             record = next((r for r in self.records if r["id"] == parsed.path.rsplit("/", 1)[-1]), None)
             if record is None:
                 raise ValueError("Unknown fictional record")
-            return {**record, "metadata": {"demo": True, "author": "Robin Hart (fictional)", "original_context": "Illustrative demo data"}, "provenance": [dict(file_id="original-" + record["id"], path=f"illustrative-demo/{record['source_id']}/{record['occurred_at'][:10]}.json", locator="Fictional record, preserved with its original context", sha256="d" * 64)]}
+            return {**record, "metadata": {"demo": True, "author": "Robin Hart (fictional)", "original_context": "Demo data"}, "provenance": [dict(file_id="original-" + record["id"], path=f"illustrative-demo/{record['source_id']}/{record['occurred_at'][:10]}.json", locator="Fictional demo record.", sha256="d" * 64)]}
         selected = list(self.records)
         for key, field in (("source", "source_id"), ("category", "category")):
             if params.get(key, [""])[0]:
@@ -181,9 +194,9 @@ def main():
         page.set_default_timeout(15000)
         try:
             page.goto(origin, wait_until="networkidle")
-            expect(page.get_by_role("heading", name="Places in your history")).to_be_visible()
+            expect(page.get_by_role("heading", name=re.compile(r"^(Locations|Places in your history)$"))).to_be_visible()
             expect(page.get_by_text("Browse 3 inferred connections", exact=True)).to_be_visible()
-            page.evaluate("""() => { const badge=document.createElement('div'); badge.id='demo-label'; badge.textContent='Illustrative demo data'; document.body.append(badge); }""")
+            page.evaluate("""() => { const badge=document.createElement('div'); badge.id='demo-label'; badge.textContent='Demo data'; document.body.append(badge); }""")
             page.add_style_tag(content="#demo-label{position:fixed;right:95px;top:17px;z-index:99999;padding:8px 13px;border:1px solid #bad7ca;background:#edf8f2;color:#426e59;border-radius:7px;font:600 12px/1.2 system-ui;box-shadow:0 2px 8px #17324d08}.topbar-right>span{visibility:hidden}")
 
             def capture(name, clip=None):
@@ -192,18 +205,18 @@ def main():
                 destination.chmod(0o644)
                 report["artifacts"].append(dict(path=str(destination), bytes=destination.stat().st_size, sha256=hashlib.sha256(destination.read_bytes()).hexdigest()))
 
-            page.get_by_role("button", name="Timeline", exact=True).click()
-            image_locator = page.get_by_alt_text("A weekend in the Northwest · generated demo illustration")
+            page.get_by_role("group", name="Archive view").get_by_role("button", name=re.compile(r"^(Records|Timeline)$")).click()
+            image_locator = page.get_by_alt_text("Waterfront illustration · demo data")
             expect(image_locator).to_have_js_property("naturalWidth", 1100)
             page.evaluate("scrollTo(0,0)")
             capture("timeline.png")
-            page.get_by_role("button", name="Map & day context", exact=True).click()
+            page.get_by_role("group", name="Archive view").get_by_role("button", name=re.compile(r"^(Map|Map & day context)$")).click()
             page.set_viewport_size(dict(width=1520, height=1320))
             clear_location = page.get_by_role("button", name="Clear selected location", exact=True)
             expect(clear_location).to_be_visible(); clear_location.click()
             summary = page.get_by_text("Browse 3 inferred connections", exact=True)
             expect(summary).to_be_visible(); summary.click()
-            page.get_by_role("button", name=re.compile("A pause in Olympia.*An afternoon in Portland")).click()
+            page.get_by_role("button", name=re.compile("Olympia stop.*Portland stop")).click()
             summary.click()
             expect(page.get_by_role("region", name="Inferred trip connection details", exact=True)).to_be_visible()
             page.wait_for_timeout(250)
@@ -211,7 +224,7 @@ def main():
             page.wait_for_timeout(250)
             page.get_by_role("button", name="Zoom out", exact=True).click()
             page.wait_for_timeout(500)
-            page.evaluate("""() => { document.querySelector('.leaflet-control-attribution').textContent='Schematic demo basemap · no map service contacted'; const wrap=document.querySelector('.map-canvas-wrap'); const label=document.createElement('div'); label.className='demo-map-label'; label.textContent='Illustrative demo data · schematic basemap, not geographic imagery'; wrap.append(label); }""")
+            page.evaluate("""() => { document.querySelector('.leaflet-control-attribution').textContent='Schematic demo basemap · no map service contacted'; const wrap=document.querySelector('.map-canvas-wrap'); const label=document.createElement('div'); label.className='demo-map-label'; label.textContent='Demo data · schematic basemap'; wrap.append(label); }""")
             page.add_style_tag(content=".demo-map-label{position:absolute;left:48px;top:14px;z-index:800;padding:7px 9px;border-radius:5px;background:#ffffffed;color:#587181;font:600 9px/1.2 system-ui;letter-spacing:.8px}")
             workspace = page.get_by_role("region", name="Map and same-day timeline", exact=True)
             workspace.evaluate("element => window.scrollTo(0, element.getBoundingClientRect().top + scrollY - 80)")
@@ -220,11 +233,11 @@ def main():
             detail_box = page.get_by_role("region", name="Inferred trip connection details", exact=True).bounding_box()
             capture("map.png", dict(x=box["x"], y=box["y"], width=box["width"], height=detail_box["y"] + detail_box["height"] - box["y"]))
             page.set_viewport_size(dict(width=1520, height=1120))
-            page.get_by_role("button", name="Timeline", exact=True).click()
-            page.get_by_role("heading", name="A little music by the water", exact=True).click()
+            page.get_by_role("group", name="Archive view").get_by_role("button", name=re.compile(r"^(Records|Timeline)$")).click()
+            page.get_by_role("heading", name="Saturday concert", exact=True).click()
             drawer = page.get_by_role("dialog")
-            expect(drawer.get_by_role("heading", name="Original evidence", exact=True)).to_be_visible()
-            expect(drawer.get_by_alt_text("A weekend in the Northwest · generated demo illustration")).to_have_js_property("naturalWidth", 1100)
+            expect(drawer.get_by_role("heading", name=re.compile(r"^(Original evidence|Evidence)$"))).to_be_visible()
+            expect(drawer.get_by_alt_text("Waterfront illustration · demo data")).to_have_js_property("naturalWidth", 1100)
             box = drawer.bounding_box()
             capture("evidence.png", dict(x=box["x"] - 80, y=0, width=box["width"] + 80, height=1120))
             assert not report["errors"] and not report["blocked_requests"] and not server.violations

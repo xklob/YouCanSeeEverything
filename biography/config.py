@@ -27,6 +27,8 @@ class Settings:
     account_key: str = str(PROFILE.get("account_key", "owner"))
     excluded_directory_names: tuple[str, ...] = tuple(str(x).casefold() for x in PROFILE.get("excluded_directory_names", []))
     reserve_bytes: int = int(os.environ.get("BIOGRAPHY_RESERVE_BYTES", str(20 * 1024**3)))
+    # Optional physical-host capacity constraints, e.g. the volume hosting a VM.
+    capacity_paths: tuple[Path, ...] = tuple(Path(p).expanduser() for p in PROFILE.get("capacity_paths", []))
     # Browser-restricted key stays outside profiles, source control and builds.
     google_maps_api_key: str = field(default=os.environ.get("BIOGRAPHY_GOOGLE_MAPS_API_KEY", "").strip(), repr=False)
 
@@ -37,5 +39,13 @@ class Settings:
     @property
     def revisions_dir(self):
         return self.state_dir / "revisions"
+
+    @property
+    def daily_database(self):
+        return self.state_dir / "daily" / "projection.sqlite3"
+
+    @property
+    def summaries_dir(self):
+        return self.state_dir / "summaries"
 
 settings = Settings()

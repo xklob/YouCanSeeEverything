@@ -22,13 +22,13 @@ import {
   FileText,
   FolderArchive,
   HardDrive,
-  History,
   Layers3,
   List,
   LoaderCircle,
   LockKeyhole,
   Menu,
   Map as MapIcon,
+  Route,
   MessageSquareText,
   RefreshCw,
   Search,
@@ -54,8 +54,20 @@ import {
 import MapWorkspace from "./MapWorkspace";
 import MediaGallery from "./MediaGallery";
 import EnrichmentEvidence, { EnrichedLocation } from "./EnrichmentEvidence";
+import DailyWorkspace from "./DailyWorkspace";
+import CoverageWorkspace from "./CoverageWorkspace";
+import ReadableData, { CitedProse, readablePreview } from "./ReadableData";
+import TripsWorkspace from "./TripsWorkspace";
 
-type View = "timeline" | "sources" | "assistant";
+type View = "timeline" | "sources" | "coverage" | "assistant" | "trips";
+type Presentation = "map" | "daily" | "timeline";
+interface TripMapRequest {
+  from: string;
+  to: string;
+  sourceId: string;
+  tripId: string;
+  key: number;
+}
 const PAGE_SIZE = 40;
 const activeStatuses = [
   "queued",
@@ -117,7 +129,7 @@ function Status({ value }: { value: string }) {
 
 export default function App() {
   const [view, setView] = useState<View>("timeline");
-  const [presentation, setPresentation] = useState<"map" | "timeline">("map");
+  const [presentation, setPresentation] = useState<Presentation>("map");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
@@ -126,6 +138,10 @@ export default function App() {
   const [libraryLoading, setLibraryLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
   const [sourceFilter, setSourceFilter] = useState("");
+  const [tripMapRequest, setTripMapRequest] = useState<TripMapRequest | null>(
+    null,
+  );
+  const [tripEvent, setTripEvent] = useState<string | null>(null);
   const refresh = useCallback(() => setRefreshKey((value) => value + 1), []);
 
   useEffect(() => {
@@ -164,6 +180,7 @@ export default function App() {
     setSidebarOpen(false);
   };
   const browseSource = (id: string) => {
+    setTripMapRequest(null);
     setSourceFilter(id);
     setPresentation("timeline");
     navigate("timeline");
@@ -190,6 +207,7 @@ export default function App() {
           href="#timeline"
           onClick={(event) => {
             event.preventDefault();
+            setTripMapRequest(null);
             navigate("timeline");
           }}
         >
@@ -200,38 +218,55 @@ export default function App() {
             Biography<span className="brand-secondary">of you</span>
           </span>
         </a>
-        <div className="workspace-label">YOUR PERSONAL ARCHIVE</div>
+        <div className="workspace-label">LOCAL ARCHIVE</div>
         <nav>
           <button
             className={`nav-item ${view === "timeline" ? "selected" : ""}`}
-            onClick={() => navigate("timeline")}
+            onClick={() => {
+              setTripMapRequest(null);
+              navigate("timeline");
+            }}
           >
             <MapIcon size={18} />
-            <span>Map & timeline</span>
+            <span>Records</span>
             {overview && (
               <span className="nav-count">{count(overview.total_events)}</span>
             )}
+          </button>
+          <button
+            className={`nav-item ${view === "trips" ? "selected" : ""}`}
+            onClick={() => navigate("trips")}
+          >
+            <Route size={18} />
+            <span>Trips</span>
           </button>
           <button
             className={`nav-item ${view === "sources" ? "selected" : ""}`}
             onClick={() => navigate("sources")}
           >
             <FolderArchive size={18} />
-            <span>Source library</span>
+            <span>Sources</span>
             {runningImports.length > 0 && <span className="activity-dot" />}
+          </button>
+          <button
+            className={`nav-item ${view === "coverage" ? "selected" : ""}`}
+            onClick={() => navigate("coverage")}
+          >
+            <SlidersHorizontal size={18} />
+            <span>Imports</span>
           </button>
           <button
             className={`nav-item ${view === "assistant" ? "selected" : ""}`}
             onClick={() => navigate("assistant")}
           >
             <Sparkles size={18} />
-            <span>Ask your archive</span>
+            <span>Ask</span>
             <span className="small-badge">CODEX</span>
           </button>
         </nav>
         <div className="sidebar-divider" />
         <div className="sidebar-section-heading">
-          <span>CONNECTED SOURCES</span>
+          <span>SOURCES</span>
           <span>{sources.length || ""}</span>
         </div>
         <div className="source-shortcuts">
@@ -271,7 +306,7 @@ export default function App() {
           {runningImports.length > 0 && (
             <button
               className="import-indicator"
-              onClick={() => navigate("sources")}
+              onClick={() => navigate("coverage")}
             >
               <LoaderCircle size={15} className="spin" />
               <span>
@@ -286,7 +321,7 @@ export default function App() {
             <span>Local & private</span>
             <LockKeyhole size={12} />
           </div>
-          <p>Your archive stays on this machine.</p>
+          <p>Served on localhost.</p>
         </div>
       </aside>
       <main className="main-area">
@@ -299,14 +334,18 @@ export default function App() {
             >
               <Menu size={20} />
             </button>
-            <span>Your archive</span>
+            <span>Archive</span>
             <ChevronRight size={13} />
             <strong>
               {view === "timeline"
-                ? "Map & timeline"
+                ? "Records"
                 : view === "sources"
-                  ? "Source library"
-                  : "Ask your archive"}
+                  ? "Sources"
+                  : view === "trips"
+                    ? "Trips"
+                    : view === "coverage"
+                      ? "Imports"
+                      : "Ask"}
             </strong>
           </div>
           <div className="topbar-right">
@@ -333,6 +372,7 @@ export default function App() {
             onShowSources={() => navigate("sources")}
             presentation={presentation}
             setPresentation={setPresentation}
+            tripMapRequest={tripMapRequest}
           />
         )}
         {view === "sources" && (
@@ -347,11 +387,32 @@ export default function App() {
           />
         )}
         {view === "assistant" && <Assistant onChange={refresh} />}
+        {view === "trips" && (
+          <TripsWorkspace
+            refreshKey={refreshKey}
+            onOpenEvent={setTripEvent}
+            onShowMap={(request) => {
+              setTripMapRequest({ ...request, key: Date.now() });
+              setSourceFilter(request.sourceId);
+              setPresentation("map");
+              navigate("timeline");
+            }}
+          />
+        )}
+        {view === "coverage" && (
+          <CoverageWorkspace
+            refreshKey={refreshKey}
+            onBrowseSource={browseSource}
+          />
+        )}
+        {tripEvent && (
+          <EventDrawer id={tripEvent} close={() => setTripEvent(null)} />
+        )}
         <footer className="page-footer">
           <BookOpen size={13} />
           <span>Biography of You</span>
           <span className="footer-separator">·</span>
-          <span>A little more of the whole story.</span>
+          <span>Local archive.</span>
         </footer>
       </main>
     </div>
@@ -367,6 +428,7 @@ function Timeline({
   onShowSources,
   presentation,
   setPresentation,
+  tripMapRequest,
 }: {
   overview: Overview | null;
   sources: Source[];
@@ -374,14 +436,15 @@ function Timeline({
   setSourceFilter: (value: string) => void;
   refreshKey: number;
   onShowSources: () => void;
-  presentation: "map" | "timeline";
-  setPresentation: (value: "map" | "timeline") => void;
+  presentation: Presentation;
+  setPresentation: (value: Presentation) => void;
+  tripMapRequest: TripMapRequest | null;
 }) {
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [category, setCategory] = useState("");
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
+  const [from, setFrom] = useState(tripMapRequest?.from || "");
+  const [to, setTo] = useState(tripMapRequest?.to || "");
   const [undated, setUndated] = useState(false);
   const [sort, setSort] = useState("desc");
   const [offset, setOffset] = useState(0);
@@ -528,17 +591,8 @@ function Timeline({
     <div className="page timeline-page">
       <div className="page-heading">
         <div>
-          <div className="eyebrow">THE THREADS THAT MAKE YOU, YOU</div>
-          <h1>
-            Your life, in context<span className="accent-period">.</span>
-          </h1>
-          <p>
-            One place for your memories, conversations, and everything in
-            between.
-          </p>
-        </div>
-        <div className="heading-icon">
-          <History size={30} strokeWidth={1.25} />
+          <h1>Records</h1>
+          <p>Search imported records.</p>
         </div>
       </div>
       <div className="archive-summary">
@@ -546,7 +600,7 @@ function Timeline({
           <span className="summary-number">
             {overview ? count(overview.total_events) : "—"}
           </span>{" "}
-          moments
+          records
         </span>
         <i />
         <span>
@@ -560,10 +614,10 @@ function Timeline({
           <CalendarDays size={14} />
           {overview?.date_range?.start
             ? `${formatDate(overview.date_range.start, "year")} – ${formatDate(overview.date_range.end, "year")}`
-            : "Your history, coming together"}
+            : "No dated records"}
         </span>
         <button onClick={onShowSources}>
-          Explore sources <ArrowUpRight size={14} />
+          View sources <ArrowUpRight size={14} />
         </button>
       </div>
       <section
@@ -577,7 +631,7 @@ function Timeline({
               ref={searchInput}
               aria-label="Search your timeline"
               type="search"
-              placeholder="Search a memory, a person, a place…"
+              placeholder="Search records…"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
@@ -677,20 +731,25 @@ function Timeline({
             onClick={() => setPresentation("map")}
           >
             <MapIcon size={15} />
-            Map & day context
+            Map
+          </button>
+          <button
+            className={presentation === "daily" ? "selected" : ""}
+            onClick={() => setPresentation("daily")}
+          >
+            <CalendarDays size={15} />
+            Days
           </button>
           <button
             className={presentation === "timeline" ? "selected" : ""}
             onClick={() => setPresentation("timeline")}
           >
             <List size={15} />
-            Timeline
+            Records
           </button>
         </div>
         <span>
-          {presentation === "map"
-            ? "Explicit places. Connected days."
-            : "Every source, one continuous story."}
+          {presentation === "map" ? "" : presentation === "daily" ? "" : ""}
         </span>
       </div>
       {presentation === "map" ? (
@@ -706,6 +765,20 @@ function Timeline({
           refreshKey={refreshKey}
           onOpenEvent={setSelected}
           onShowTimeline={() => setPresentation("timeline")}
+          focusTripId={tripMapRequest?.tripId}
+        />
+      ) : presentation === "daily" ? (
+        <DailyWorkspace
+          filters={{
+            q: debouncedQuery,
+            source: sourceFilter,
+            category,
+            from,
+            to,
+            undated,
+          }}
+          refreshKey={refreshKey}
+          onOpenEvent={setSelected}
         />
       ) : (
         <div className="timeline-layout">
@@ -717,8 +790,8 @@ function Timeline({
             <div className="results-heading">
               <span>
                 {loading
-                  ? "Finding your moments…"
-                  : `${count(page?.total)} ${debouncedQuery || activeFilterCount ? "matching " : ""}moments`}
+                  ? "Finding your records…"
+                  : `${count(page?.total)} ${debouncedQuery || activeFilterCount ? "matching " : ""}records`}
                 {debouncedQuery && !loading && (
                   <span className="query-label"> for “{debouncedQuery}”</span>
                 )}
@@ -768,8 +841,8 @@ function Timeline({
                 }
                 title={
                   debouncedQuery || activeFilterCount
-                    ? "No moments found"
-                    : "Your story starts here"
+                    ? "No matching records"
+                    : "No records"
                 }
               >
                 {debouncedQuery || activeFilterCount ? (
@@ -782,9 +855,9 @@ function Timeline({
                   </>
                 ) : (
                   <>
-                    Your imported history will appear here as it is processed.{" "}
+                    Records appear as imports finish.{" "}
                     <button className="inline-button" onClick={onShowSources}>
-                      See your source library
+                      Open Sources
                     </button>
                     .
                   </>
@@ -851,7 +924,7 @@ function Timeline({
             )}
           </section>
           <aside className="time-rail">
-            <div className="rail-heading">JUMP TO A YEAR</div>
+            <div className="rail-heading">YEARS</div>
             {years.length ? (
               <div className="year-list">
                 <button
@@ -885,16 +958,12 @@ function Timeline({
                 ))}
               </div>
             ) : (
-              <p className="rail-empty">
-                Years appear as your history is imported.
-              </p>
+              <p className="rail-empty">No indexed years.</p>
             )}
             <div className="rail-note">
               <BookOpen size={19} strokeWidth={1.4} />
-              <p>Every moment has a source.</p>
-              <span>
-                Open a moment to see its original context and evidence.
-              </span>
+              <p>Source evidence</p>
+              <span>Open a record for its source.</span>
             </div>
           </aside>
         </div>
@@ -923,18 +992,20 @@ function EventCard({
             className={`event-source color-${Math.max(0, sourceIndex) % 5}`}
           >
             <span className="source-dot" />
-            {event.source || "Unknown source"}
+            {event.source_label || event.source || "Unknown source"}
           </span>
           <span className="event-date">
             {formatDate(event.occurred_at, event.time_precision)}
           </span>
         </div>
-        <h3>{event.title || "Untitled moment"}</h3>
+        <h3>{event.title || "Untitled record"}</h3>
         <EnrichedLocation event={event} />
-        {event.body && <p className="event-excerpt">{event.body}</p>}
+        {event.body && (
+          <p className="event-excerpt">{readablePreview(event.body)}</p>
+        )}
         <div className="event-card-bottom">
           <span className="category-tag">
-            {humanize(event.category || "record")}
+            {humanize(event.display_category || event.category || "record")}
           </span>
           {event.time_precision &&
             !["day", "second", "exact"].includes(event.time_precision) && (
@@ -943,8 +1014,8 @@ function EventCard({
                 {humanize(event.time_precision)} precision
               </span>
             )}
-          <span className="open-moment">
-            View context <ArrowUpRight size={13} />
+          <span className="open-record">
+            Open record <ArrowUpRight size={13} />
           </span>
         </div>
       </button>
@@ -1003,7 +1074,7 @@ function EventDrawer({ id, close }: { id: string; close: () => void }) {
     <div className="drawer-overlay">
       <button
         className="drawer-scrim"
-        aria-label="Close moment"
+        aria-label="Close record"
         onClick={close}
       />
       <section
@@ -1015,13 +1086,13 @@ function EventDrawer({ id, close }: { id: string; close: () => void }) {
         <header className="drawer-header">
           <span>
             <FileText size={15} />
-            MOMENT & CONTEXT
+            RECORD
           </span>
           <button
             ref={closeButton}
             onClick={close}
             className="icon-button"
-            aria-label="Close moment"
+            aria-label="Close record"
           >
             <X size={20} />
           </button>
@@ -1031,15 +1102,15 @@ function EventDrawer({ id, close }: { id: string; close: () => void }) {
         ) : !event ? (
           <div className="drawer-loading">
             <LoaderCircle className="spin" size={22} />
-            Loading the original context…
+            Loading record…
           </div>
         ) : (
           <div className="drawer-content">
             <span className="event-source color-0">
               <span className="source-dot" />
-              {event.source}
+              {event.source_label || event.source}
             </span>
-            <h2 id="drawer-title">{event.title || "Untitled moment"}</h2>
+            <h2 id="drawer-title">{event.title || "Untitled record"}</h2>
             <div className="drawer-date">
               <CalendarDays size={15} />
               {formatDate(event.occurred_at, event.time_precision)}
@@ -1048,7 +1119,7 @@ function EventDrawer({ id, close }: { id: string; close: () => void }) {
             </div>
             <div className="detail-tags">
               <span className="category-tag">
-                {humanize(event.category || "record")}
+                {humanize(event.display_category || event.category || "record")}
               </span>
               {event.time_precision && (
                 <span className="category-tag">
@@ -1057,17 +1128,21 @@ function EventDrawer({ id, close }: { id: string; close: () => void }) {
               )}
             </div>
             <div className="event-body">
-              {event.body || "This moment has no text content."}
+              {event.body ? (
+                <ReadableData value={event.body} />
+              ) : (
+                "No text content."
+              )}
             </div>
             <MediaGallery media={event.media} />
             <EnrichmentEvidence event={event} />
             <section className="evidence-section">
               <h3>
                 <Layers3 size={15} />
-                Original evidence
+                Evidence
               </h3>
               <p className="section-description">
-                The source material behind this moment.
+                Source files for this record.
               </p>
               {event.provenance?.length ? (
                 event.provenance.map((item, index) => (
@@ -1089,12 +1164,10 @@ function EventDrawer({ id, close }: { id: string; close: () => void }) {
                       </a>
                     </div>
                     {item.locator != null && (
-                      <p>
+                      <div className="evidence-locator">
                         <span>Location</span>
-                        {typeof item.locator === "string"
-                          ? item.locator
-                          : JSON.stringify(item.locator)}
-                      </p>
+                        <ReadableData value={item.locator} />
+                      </div>
                     )}
                     {item.sha256 && (
                       <details>
@@ -1108,7 +1181,7 @@ function EventDrawer({ id, close }: { id: string; close: () => void }) {
                 <div className="notice">
                   <CircleAlert size={15} />
                   <span>
-                    No original file links are recorded for this moment.
+                    No original file links are recorded for this record.
                   </span>
                 </div>
               )}
@@ -1118,18 +1191,14 @@ function EventDrawer({ id, close }: { id: string; close: () => void }) {
                 (key) => key !== "enrichment",
               ) && (
                 <details className="metadata">
-                  <summary>Additional record details</summary>
-                  <pre>
-                    {JSON.stringify(
-                      Object.fromEntries(
-                        Object.entries(event.metadata).filter(
-                          ([key]) => key !== "enrichment",
-                        ),
+                  <summary>Record details</summary>
+                  <ReadableData
+                    value={Object.fromEntries(
+                      Object.entries(event.metadata).filter(
+                        ([key]) => key !== "enrichment",
                       ),
-                      null,
-                      2,
                     )}
-                  </pre>
+                  />
                 </details>
               )}
             <div className="record-id">Record {event.id}</div>
@@ -1161,16 +1230,8 @@ function SourceLibrary({
     <div className="page library-page">
       <div className="page-heading">
         <div>
-          <div className="eyebrow">THE BUILDING BLOCKS OF YOUR STORY</div>
-          <h1>
-            Source library<span className="accent-period">.</span>
-          </h1>
-          <p>
-            Your original files, import progress, and what is ready to explore.
-          </p>
-        </div>
-        <div className="heading-icon">
-          <FolderArchive size={30} strokeWidth={1.25} />
+          <h1>Sources</h1>
+          <p>Original files and import status.</p>
         </div>
       </div>
       <div className="library-summary">
@@ -1212,22 +1273,17 @@ function SourceLibrary({
       )}
       <section>
         <div className="section-title">
-          <h2>Your sources</h2>
+          <h2>Sources</h2>
           <span>{count(sources.length)} connected</span>
         </div>
         {loading ? (
           <div className="drawer-loading">
             <LoaderCircle className="spin" size={20} />
-            Loading source library…
+            Loading sources…
           </div>
         ) : !sources.length ? (
-          <EmptyState
-            icon={<FolderArchive size={28} />}
-            title="A home for your history"
-          >
-            Sources will appear here when the local importer discovers your
-            archives. Original files and their import status stay visible as
-            your timeline grows.
+          <EmptyState icon={<FolderArchive size={28} />} title="No sources">
+            Imported sources appear here.
           </EmptyState>
         ) : (
           <div className="source-grid">
@@ -1241,29 +1297,27 @@ function SourceLibrary({
                 </div>
                 <h3>{source.name}</h3>
                 <div className="source-card-count">
-                  <strong>{count(source.event_count)}</strong> moments
+                  <strong>{count(source.event_count)}</strong> records
                   <span> · {count(source.file_count)} files</span>
                 </div>
                 <div className="source-date-range">
                   <CalendarDays size={13} />
                   {source.first_event
                     ? `${formatDate(source.first_event)} – ${formatDate(source.last_event)}`
-                    : "No dated moments yet"}
+                    : "No dated records yet"}
                 </div>
                 {source.notes &&
                   (typeof source.notes === "string"
                     ? source.notes
                     : source.notes.length > 0) && (
-                    <p className="source-notes">
-                      {Array.isArray(source.notes)
-                        ? source.notes.join("\n")
-                        : source.notes}
-                    </p>
+                    <div className="source-notes">
+                      <ReadableData value={source.notes} />
+                    </div>
                   )}
                 <div className="source-card-footer">
                   <span>{bytes(source.bytes)} preserved</span>
                   <button onClick={() => browseSource(source.id)}>
-                    Browse timeline
+                    Browse records
                     <ArrowRight size={14} />
                   </button>
                 </div>
@@ -1275,11 +1329,8 @@ function SourceLibrary({
       <div className="coverage-note">
         <Layers3 size={20} />
         <div>
-          <h3>A timeline is only as complete as its sources.</h3>
-          <p>
-            Empty periods can reflect missing archives or undated records.
-            Import status and original evidence help you see what is available.
-          </p>
+          <h3>Coverage</h3>
+          <p>Missing records do not establish that nothing happened.</p>
         </div>
       </div>
     </div>
@@ -1319,7 +1370,7 @@ function ImportCard({ item }: { item: ImportRun }) {
             · {bytes(item.completed_bytes)} / {bytes(item.total_bytes)}
           </span>
         </span>
-        <span>{count(item.events)} moments</span>
+        <span>{count(item.events)} records</span>
       </div>
       {item.error && <p className="import-error">{item.error}</p>}
     </div>
@@ -1404,29 +1455,8 @@ function Assistant({ onChange }: { onChange: () => void }) {
     <div className="page assistant-page">
       <div className="page-heading">
         <div>
-          <div className="eyebrow">MAKE CONNECTIONS ACROSS YOUR HISTORY</div>
-          <h1>
-            Ask your archive<span className="accent-period">.</span>
-          </h1>
-          <p>
-            Explore your history with Codex, or request a change to your local
-            dashboard.
-          </p>
-        </div>
-        <div className="heading-icon">
-          <Sparkles size={30} strokeWidth={1.25} />
-        </div>
-      </div>
-      <div className="assistant-intro">
-        <div className="assistant-orb">
-          <Sparkles size={24} />
-        </div>
-        <div>
-          <h2>There is a story in the details.</h2>
-          <p>
-            Ask about a period of your life, find a connection, or follow a
-            thread across sources.
-          </p>
+          <h1>Ask</h1>
+          <p>Ask about records or change the app.</p>
         </div>
       </div>
       <form className="prompt-composer" onSubmit={submit}>
@@ -1446,17 +1476,15 @@ function Assistant({ onChange }: { onChange: () => void }) {
               onClick={() => setMode("change")}
             >
               <SlidersHorizontal size={14} />
-              Request a change
+              Change app
             </button>
           </div>
           <span className="small-badge">CODEX</span>
         </div>
         <textarea
-          aria-label={mode === "ask" ? "Ask your archive" : "Describe a change"}
+          aria-label={mode === "ask" ? "Ask" : "Describe a change"}
           placeholder={
-            mode === "ask"
-              ? "What would you like to learn about your history?"
-              : "Describe how you would like Codex to change this dashboard…"
+            mode === "ask" ? "Ask about records…" : "Describe the app change…"
           }
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
@@ -1480,11 +1508,7 @@ function Assistant({ onChange }: { onChange: () => void }) {
             ) : (
               <Send size={15} />
             )}
-            {submitting
-              ? "Starting…"
-              : mode === "ask"
-                ? "Ask Codex"
-                : "Run change"}
+            {submitting ? "Starting…" : mode === "ask" ? "Send" : "Run change"}
           </button>
         </div>
       </form>
@@ -1500,7 +1524,7 @@ function Assistant({ onChange }: { onChange: () => void }) {
       )}
       <section className="jobs-section">
         <div className="section-title">
-          <h2>Conversations & changes</h2>
+          <h2>Activity</h2>
           <span>Saved locally</span>
         </div>
         {loading ? (
@@ -1511,10 +1535,9 @@ function Assistant({ onChange }: { onChange: () => void }) {
         ) : !jobs.length ? (
           <EmptyState
             icon={<MessageSquareText size={27} />}
-            title="Follow your curiosity"
+            title="No questions yet"
           >
-            Your questions, answers, and changes will appear here. Start with
-            something you have always wanted to connect.
+            Questions, answers, and app changes appear here.
           </EmptyState>
         ) : (
           <div className="job-list">
@@ -1594,7 +1617,11 @@ function JobResult({
   onEvidence: (id: string) => void;
 }) {
   if (typeof result === "string")
-    return <div className="job-result">{result}</div>;
+    return (
+      <div className="job-result">
+        <ReadableData value={result} />
+      </div>
+    );
   if (result && typeof result === "object") {
     const value = result as Record<string, unknown>;
     if (typeof value.answer === "string") {
@@ -1603,7 +1630,11 @@ function JobResult({
         : [];
       return (
         <div className="job-result">
-          <div>{value.answer}</div>
+          <CitedProse
+            text={value.answer}
+            citations={citations}
+            onEvidence={onEvidence}
+          />
           {citations.length > 0 && (
             <div className="job-citations">
               <span>ORIGINAL EVIDENCE</span>
@@ -1637,14 +1668,14 @@ function JobResult({
           )}
           <details className="result-details">
             <summary>Revision details</summary>
-            <pre>{JSON.stringify(value, null, 2)}</pre>
+            <ReadableData value={value} />
           </details>
         </div>
       );
   }
   return (
     <div className="job-result">
-      <pre>{JSON.stringify(result, null, 2)}</pre>
+      <ReadableData value={result} />
     </div>
   );
 }

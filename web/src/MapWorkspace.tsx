@@ -20,8 +20,13 @@ import {
   type Page,
 } from "./api";
 import MediaGallery from "./MediaGallery";
+import { readablePreview } from "./ReadableData";
 import LeafletCanvas from "./maps/LeafletCanvas";
 import GoogleCanvas from "./maps/GoogleCanvas";
+import {
+  preferredMapProvider,
+  rememberMapProvider,
+} from "./maps/providerSession";
 import {
   validStop,
   withTripEndpoints,
@@ -95,7 +100,7 @@ function TripDetails({
             <h4>{stop.title || "Recorded stop"}</h4>
             <p>{formatDate(at || stop.occurred_at, stop.time_precision)}</p>
             <button onClick={() => onOpenEvent(stop.event_id)}>
-              Open original event
+              Open record
               <ArrowUpRight size={12} />
             </button>
           </div>
@@ -123,11 +128,13 @@ export default function MapWorkspace({
   refreshKey,
   onOpenEvent,
   onShowTimeline,
+  focusTripId,
 }: {
   filters: MapFilters;
   refreshKey: number;
   onOpenEvent: (id: string) => void;
   onShowTimeline: () => void;
+  focusTripId?: string;
 }) {
   const [page, setPage] = useState<MapPage | null>(null);
   const [loading, setLoading] = useState(true);
@@ -153,18 +160,23 @@ export default function MapWorkspace({
   const [tripsError, setTripsError] = useState("");
   const [tripsRetry, setTripsRetry] = useState(0);
   const [selectedTripId, setSelectedTripId] = useState("");
+  const [focusApplied, setFocusApplied] = useState(false);
   const [provider, setProvider] = useState<"openstreetmap" | "google">(
     "openstreetmap",
   );
   const [mapConfig, setMapConfig] = useState<MapConfig | null>(null);
   const [providerError, setProviderError] = useState("");
   const [googleWasSelected, setGoogleWasSelected] = useState(false);
+  const [configLoading, setConfigLoading] = useState(true);
 
   useEffect(() => {
     const controller = new AbortController();
     api<MapConfig>("/map-config", { signal: controller.signal })
       .then((config) => {
-        if (!controller.signal.aborted) setMapConfig(config);
+        if (!controller.signal.aborted) {
+          setMapConfig(config);
+          setProvider(preferredMapProvider(config));
+        }
       })
       .catch(() => {
         if (!controller.signal.aborted)
@@ -172,9 +184,16 @@ export default function MapWorkspace({
             provider: "openstreetmap",
             google_maps_configured: false,
           });
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setConfigLoading(false);
       });
     return () => controller.abort();
   }, []);
+  useEffect(() => {
+    if (!configLoading && provider === "google" && tilesEnabled)
+      setGoogleWasSelected(true);
+  }, [provider, tilesEnabled, configLoading]);
   const { q, source, category, from, to, undated } = filters;
   const filterKey = [q, source, category, from, to, undated].join("\0");
   const [previousFilters, setPreviousFilters] = useState(filterKey);
@@ -291,6 +310,16 @@ export default function MapWorkspace({
     [locations, trips],
   );
   const selectedTrip = trips.find((trip) => trip.id === selectedTripId);
+  useEffect(() => {
+    if (focusApplied || !focusTripId || tripsLoading) return;
+    const leg = trips.find(
+      (item) => item.id === focusTripId || item.trip_id === focusTripId,
+    );
+    if (leg) {
+      setSelectedTripId(leg.id);
+      setFocusApplied(true);
+    }
+  }, [focusTripId, focusApplied, tripsLoading, trips]);
   const gapCount = tripsPage?.gaps_total ?? tripsPage?.gaps?.length ?? 0;
   const selected = canvasLocations.find((point) => point.id === selectedId);
   const day = selected ? recordedDay(selected) : null;
@@ -335,11 +364,9 @@ export default function MapWorkspace({
         <div>
           <h2>
             <MapPin size={17} />
-            Places in your history
+            Locations
           </h2>
-          <p>
-            Select a recorded point to explore that day across your sources.
-          </p>
+          <p>Select a point to see that day's records.</p>
         </div>
         <span className="map-point-count">
           {loading
@@ -350,9 +377,8 @@ export default function MapWorkspace({
       <div className="map-integrity-note">
         <Compass size={14} />
         <span>
-          Markers come from explicit source coordinates. Same-day posts provide
-          temporal context; their location is not inferred. Dotted links infer
-          connections between recorded stops, not recorded routes.
+          Points have source coordinates. Dashed lines are inferred. Same-day
+          records do not establish a shared location.
         </span>
       </div>
       <div className="trip-controls-row">
@@ -458,8 +484,12 @@ export default function MapWorkspace({
                     mapConfig.google_maps_api_key
                   ) {
                     setGoogleWasSelected(true);
+                    rememberMapProvider("google");
                     setProvider("google");
-                  } else setProvider("openstreetmap");
+                  } else {
+                    rememberMapProvider("openstreetmap");
+                    setProvider("openstreetmap");
+                  }
                 }}
               >
                 <option value="openstreetmap">OpenStreetMap</option>
@@ -515,13 +545,24 @@ export default function MapWorkspace({
               {providerError}
             </div>
           )}
-          {provider === "google" &&
-          tilesEnabled &&
-          mapConfig?.google_maps_api_key ? (
+          {configLoading ? (
+            <div className="map-canvas-wrap">
+              <div
+                className="location-canvas provider-config-loading"
+                role="status"
+              >
+                <LoaderCircle size={18} className="spin" />
+                Loading map provider…
+              </div>
+            </div>
+          ) : provider === "google" &&
+            tilesEnabled &&
+            mapConfig?.google_maps_api_key ? (
             <GoogleCanvas
               apiKey={mapConfig.google_maps_api_key}
               onFailure={() => {
                 setProvider("openstreetmap");
+                rememberMapProvider("openstreetmap");
                 setProviderError(
                   "Google Maps could not load. OpenStreetMap is active with the same recorded stops and inferred connections.",
                 );
@@ -552,7 +593,7 @@ export default function MapWorkspace({
               ? "Google Maps receives the viewed area and coordinates used to render map overlays. Your post text is not sent. Google map loads may use your project quota."
               : "Basemap requests reveal the viewed map area to OpenStreetMap. Hide the basemap to stop external tile requests. Your posts are not sent."}
             {googleWasSelected &&
-              " Hiding the basemap removes the Google map; its JavaScript remains loaded until the page is closed."}
+              " Hiding removes the Google map. Any loaded Google JavaScript remains until the page is closed."}
           </p>
           {selectedTrip && (
             <TripDetails
@@ -755,16 +796,20 @@ export default function MapWorkspace({
                           onClick={() => onOpenEvent(event.id)}
                         >
                           <span>
-                            {event.source}
-                            <span>{humanize(event.category)}</span>
+                            {event.source_label || event.source}
+                            <span>
+                              {humanize(
+                                event.display_category || event.category,
+                              )}
+                            </span>
                           </span>
-                          <h4>{event.title || "Untitled moment"}</h4>
-                          {event.body && <p>{event.body}</p>}
+                          <h4>{event.title || "Untitled record"}</h4>
+                          {event.body && <p>{readablePreview(event.body)}</p>}
                           <span className="same-day-evidence">
                             <FileText size={11} />
                             {event.id === selected.event_id
                               ? "Selected location record"
-                              : "Open original context"}
+                              : "Open record"}
                             <ArrowUpRight size={11} />
                           </span>
                         </button>

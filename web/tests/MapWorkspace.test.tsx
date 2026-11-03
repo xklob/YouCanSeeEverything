@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event";
 import MapWorkspace, { recordedDay } from "../src/MapWorkspace";
 import MediaGallery from "../src/MediaGallery";
 import type { MapLocation } from "../src/api";
+import { rememberMapProvider } from "../src/maps/providerSession";
 import {
   withTripEndpoints,
   tripDisplayPath,
@@ -94,6 +95,7 @@ const filters = {
 };
 let requests: string[];
 beforeEach(() => {
+  rememberMapProvider(null);
   requests = [];
   localStorage.clear();
   vi.stubGlobal(
@@ -161,7 +163,7 @@ it("links explicit points to same-day evidence across sources without claiming a
     />,
   );
   await screen.findByText("A post on the same day");
-  expect(screen.getByText(/their location is not inferred/)).toBeTruthy();
+  expect(screen.getByText(/do not establish a shared location/)).toBeTruthy();
   expect(
     screen.getByText(/does not establish that a post was written/),
   ).toBeTruthy();
@@ -299,9 +301,9 @@ it("draws only backend-provided inferred legs with off-page recorded endpoints a
       [38.2, -78.1],
     ],
     expect.objectContaining({
-      dashArray: "2 7",
+      dashArray: "5 6",
       pane: "inferred-trips",
-      weight: 2,
+      weight: 3,
     }),
   );
   expect(L.circleMarker).toHaveBeenCalledWith([38.2, -78.1], expect.anything());
@@ -321,7 +323,7 @@ it("draws only backend-provided inferred legs with off-page recorded endpoints a
   expect(screen.getByText("99.3 km")).toBeTruthy();
   expect(screen.getByText("1 day")).toBeTruthy();
   await user.click(
-    screen.getAllByRole("button", { name: "Open original event" })[1],
+    screen.getAllByRole("button", { name: "Open record", exact: true })[1],
   );
   expect(open).toHaveBeenCalledWith("later-record");
   await user.click(screen.getByRole("button", { name: "Older points" }));
@@ -393,7 +395,7 @@ it("keeps recorded stops usable when trips are unavailable and offers a separate
   expect(document.querySelector('script[src*="google"]')).toBeNull();
 });
 
-it("defaults to OSM even with a configured Google key and requires selection plus an enabled basemap", async () => {
+it("defaults to configured Google, respects hidden basemap, and preserves manual choices", async () => {
   const original = vi.mocked(fetch).getMockImplementation()!;
   vi.mocked(fetch).mockImplementation(async (input, options) =>
     String(input) === "/api/map-config"
@@ -406,8 +408,9 @@ it("defaults to OSM even with a configured Google key and requires selection plu
         )
       : original(input, options),
   );
+  localStorage.setItem("biography.basemap", "hidden");
   const user = userEvent.setup();
-  render(
+  const rendered = render(
     <MapWorkspace
       filters={filters}
       refreshKey={0}
@@ -415,25 +418,28 @@ it("defaults to OSM even with a configured Google key and requires selection plu
       onShowTimeline={vi.fn()}
     />,
   );
-  await screen.findByRole("button", { name: "View location evidence" });
+  await screen.findByRole("checkbox", { name: "Google Maps basemap" });
   const select = screen.getByRole("combobox", { name: "Map provider" });
-  expect((select as HTMLSelectElement).value).toBe("openstreetmap");
+  expect((select as HTMLSelectElement).value).toBe("google");
   expect(googleCanvas).not.toHaveBeenCalled();
-  await user.click(
-    screen.getByRole("checkbox", { name: "OpenStreetMap basemap" }),
-  );
-  await user.selectOptions(select, "google");
-  expect(googleCanvas).not.toHaveBeenCalled();
+  expect(tileLayer).not.toHaveBeenCalled();
   await user.click(
     screen.getByRole("checkbox", { name: "Google Maps basemap" }),
   );
   expect(googleCanvas).toHaveBeenCalled();
-  expect(localStorage.getItem("biography.basemap")).toBe("shown");
-  expect(
-    Object.values(localStorage).some((value) =>
-      String(value).includes("synthetic-browser-key"),
-    ),
-  ).toBe(false);
+  await user.selectOptions(select, "openstreetmap");
+  const calls = googleCanvas.mock.calls.length;
+  rendered.rerender(
+    <MapWorkspace
+      filters={{ ...filters, q: "different" }}
+      refreshKey={0}
+      onOpenEvent={vi.fn()}
+      onShowTimeline={vi.fn()}
+    />,
+  );
+  expect((select as HTMLSelectElement).value).toBe("openstreetmap");
+  expect(googleCanvas).toHaveBeenCalledTimes(calls);
+  await user.selectOptions(select, "google");
   await user.click(
     screen.getByRole("button", { name: "Simulate Google failure" }),
   );
@@ -442,8 +448,10 @@ it("defaults to OSM even with a configured Google key and requires selection plu
     screen.getByText(/OpenStreetMap is active with the same recorded stops/),
   ).toBeTruthy();
   expect(
-    screen.getByRole("button", { name: "View location evidence" }),
-  ).toBeTruthy();
+    Object.values(localStorage).some((value) =>
+      String(value).includes("synthetic-browser-key"),
+    ),
+  ).toBe(false);
 });
 
 it("shows a disabled Google choice and setup hint when no key is configured", async () => {
@@ -464,4 +472,69 @@ it("shows a disabled Google choice and setup hint when no key is configured", as
     screen.getByText(/Add a localhost-restricted browser key/),
   ).toBeTruthy();
   expect(googleCanvas).not.toHaveBeenCalled();
+});
+
+it("keeps an explicit provider choice across map view remounts without storing a key", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, options) =>
+    String(input) === "/api/map-config"
+      ? new Response(
+          JSON.stringify({
+            provider: "google",
+            google_maps_configured: true,
+            google_maps_api_key: "synthetic-browser-key",
+          }),
+        )
+      : original(input, options),
+  );
+  const user = userEvent.setup();
+  const first = render(
+    <MapWorkspace
+      filters={filters}
+      refreshKey={0}
+      onOpenEvent={vi.fn()}
+      onShowTimeline={vi.fn()}
+    />,
+  );
+  await screen.findByRole("checkbox", { name: "Google Maps basemap" });
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Map provider" }),
+    "openstreetmap",
+  );
+  await user.click(
+    screen.getByRole("checkbox", { name: "OpenStreetMap basemap" }),
+  );
+  const calls = googleCanvas.mock.calls.length;
+  first.unmount();
+  render(
+    <MapWorkspace
+      filters={filters}
+      refreshKey={0}
+      onOpenEvent={vi.fn()}
+      onShowTimeline={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: "View location evidence" });
+  await waitFor(() =>
+    expect(
+      (
+        screen.getByRole("combobox", {
+          name: "Map provider",
+        }) as HTMLSelectElement
+      ).value,
+    ).toBe("openstreetmap"),
+  );
+  expect(
+    (
+      screen.getByRole("checkbox", {
+        name: "OpenStreetMap basemap",
+      }) as HTMLInputElement
+    ).checked,
+  ).toBe(false);
+  expect(googleCanvas).toHaveBeenCalledTimes(calls);
+  expect(
+    Object.values(localStorage).some((value) =>
+      String(value).includes("synthetic-browser-key"),
+    ),
+  ).toBe(false);
 });

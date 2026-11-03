@@ -129,14 +129,14 @@ export default function GoogleCanvas({
         icons: [
           {
             icon: {
-              path: "M 0,-1 0,1",
-              strokeColor: "#8399b3",
-              strokeOpacity: 0.55,
-              strokeWeight: 1.5,
+              path: "M 0,-2 0,2",
+              strokeColor: "#52779f",
+              strokeOpacity: 0.85,
+              strokeWeight: 2,
               scale: 1,
             },
             offset: "0",
-            repeat: "9px",
+            repeat: "12px",
           },
         ],
       });
@@ -183,14 +183,14 @@ export default function GoogleCanvas({
         icons: [
           {
             icon: {
-              path: "M 0,-1 0,1",
-              strokeColor: id === props.selectedTripId ? "#b58b4e" : "#8399b3",
-              strokeOpacity: id === props.selectedTripId ? 0.8 : 0.55,
-              strokeWeight: 1.5,
+              path: "M 0,-2 0,2",
+              strokeColor: id === props.selectedTripId ? "#ac722c" : "#52779f",
+              strokeOpacity: id === props.selectedTripId ? 1 : 0.85,
+              strokeWeight: id === props.selectedTripId ? 2.5 : 2,
               scale: 1,
             },
             offset: "0",
-            repeat: "9px",
+            repeat: "12px",
           },
         ],
       });

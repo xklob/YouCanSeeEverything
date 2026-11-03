@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "../src/App";
 vi.mock("../src/maps/LeafletCanvas", () => ({ default: () => null }));
@@ -11,7 +17,9 @@ const event = {
   occurred_at: "2020-03-14T12:00:00Z",
   source_id: "sample",
   source: "Sample archive",
+  source_label: "Display archive",
   category: "conversation",
+  display_category: "Discussion",
   time_precision: "day",
 };
 const overview = {
@@ -106,11 +114,20 @@ describe("Archive browser workflows", () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(
-      screen.getByRole("button", { name: "Timeline", exact: true }),
+      within(screen.getByRole("group", { name: "Archive view" })).getByRole(
+        "button",
+        { name: "Records" },
+      ),
     );
     await user.click(
       await screen.findByRole("button", { name: /A recorded conversation/ }),
     );
+    expect(
+      within(await screen.findByRole("dialog")).getByText("Display archive"),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByRole("dialog")).getByText("Discussion"),
+    ).toBeTruthy();
     const original = await screen.findByRole("link", {
       name: "Open original file /test/archive/conversation.json",
     });
@@ -127,7 +144,10 @@ describe("Archive browser workflows", () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(
-      screen.getByRole("button", { name: "Timeline", exact: true }),
+      within(screen.getByRole("group", { name: "Archive view" })).getByRole(
+        "button",
+        { name: "Records" },
+      ),
     );
     await screen.findByRole("button", { name: /A recorded conversation/ });
     await user.click(screen.getByRole("button", { name: "Next" }));
@@ -175,11 +195,14 @@ describe("Archive browser workflows", () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(
-      screen.getByRole("button", { name: "Timeline", exact: true }),
+      within(screen.getByRole("group", { name: "Archive view" })).getByRole(
+        "button",
+        { name: "Records" },
+      ),
     );
-    await user.click(screen.getByRole("button", { name: "Source library" }));
+    await user.click(screen.getByRole("button", { name: "Sources" }));
     expect(await screen.findByText(/One undated file remains/)).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Browse timeline" }));
+    await user.click(screen.getByRole("button", { name: "Browse records" }));
     await waitFor(() =>
       expect(requests.some((item) => item.path.includes("source=sample"))).toBe(
         true,
@@ -192,7 +215,10 @@ describe("Archive browser workflows", () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(
-      screen.getByRole("button", { name: "Timeline", exact: true }),
+      within(screen.getByRole("group", { name: "Archive view" })).getByRole(
+        "button",
+        { name: "Records" },
+      ),
     );
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.queryByText(event.title)).toBeNull();
@@ -207,14 +233,21 @@ describe("Archive browser workflows", () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(
-      screen.getByRole("button", { name: "Timeline", exact: true }),
+      within(screen.getByRole("group", { name: "Archive view" })).getByRole(
+        "button",
+        { name: "Records" },
+      ),
     );
-    await user.click(screen.getByRole("button", { name: /Ask your archive/ }));
+    await user.click(screen.getByRole("button", { name: /Ask/ }));
     await user.type(
-      screen.getByRole("textbox", { name: "Ask your archive" }),
+      screen.getByRole("textbox", { name: "Ask" }),
       "What happened in March 2020?",
     );
-    await user.click(screen.getByRole("button", { name: "Ask Codex" }));
+    await user.click(
+      within(
+        document.querySelector(".prompt-composer") as HTMLElement,
+      ).getByRole("button", { name: "Send" }),
+    );
     await waitFor(() =>
       expect(requests.some((item) => item.path === "/api/assistant")).toBe(
         true,

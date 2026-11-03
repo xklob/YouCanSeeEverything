@@ -113,7 +113,7 @@ it("creates one Google map while filters only replace coordinate and dotted-trip
         geodesic: false,
         strokeOpacity: 0,
         zIndex: 1,
-        icons: [expect.objectContaining({ repeat: "9px" })],
+        icons: [expect.objectContaining({ repeat: "12px" })],
       }),
     );
     expect(maps.Circle).toHaveBeenCalledWith(

@@ -8,6 +8,30 @@ def decode_event(row):
     value['metadata'] = json.loads(value.get('metadata') or '{}')
     return value
 
+
+def _presentation(conn, items, provenance_by_event=None):
+    """Classify only returned rows; raw catalog values and filters stay intact."""
+    if not items:
+        return
+    if provenance_by_event is None:
+        ids = [item['id'] for item in items]
+        provenance_by_event = {identity: [] for identity in ids}
+        placeholders = ','.join('?' for _ in ids)
+        rows = conn.execute('''SELECT v.event_id,f.id AS file_id,
+            f.original_path,f.object_hash,v.locator,v.parser
+            FROM evidence v JOIN files f ON f.id=v.file_id
+            WHERE v.event_id IN (''' + placeholders + ')', ids)
+        for row in rows:
+            provenance_by_event[row['event_id']].append(dict(row))
+    from .classification import classify_event
+    for item in items:
+        hints = classify_event({**item, 'source_name': item.get('source')}, provenance_by_event.get(item['id'], []))
+        item['classification'] = hints
+        item['source_label'] = hints['source_label']
+        item['display_category'] = hints['category']
+        for key in ('display_class','is_raw_sample','metric','metrics','date_basis','sample_family'):
+            item[key] = hints[key]
+
 def event_filters(q='',source='',category='',start='',end='',undated=False):
     clauses, args = [], []
     if q.strip():
@@ -46,6 +70,7 @@ def list_events(path=None, *,q='',source='',category='',start='',end='',limit=50
         rows=conn.execute('SELECT e.*,s.name AS source FROM events e JOIN sources s ON s.id=e.source_id'+where+
             f' ORDER BY e.occurred_at {order} NULLS LAST,e.id {tie_order} LIMIT ? OFFSET ?',args+[min(max(limit,1),200),max(offset,0)]).fetchall()
         items=[decode_event(r) for r in rows]
+        _presentation(conn, items)
         from .media import media_for_events
         attachments=media_for_events([item['id'] for item in items],path)
         for item in items:item['media']=attachments.get(item['id'],[])
@@ -60,6 +85,7 @@ def event_detail(event_id,path=None):
         result=decode_event(row)
         result['provenance']=[dict(r) for r in conn.execute('''SELECT f.id AS file_id,f.original_path AS path,f.object_hash AS sha256,v.locator,v.parser
             FROM evidence v JOIN files f ON f.id=v.file_id WHERE v.event_id=? ORDER BY f.original_path''',(event_id,))]
+        _presentation(conn, [result], {event_id: result['provenance']})
         from .media import media_for_event
         result['media']=media_for_event(event_id,path,include_unresolved=True)
         return result

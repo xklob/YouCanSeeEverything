@@ -5,7 +5,7 @@ from biography.config import Settings
 
 @pytest.fixture
 def client(tmp_path,monkeypatch):
-    local=Settings(data_dir=tmp_path/'vault',google_maps_api_key='')
+    local=Settings(data_dir=tmp_path/'vault',state_dir=tmp_path/'.local',google_maps_api_key='')
     monkeypatch.setattr(db,'settings',local)
     monkeypatch.setattr(api,'settings',local)
     with TestClient(api.app,base_url='http://127.0.0.1:8000') as c:yield c
@@ -26,7 +26,7 @@ def test_api_unknown_objects_and_safe_static_boundaries(client):
     assert 'frame-ancestors' in client.get('/api/status').headers['content-security-policy']
 
 
-def test_map_configuration_is_opt_in_and_browser_key_is_not_status_data(client,monkeypatch):
+def test_map_configuration_defaults_to_configured_provider_without_exposing_key_in_status(client,monkeypatch):
     from dataclasses import replace
     response=client.get('/api/map-config')
     assert response.json()=={'provider':'openstreetmap','google_maps_configured':False}
@@ -36,7 +36,7 @@ def test_map_configuration_is_opt_in_and_browser_key_is_not_status_data(client,m
     configured=replace(api.settings,google_maps_api_key=fake_key)
     monkeypatch.setattr(api,'settings',configured)
     response=client.get('/api/map-config')
-    assert response.json()=={'provider':'openstreetmap','google_maps_configured':True,'google_maps_api_key':fake_key}
+    assert response.json()=={'provider':'google','google_maps_configured':True,'google_maps_api_key':fake_key}
     assert response.headers['cache-control']=='no-store'
     policy=response.headers['content-security-policy']
     script_policy=next(item for item in policy.split('; ') if item.startswith('script-src '))
@@ -70,6 +70,36 @@ def test_trip_api_validates_filters_and_keeps_full_adjacency(client):
     assert client.get('/api/trips?from=2025-01-01').json()['total']==0
     assert client.get('/api/trips?from=invalid').status_code==400
     assert client.get('/api/trips?limit=5001').status_code==422
+    groups=client.get('/api/journeys?from=2024-06-01&to=2024-06-01').json()
+    assert groups['total']==1 and groups['items'][0]['legs']==2
+    group=groups['items'][0]
+    detail=client.get('/api/journeys/'+group['id']+'?limit=1').json()
+    assert detail['total']==2 and detail['truncated'] and not detail['complete']
+    assert detail['items'][0]['from']['event_id']=='stop-0'
+    assert client.get('/api/journeys?kind=unknown').status_code==400
+    assert client.get('/api/journeys?from=invalid').status_code==400
+    assert client.get('/api/journeys/missing').status_code==404
+
+
+def test_day_routes_preserve_evidence_and_report_unbuilt_index(client):
+    from biography.daily import build_daily
+    assert client.get('/api/daily/status').json()['status']=='not_built'
+    assert client.get('/api/days').json()['items']==[]
+    with db.transaction() as conn:
+        conn.execute("INSERT INTO sources(id,name,created_at,updated_at) VALUES('s','Synthetic','now','now')")
+        conn.execute("""INSERT INTO events(id,source_id,title,body,category,occurred_at,time_precision,created_at)
+            VALUES('note','s','A note','Original wording','note','2024-06-01T12:00:00Z','second','now')""")
+    build_daily(api.settings.database,api.settings.daily_database,capacity_paths=(),reserve_bytes=0)
+    days=client.get('/api/days?from=2024-06-01&to=2024-06-01').json()
+    assert days['total']==1
+    detail=client.get('/api/days/2024-06-01').json()
+    assert detail['items'][0]['id']=='note'
+    assert detail['items'][0]['body']=='Original wording'
+    assert client.get('/api/days/2024-99-01').status_code==400
+    assert client.get('/api/days?from=invalid').status_code==400
+    assert client.get('/api/rollups/missing').status_code==404
+    coverage=client.get('/api/coverage').json()
+    assert coverage['indexing']['daily']['processed_records']==1
 
 
 def test_media_range_and_map_filters(client):

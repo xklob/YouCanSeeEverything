@@ -167,7 +167,8 @@ def _endpoint(stop):
 
 def trip_connections(path=None, *, q="",source="",category="",start="",end="",undated=False,
                      limit=2000,offset=0,max_gap_hours=72,min_distance_km=1,
-                     long_distance_km=100,max_speed_kmh=1200):
+                     long_distance_km=100,max_speed_kmh=1200,
+                     summaries_only=False,group_id=None):
     """Infer only bounded connections between adjacent reliable recorded stops.
 
     Visit sources take priority. A source with no visits may use explicitly
@@ -175,6 +176,8 @@ def trip_connections(path=None, *, q="",source="",category="",start="",end="",un
     source chronologies exceeding the safety bound are omitted, never sampled.
     Search/category/date filters select established legs, never manufacture new
     adjacency. A 24-hour recorded dwell begins a new inferred trip grouping.
+    Summary-only queries return every selected group from that same full pass;
+    group selection applies after adjacency and before leg pagination.
     """
     lower,_ = _bound(start)
     upper,upper_exclusive = _bound(end,upper=True)
@@ -333,6 +336,8 @@ def trip_connections(path=None, *, q="",source="",category="",start="",end="",un
                     previous,trip_id = stop,None
                     continue
                 if distance<parameters["min_distance_km"]:
+                    if (previous["end"]-previous["start"]).total_seconds()>=24*3600:
+                        trip_id = None
                     previous = stop
                     continue
                 if hours<=0 or distance/hours>parameters["max_speed_kmh"]:
@@ -344,20 +349,26 @@ def trip_connections(path=None, *, q="",source="",category="",start="",end="",un
                     trip_id = hashlib.sha256(json.dumps([group["source_id"],group["account_key"],previous["event_ids"][0],_iso(departure)]).encode()).hexdigest()
                     summaries[trip_id] = {"id":trip_id,"source_id":group["source_id"],"source":group["source"],
                         "account_key":group["account_key"],"departure_at":_iso(departure),"arrival_at":_iso(arrival),
-                        "legs":0,"distance_km":0,"max_leg_distance_km":0,"inferred":True}
+                        "legs":0,"distance_km":0,"max_leg_distance_km":0,"max_gap_hours":0,
+                        "first_stop":_endpoint(previous),"last_stop":_endpoint(stop),
+                        "_represented_events":set(),"inferred":True}
                 summary = summaries[trip_id]
                 summary["legs"] += 1
                 summary["distance_km"] += distance
                 summary["max_leg_distance_km"] = max(summary["max_leg_distance_km"],distance)
+                summary["max_gap_hours"] = max(summary["max_gap_hours"],hours)
+                summary["last_stop"] = _endpoint(stop)
+                summary["_represented_events"].update((previous["event_ids"][0],stop["event_ids"][0]))
                 summary["arrival_at"] = _iso(arrival)
                 visible = (in_window(previous["start"]) and in_window(stop["start"])
+                           and (group_id is None or trip_id==group_id)
                            and (matching is None or (any(event in matching for event in previous["event_ids"])
                                                      and any(event in matching for event in stop["event_ids"]))))
                 if visible:
                     selected_trip_ids.add(trip_id)
                     index = response["total"]
                     response["total"] += 1
-                    if offset<=index<offset+limit:
+                    if not summaries_only and offset<=index<offset+limit:
                         wrapped_lon = previous["longitude"] + (stop["longitude"]-previous["longitude"]+180)%360-180
                         identity = hashlib.sha256(json.dumps([group["source_id"],group["account_key"],previous["event_ids"],stop["event_ids"]]).encode()).hexdigest()
                         response["items"].append({"id":identity,"trip_id":trip_id,"source_id":group["source_id"],
@@ -369,11 +380,17 @@ def trip_connections(path=None, *, q="",source="",category="",start="",end="",un
                             "crosses_dateline":abs(stop["longitude"]-previous["longitude"])>180,
                             "label":f"Inferred connection · {distance:.0f} km · {hours:.1f} h between recorded stops"})
                 previous = stop
-        shown_trip_ids = {item["trip_id"] for item in response["items"]}
+        shown_trip_ids = selected_trip_ids if summaries_only else {item["trip_id"] for item in response["items"]}
+        # Include an explicitly selected group's summary even on an empty page.
+        if group_id in selected_trip_ids:
+            shown_trip_ids.add(group_id)
         for identity in shown_trip_ids:
             summary = summaries[identity]
             summary["distance_km"] = round(summary["distance_km"],3)
             summary["max_leg_distance_km"] = round(summary["max_leg_distance_km"],3)
+            summary["max_gap_hours"] = round(summary["max_gap_hours"],6)
+            summary["represented_stops"] = len(summary.pop("_represented_events"))
+            summary["summary_complete"] = True
             summary["long_distance"] = summary["max_leg_distance_km"]>=parameters["long_distance_km"]
             summary["kind"] = "long_distance" if summary["long_distance"] else "local_movement"
             response["trips"].append(summary)

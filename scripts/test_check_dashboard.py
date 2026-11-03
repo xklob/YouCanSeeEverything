@@ -37,6 +37,38 @@ class AcceptanceBoundaryTests(unittest.TestCase):
         self.assertNotIn(trips["items"][0]["from"]["event_id"], paged_ids)
         self.assertEqual(fixture_api("/api/trips?category=post")["total"], 0)
 
+    def test_live_map_configuration_is_projected_without_fetching_a_key(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server = CandidateServer(Path(folder), "http://127.0.0.1:9")
+            try:
+                # A closed upstream port proves this response never fetches live configuration.
+                self.assertEqual(server.api("/api/map-config"), {
+                    "provider": "openstreetmap", "google_maps_configured": False,
+                })
+            finally:
+                server.server_close()
+
+    def test_coverage_and_daily_fixtures_keep_evidence_and_progress_distinct(self):
+        coverage = fixture_api("/api/coverage")
+        self.assertFalse(coverage["continuous_coverage_asserted"])
+        self.assertEqual(coverage["totals"]["events"], 3)
+        progress = coverage["active_imports"][0]
+        self.assertEqual(progress["files"]["fraction"], .25)
+        self.assertEqual(progress["bytes"]["fraction"], .75)
+        self.assertNotEqual(progress["events_reported"], coverage["totals"]["events"])
+        self.assertEqual(coverage["backup"]["status"], "not_supplied")
+        self.assertEqual(fixture_api("/api/days")["total"], 2)
+        day = fixture_api("/api/days/2024-04-05?source=qa-two")
+        self.assertEqual([record["id"] for record in day["items"]], ["qa-birch"])
+        self.assertEqual(fixture_api("/api/days/2024-04-03")["total"], 0)
+        saved = fixture_api("/api/summaries?period=2024-04")
+        self.assertEqual(saved["result"]["citations"], ["qa-alder"])
+        self.assertEqual(fixture_api("/api/events/qa-alder")["id"], saved["result"]["citations"][0])
+        focused = fixture_api("/api/summaries?period=2024-04&focus=fictional")
+        self.assertEqual(focused["status"], "missing")
+        self.assertIsNone(focused["result"])
+        self.assertNotEqual(focused["key"], saved["key"])
+
     def test_candidate_cannot_mutate_get_tokens_download_files_or_follow_symlinks(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

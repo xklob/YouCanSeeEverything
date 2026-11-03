@@ -79,8 +79,8 @@ def status():
 @app.get('/api/map-config')
 def map_configuration():
     # A website-restricted Maps key is necessarily delivered to its browser.
-    # OSM remains the default; returning configuration never loads Google itself.
-    result={'provider':'openstreetmap','google_maps_configured':bool(settings.google_maps_api_key)}
+    # A configured key selects Google. Returning config itself performs no map requests.
+    result={'provider':'google' if settings.google_maps_api_key else 'openstreetmap','google_maps_configured':bool(settings.google_maps_api_key)}
     if settings.google_maps_api_key:result['google_maps_api_key']=settings.google_maps_api_key
     return result
 
@@ -92,6 +92,51 @@ def sources():return queries.sources()
 
 @app.get('/api/imports')
 def imports():return queries.imports()
+
+def backup_status():
+    path=settings.state_dir/'backup-status.json'
+    try:
+        if path.stat().st_size>100_000:return {'status':'unavailable'}
+        value=json.loads(path.read_text())
+        return value if isinstance(value,dict) else {'status':'unavailable'}
+    except FileNotFoundError:return {'status':'not_configured'}
+    except (OSError,ValueError):return {'status':'unavailable'}
+
+@app.get('/api/coverage')
+def coverage(include_months:bool=False):
+    from .coverage import coverage_overview
+    from .daily import daily_status
+    return coverage_overview(settings.database,include_months=include_months,
+        index_status=daily_status(settings.database,settings.daily_database),backup_status=backup_status())
+
+@app.get('/api/daily/status')
+def daily_index_status():
+    from .daily import daily_status
+    return daily_status(settings.database,settings.daily_database)
+
+@app.get('/api/days')
+def days(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),
+         limit:int=Query(90,ge=1,le=366),offset:int=Query(0,ge=0),undated:bool=False):
+    from .daily import daily_days
+    try:return daily_days(settings.database,settings.daily_database,q=q,source=source,category=category,
+                          start=start,end=end,limit=limit,offset=offset,undated=undated)
+    except ValueError as error:raise HTTPException(400,'Invalid day filter.') from error
+
+@app.get('/api/days/{day}')
+def day_detail(day:str,q:str='',source:str='',category:str='',limit:int=Query(50,ge=1,le=200),
+               offset:int=Query(0,ge=0),include_technical:bool=False):
+    from .daily import daily_detail
+    if day!='undated' and not re.fullmatch(r'\d{4}-\d{2}-\d{2}',day):raise HTTPException(400,'Choose a day in YYYY-MM-DD format.')
+    try:return daily_detail(day,settings.database,settings.daily_database,q=q,source=source,category=category,
+                            limit=limit,offset=offset,include_technical=include_technical)
+    except ValueError as error:raise HTTPException(400,'Invalid day filter.') from error
+
+@app.get('/api/rollups/{rollup_id}')
+def rollup_detail(rollup_id:str,limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0)):
+    from .daily import rollup_records
+    result=rollup_records(rollup_id,settings.database,settings.daily_database,limit=limit,offset=offset)
+    if result['rollup'] is None:raise HTTPException(404,'Measurement group not found.')
+    return result
 
 @app.get('/api/events')
 def events(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0),sort:str='desc',undated:bool=False):
@@ -119,6 +164,28 @@ def inferred_trips(q:str='',source:str='',category:str='',start:str=Query('',ali
     try:
         return trip_connections(settings.database,q=q,source=source,category=category,start=start,end=end,limit=limit,offset=offset,undated=undated)
     except ValueError as error:raise HTTPException(400,'Invalid trip filter.') from error
+
+@app.get('/api/journeys')
+def journeys(source:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),
+             kind:str='all',limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0)):
+    from .journeys import list_journeys
+    try:return list_journeys(settings.database,source=source,start=start,end=end,kind=kind,limit=limit,offset=offset)
+    except ValueError as error:raise HTTPException(400,'Invalid trip filter.') from error
+
+@app.get('/api/journeys/{journey_id}')
+def journey(journey_id:str,limit:int=Query(100,ge=1,le=500),offset:int=Query(0,ge=0)):
+    from .journeys import journey_detail
+    result=journey_detail(journey_id,settings.database,limit=limit,offset=offset)
+    if result is None:raise HTTPException(404,'Trip not found.')
+    return result
+
+@app.get('/api/summaries')
+def saved_summary(period:str,source:str='',model:str='gpt-6.1-sol',focus:str=Query('',max_length=4000)):
+    from .synthesis import summary_status
+    from .agents import AgentError
+    try:return summary_status(period,settings.summaries_dir,settings.database,
+                              source_ids=[source] if source else [],focus=focus,model=model)
+    except (ValueError,AgentError) as error:raise HTTPException(400,str(error)) from error
 
 @app.get('/api/files/{file_id}/download')
 def download_file(file_id:str):
@@ -163,30 +230,20 @@ def get_job(job_id:str):
     if not row:raise HTTPException(404,'Task not found.')
     return job_value(row)
 
-def retrieve_evidence(prompt):
-    stop={'what','when','where','which','have','with','from','about','that','this','were','would','could','please','tell','show','summarize','summary','give','does','into','been','your','my','the','and','for','you','how','did','was','are'}
-    tokens=[t for t in re.findall(r'[\w-]+',prompt.lower()) if len(t)>2 and t not in stop][:15]
-    conn=connect()
-    try:
-        if tokens:
-            match=' OR '.join('"'+t+'"' for t in tokens)
-            rows=conn.execute('''SELECT e.*,s.name source FROM events_fts JOIN events e ON e.rowid=events_fts.rowid
-              JOIN sources s ON s.id=e.source_id WHERE events_fts MATCH ? ORDER BY rank LIMIT 60''',(match,)).fetchall()
-        else:rows=[]
-        if not rows:
-            rows=conn.execute('''SELECT * FROM (SELECT e.*,s.name source,ROW_NUMBER() OVER(PARTITION BY source_id ORDER BY occurred_at DESC) n
-              FROM events e JOIN sources s ON s.id=e.source_id) WHERE n<=6 ORDER BY occurred_at DESC LIMIT 60''').fetchall()
-        return [{k:r[k] for k in ('id','title','body','occurred_at','source','category')} for r in rows]
-    finally:conn.close()
-
-def assistant_worker(job_id,prompt,mode):
+def assistant_worker(job_id,prompt,mode,period=None,source_ids=None,model='gpt-6.1-sol'):
     try:
         with transaction() as conn:conn.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?",(now(),job_id))
-        from . import agents,revisions
+        from . import agents,revisions,retrieval,synthesis
         if mode=='ask':
-            result=agents.ask(prompt,retrieve_evidence(prompt),settings.state_dir/'agent-jobs')
+            bundle=retrieval.retrieve(prompt,settings.database,period=period,source_ids=source_ids)
+            context={key:value for key,value in bundle.items() if key!='evidence'}
+            result=agents.ask(prompt,bundle['evidence'],settings.state_dir/'agent-jobs',model=model,retrieval_context=context)
+            result.update(context)
+        elif mode=='summarize':
+            result=synthesis.summarize(period,settings.summaries_dir,settings.database,
+                                       source_ids=source_ids,focus=prompt,model=model)
         else:
-            result=agents.change_dashboard(prompt,settings.project_root,settings.revisions_dir)
+            result=agents.change_dashboard(prompt,settings.project_root,settings.revisions_dir,model=model)
             checker=settings.project_root/'scripts'/'check_dashboard.py'
             check_dir=settings.state_dir/'revision-checks'/result['revision_id']
             checked=subprocess.run([str(settings.project_root/'.venv'/'bin'/'python'),str(checker),
@@ -203,18 +260,30 @@ def assistant_worker(job_id,prompt,mode):
         with transaction() as conn:conn.execute("UPDATE jobs SET status='failed',error=?,updated_at=? WHERE id=?",(f'{type(error).__name__}: {str(error)[:2000]}',now(),job_id))
 
 class AssistantRequest(BaseModel):
-    prompt:str=Field(min_length=1,max_length=10000)
+    prompt:str=Field(default='',max_length=8000)
     mode:str='ask'
+    period:str|None=None
+    source_ids:list[str]=Field(default_factory=list,max_length=100)
+    model:str='gpt-6.1-sol'
 
 @app.post('/api/assistant',status_code=202)
 def assistant(request:AssistantRequest):
-    if request.mode not in {'ask','change'}:raise HTTPException(400,'Unknown task mode.')
+    from . import agents,retrieval,synthesis
+    if request.mode not in {'ask','change','summarize'}:raise HTTPException(400,'Unknown task mode.')
+    try:
+        agents._model(request.model)
+        if request.mode=='summarize':
+            synthesis._period(request.period)
+            if len(request.prompt)>4000:raise ValueError('A summary focus must be at most 4,000 characters.')
+        elif not request.prompt.strip():raise ValueError('Enter a question or change.')
+        if request.mode!='change':retrieval.selection(request.prompt,period=request.period,source_ids=request.source_ids)
+    except (ValueError,agents.AgentError) as error:raise HTTPException(400,str(error)) from error
     jid=uuid.uuid4().hex
     with transaction() as conn:
         pending=conn.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
         if pending>=3:raise HTTPException(409,'The local assistant queue is full.')
         conn.execute('INSERT INTO jobs(id,kind,status,prompt,created_at,updated_at) VALUES(?,?,?,?,?,?)',(jid,request.mode,'queued',request.prompt,now(),now()))
-    EXECUTOR.submit(assistant_worker,jid,request.prompt,request.mode)
+    EXECUTOR.submit(assistant_worker,jid,request.prompt,request.mode,request.period,request.source_ids,request.model)
     return {'id':jid,'status':'queued'}
 
 @app.post('/api/jobs/{job_id}/undo')

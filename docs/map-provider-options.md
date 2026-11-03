@@ -1,6 +1,6 @@
 # Google-backed map options
 
-Reviewed November 2026. The application defaults to Leaflet with OpenStreetMap. An optional Google Maps JavaScript adapter displays the same recorded points and inferred connections. Google is loaded only after explicit selection with the background enabled; [setup instructions](google-maps-setup.md) cover its browser key and billing requirements. OpenStreetMap requires no Google account.
+Reviewed November 2026. The application uses Google Maps when a key is configured, otherwise Leaflet with OpenStreetMap. Both display the same recorded points and inferred connections. The background can be hidden and the provider can be switched manually; [setup instructions](google-maps-setup.md) cover its browser key and billing requirements. OpenStreetMap requires no Google account.
 
 The renderer, background-map provider, and overlay data are separate choices. An open-source renderer does not make a commercial provider's tiles or APIs free of their access requirements.
 

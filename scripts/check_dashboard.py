@@ -47,6 +47,61 @@ def api_origin(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def fixture_coverage(sources: list[dict]) -> dict:
+    """Observed evidence and input progress are deliberately different quantities."""
+    measured_at = "2024-04-05T13:00:00Z"
+    rows = []
+    for source in sources:
+        rows.append({**source, "queue_order": 1, "notes": ["Synthetic acceptance source."],
+            "files": dict(total=4, bytes=1024, by_parse_status={"parsed": 1, "metadata_only": 1, "retained_only": 1, "partial": 1},
+                          parsed=1, partial=1, metadata_only=1, retained_only=1, empty=0, excluded=0, pending=0, needs_review=1),
+            "records": dict(status="current", total=source["event_count"], dated=source["event_count"], undated=0,
+                            first_observed=source["first_event"], last_observed=source["last_event"], measured_at=measured_at),
+            "extraction": dict(review_files=1, pending_files=0, history_absence_established=False),
+            "classification": dict(status="source_label_only", label=source["name"])})
+    return dict(scope="observed_imported_records", continuous_coverage_asserted=False, generated_at=measured_at,
+        totals=dict(sources=2, files=8, bytes=2048, parsed_files=2, metadata_only_files=2, retained_only_files=2,
+                    review_files=2, events=3, dated_events=3, undated_events=0), sources=rows,
+        active_imports=[dict(id="qa-import", source_id="qa-one", source="QA journal", status="running",
+            files=dict(completed=1, total=4, fraction=.25), bytes=dict(completed=768, total=1024, fraction=.75),
+            events_reported=9, started_at=measured_at, error=None)],
+        queue=[dict(source_id="qa-two", source="QA calendar", status="paused", position=2, snapshot_bytes=1024,
+                    error=dict(code="SyntheticReview", message="Synthetic source awaits review."))],
+        indexing=dict(catalog_max_event_rowid=3,
+            coverage_stats=dict(status="current", measured_at=measured_at, catalog_max_event_rowid=3),
+            daily=dict(status="ready", watermark_rowid=2, checkpoint_rowid=2, processed_records=2,
+                       current_catalog_max_rowid=3, caught_up_to_watermark=True, append_backlog_rowid_span=1,
+                       rebuild_required=False)), backup=dict(status="not_supplied"), limitations=[])
+
+
+def fixture_daily(path: str, records: list[dict], params: dict) -> dict:
+    projection = dict(status="ready", watermark_rowid=3, checkpoint_rowid=3, processed_records=3,
+                      current_catalog_max_rowid=3, caught_up_to_watermark=True, append_backlog_rowid_span=0,
+                      rebuild_required=False)
+    selected = records
+    for key, field in (("source", "source_id"), ("category", "category")):
+        if params.get(key):
+            selected = [r for r in selected if r[field] == params[key][0]]
+    if params.get("q"):
+        selected = [r for r in selected if params["q"][0].casefold() in (r["title"] + r["body"]).casefold()]
+    def summary(day):
+        own = [r for r in selected if r["occurred_at"][:10] == day]
+        return dict(day=day, date=day, observed_records=len(own), raw_samples=0, substantive_records=len(own),
+                    technical_records=0, display_groups=len(own), measurement_groups=0,
+                    source_count=len({r["source_id"] for r in own}), date_bases=[dict(basis="source_timestamp", count=len(own))])
+    limit, offset = int(params.get("limit", [31])[0]), int(params.get("offset", [0])[0])
+    if path == "/api/days":
+        items = [summary(day) for day in sorted({r["occurred_at"][:10] for r in selected}, reverse=True)]
+        if params.get("undated") == ["true"]:
+            items = []
+        return dict(items=items[offset:offset+limit], total=len(items), limit=limit, offset=offset, projection=projection)
+    day = unquote(path.rsplit("/", 1)[-1])
+    own = [{**r, "display_class": "substantive", "date_basis": "source_timestamp", "duplicate_count": 0}
+           for r in selected if r["occurred_at"][:10] == day]
+    return dict(day=day, summary=summary(day), rollups=[], items=own[offset:offset+limit], total=len(own),
+                limit=limit, offset=offset, projection=projection)
+
+
 def fixture_api(path: str) -> dict:
     """Deterministic, entirely synthetic records for candidate revision checks."""
     parsed = urlsplit(path)
@@ -79,6 +134,23 @@ def fixture_api(path: str) -> dict:
                     categories=[{"name": "location", "count": 2}, {"name": "post", "count": 1}], undated_count=0)
     if parsed.path == "/api/sources":
         return {"items": sources}
+    if parsed.path == "/api/coverage":
+        return fixture_coverage(sources)
+    if parsed.path == "/api/days" or parsed.path.startswith("/api/days/"):
+        return fixture_daily(parsed.path, records, params)
+    if parsed.path == "/api/summaries":
+        period, model = params.get("period", ["2024-04"])[0], params.get("model", ["gpt-6.1-sol"])[0]
+        coverage = dict(total_events_in_scope=3, selected_events=3, candidate_events=3, undated_events_excluded=0,
+                        sources=[], retrieval_limited=False, time_basis="source_timestamp", limitations=[])
+        result = dict(kind="period_summary", period=period, title="Saved synthetic monthly note",
+            answer="The synthetic journal includes an Alder visit.", citations=["qa-alder"],
+            sections=[dict(heading="Observed evidence", sentences=[dict(text="The synthetic journal includes an Alder visit.", citations=["qa-alder"])])],
+            coverage=coverage, selection={}, model=model,
+            cache=dict(status="fresh", key="qa-summary", generated_at="2024-04-05T13:00:00Z", fixed_watermark="3", current_watermark="3"), limitations=[])
+        focused = bool(params.get("focus", [""])[0].strip())
+        return dict(status="missing" if focused else "fresh", period=period, key="qa-summary-focused" if focused else "qa-summary",
+                    model=model, fixed_watermark=None if focused else "3",
+                    current_watermark="3", current_coverage=coverage, result=None if focused else result)
     if parsed.path in {"/api/imports", "/api/jobs"}:
         return {"items": []}
     if parsed.path == "/api/map-config":
@@ -136,8 +208,12 @@ class CandidateServer(ThreadingHTTPServer):
 
     def api(self, path: str) -> dict:
         # Do not expose a session token or download private file objects to candidate code.
-        if not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|map-config)(/[^/?]+)?", urlsplit(path).path):
+        if not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|map-config|coverage|days|rollups|summaries)(/[^/?]+)?", urlsplit(path).path):
             raise ValueError("Endpoint is outside the read-only acceptance API")
+        if urlsplit(path).path == "/api/map-config":
+            # The QA proxy port is not the configured browser-key origin. Never
+            # fetch or forward a live key, or initialize a billable map provider.
+            return {"provider": "openstreetmap", "google_maps_configured": False}
         if self.upstream is None:
             return fixture_api(path)
         with self.opener.open(Request(self.upstream + path, method="GET"), timeout=15) as response:
@@ -339,8 +415,8 @@ def run(args: argparse.Namespace, report: dict) -> None:
             page.goto(origin, wait_until="networkidle")
             workspace = page.get_by_role("region", name="Map and same-day timeline", exact=True)
             expect(workspace).to_be_visible()
-            expect(workspace.get_by_role("heading", name="Places in your history", exact=True)).to_be_visible()
-            expect(workspace.get_by_text("their location is not inferred", exact=False)).to_be_visible()
+            expect(workspace.get_by_role("heading", name=re.compile(r"^(Locations|Places in your history)$"))).to_be_visible()
+            expect(workspace.get_by_text(re.compile(r"their location is not inferred|Same-day records do not establish a shared location"))).to_be_visible()
             if points["items"]:
                 expect(page.get_by_role("region", name=re.compile("^Map of explicitly recorded locations"))).to_be_visible()
             else:
@@ -356,7 +432,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 context_article = workspace.get_by_role("article").filter(has=page.get_by_role("heading", name="Birch practice session", exact=True))
                 expect(location_article.get_by_text("Selected location record", exact=True)).to_be_visible()
                 expect(context_article.get_by_text("Selected location record", exact=True)).to_have_count(0)
-                expect(context_article.get_by_text("Open original context", exact=True)).to_be_visible()
+                expect(context_article.get_by_text(re.compile(r"^Open (original context|record)$"))).to_be_visible()
                 expect(workspace.get_by_text("This does not establish that a post was written", exact=False)).to_be_visible()
                 expect(location_article.get_by_role("region", name="Attached images and videos")).to_have_count(0)
                 passed("same_day_context_does_not_invent_location_or_media_associations")
@@ -401,7 +477,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 trip_detail = page.get_by_role("region", name="Inferred trip connection details", exact=True)
                 expect(trip_detail).to_be_visible()
                 expect(trip_detail.get_by_text("The route and mode of travel are not recorded.", exact=False)).to_be_visible()
-                trip_detail.get_by_role("button", name="Open original event", exact=True).first.click()
+                trip_detail.get_by_role("button", name=re.compile(r"^Open (original event|record)$")).first.click()
                 expect(page.get_by_role("dialog").get_by_role("heading", name="Cedar acceptance stop", exact=True)).to_be_visible()
                 expect(page.get_by_role("dialog").get_by_role("link", name=re.compile("Open original file"))).to_have_attribute("href", "/api/files/qa-file-qa-cedar/download")
                 page.keyboard.press("Escape")
@@ -452,7 +528,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 passed("map_api_failure_is_visible_and_retry_recovers")
 
                 page.set_viewport_size({"width": 390, "height": 844})
-                expect(workspace.get_by_role("heading", name="Places in your history")).to_be_visible()
+                expect(workspace.get_by_role("heading", name=re.compile(r"^(Locations|Places in your history)$"))).to_be_visible()
                 if not page.evaluate("document.documentElement.scrollWidth <= innerWidth"):
                     raise AssertionError("Map overflows mobile viewport")
                 screenshot("map-mobile.png")
@@ -461,7 +537,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
             else:
                 screenshot("map.png")
 
-            page.get_by_role("button", name="Timeline", exact=True).click()
+            page.get_by_role("group", name="Archive view").get_by_role("button", name=re.compile(r"^(Records|Timeline)$")).click()
             results = page.get_by_role("region", name="Timeline results")
             expect(results).to_have_attribute("aria-busy", "false")
             title = results.get_by_role("heading", name=known["title"], exact=True).first
@@ -497,7 +573,11 @@ def run(args: argparse.Namespace, report: dict) -> None:
             if not any(item["id"] == known["id"] for item in expected["items"]):
                 raise AssertionError("Known record not returned by its title search token")
             filtered = change(lambda: search.fill(query), "q", query)
-            assert filtered["total"] == expected["total"], "Browser search result differs from API"
+            # Live imports may append matches between the two GET snapshots.
+            # The actual browser response must still contain the known record.
+            assert any(item["id"] == known["id"] for item in filtered["items"]), "Browser search lost the known API record"
+            if args.fixture:
+                assert filtered["total"] == expected["total"], "Synthetic browser search result differs from API"
             expect(results.get_by_role("button").filter(has=page.get_by_role("heading"))).to_have_count(len(filtered["items"]))
             expect(results.get_by_role("heading", name=known["title"], exact=True).first).to_be_visible()
             passed("search_restores_known_api_record", matching_total=filtered["total"])
@@ -527,12 +607,50 @@ def run(args: argparse.Namespace, report: dict) -> None:
             expect(drawer).to_have_count(0)
             passed("evidence_drawer_closes_with_escape")
 
-            page.get_by_role("button", name=re.compile(r"^source library", re.I)).click()
+            page.get_by_role("complementary", name="Main navigation").get_by_role("button", name=re.compile(r"^(Sources|Source library)$", re.I)).click()
             for source in sources[:3]:
                 expect(page.get_by_role("heading", name=source["name"], exact=True).first).to_be_visible()
-            expect(page.get_by_role("button", name=re.compile("browse timeline", re.I)).first).to_be_visible()
+            expect(page.get_by_role("button", name=re.compile("browse (timeline|records)", re.I)).first).to_be_visible()
             passed("source_library_renders_api_sources", source_total=len(sources))
             screenshot("sources.png")
+            page.get_by_role("complementary", name="Main navigation").get_by_role("button", name=re.compile(r"^(Imports|Import & coverage)$")).click()
+            expect(page.get_by_role("heading", name=re.compile(r"^(Imports|Import & coverage)"))).to_be_visible()
+            expect(page.get_by_text("continuous coverage", exact=False).first).to_be_visible()
+            expect(page.get_by_role("heading", name="Source coverage", exact=True)).to_be_visible()
+            passed("coverage_renders_observed_evidence_scope")
+            screenshot("coverage.png")
+            if args.fixture:
+                expect(page.get_by_role("progressbar", name="QA journal: input files", exact=True)).to_have_attribute("aria-valuenow", "25")
+                expect(page.get_by_role("progressbar", name="QA journal: input bytes", exact=True)).to_have_attribute("aria-valuenow", "75")
+                expect(page.get_by_text("Synthetic source awaits review.", exact=True)).to_be_visible()
+                passed("coverage_distinguishes_input_files_bytes_and_observed_records")
+                source_card = page.get_by_role("article").filter(has=page.get_by_role("heading", name="QA journal", exact=True))
+                source_card.get_by_role("button", name="Browse records", exact=True).click()
+                expect(page.get_by_role("combobox", name="Filter by source")).to_have_value("qa-one")
+                passed("coverage_browse_preserves_canonical_source_id")
+                archive_modes = page.get_by_role("group", name="Archive view")
+                archive_modes.get_by_role("button", name=re.compile(r"^(Days|Day view)$")).click()
+                daily = page.get_by_role("region", name="Daily summaries and source evidence", exact=True)
+                expect(daily.get_by_role("heading", name="Alder acceptance visit", exact=True)).to_be_visible()
+                daily.get_by_role("button", name=re.compile(r"Alder acceptance visit.*Open (original context|record)")).click()
+                expect(page.get_by_role("dialog").get_by_role("heading", name="Alder acceptance visit", exact=True)).to_be_visible()
+                page.keyboard.press("Escape")
+                passed("daily_source_groups_open_original_evidence")
+                daily.get_by_text(re.compile(r"^Monthly (cited )?summary$")).click()
+                expect(daily.get_by_role("heading", name="Saved synthetic monthly note", exact=True)).to_be_visible()
+                expect(daily.get_by_role("button", name=re.compile(r"^Generate (monthly )?summary$"))).to_be_visible()
+                daily.get_by_role("button", name="Open cited record 1", exact=True).first.click()
+                expect(page.get_by_role("dialog").get_by_role("heading", name="Alder acceptance visit", exact=True)).to_be_visible()
+                page.keyboard.press("Escape")
+                passed("saved_monthly_summary_citation_opens_without_model_job")
+                with page.expect_response(lambda response: urlsplit(response.url).path == "/api/summaries" and
+                        parse_qs(urlsplit(response.url).query).get("focus") == ["Synthetic different focus"]):
+                    daily.get_by_role("textbox", name="Summary focus", exact=True).fill("Synthetic different focus")
+                    daily.get_by_role("textbox", name="Summary focus", exact=True).press("Tab")
+                expect(daily.get_by_role("heading", name="Saved synthetic monthly note", exact=True)).to_have_count(0)
+                expect(daily.get_by_text("No saved summary for this selection", exact=True)).to_be_visible()
+                passed("summary_focus_changes_saved_cache_without_starting_model")
+                screenshot("daily.png")
             assert not report["page_errors"], "Browser page errors occurred"
             assert not report["browser_console_errors"], "Browser console errors occurred"
             assert not report["blocked_requests"] and not server.violations, "Candidate attempted prohibited network access"

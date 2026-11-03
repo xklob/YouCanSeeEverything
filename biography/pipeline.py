@@ -166,6 +166,13 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
         raise
 
 def reindex(source_name=None,db_path=None):
+    from .daily import begin_daily_mutation,end_daily_mutation
+    token=begin_daily_mutation(catalog_path=db_path,reason='reindex')
+    try:return _reindex(source_name,db_path)
+    finally:end_daily_mutation(token,catalog_path=db_path)
+
+
+def _reindex(source_name=None,db_path=None):
     """Rebuild derived records from the canonical bytes, never from deleted exports."""
     from .importer import StoredFile
     from .storage import ObjectStore
@@ -195,6 +202,13 @@ def reindex(source_name=None,db_path=None):
     return results
 
 def reindex_files(file_ids,db_path=None):
+    from .daily import begin_daily_mutation,end_daily_mutation
+    token=begin_daily_mutation(catalog_path=db_path,reason='reindex_files')
+    try:return _reindex_files(file_ids,db_path)
+    finally:end_daily_mutation(token,catalog_path=db_path)
+
+
+def _reindex_files(file_ids,db_path=None):
     """Refresh selected retained files, preserving records with other evidence."""
     from .importer import StoredFile
     from .enrichment import reapply

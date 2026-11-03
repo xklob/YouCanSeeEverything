@@ -68,10 +68,10 @@ export default function LeafletCanvas({
     const group = L.layerGroup().addTo(instance);
     for (const trip of trips) {
       const line = L.polyline(tripDisplayPath(trip), {
-        color: trip.id === selectedTripId ? "#b58b4e" : "#8399b3",
-        weight: 2,
-        opacity: trip.id === selectedTripId ? 0.8 : 0.5,
-        dashArray: "2 7",
+        color: trip.id === selectedTripId ? "#ac722c" : "#52779f",
+        weight: trip.id === selectedTripId ? 3.5 : 3,
+        opacity: trip.id === selectedTripId ? 1 : 0.85,
+        dashArray: "5 6",
         lineCap: "round",
         pane: "inferred-trips",
       });

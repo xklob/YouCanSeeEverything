@@ -26,6 +26,13 @@ def _apply(conn, event_id, payload):
 
 
 def apply_reviewed_report(report, path=None):
+    from .daily import begin_daily_mutation,end_daily_mutation
+    token=begin_daily_mutation(catalog_path=path,reason='reviewed_enrichment')
+    try:return _apply_reviewed_report(report,path)
+    finally:end_daily_mutation(token,catalog_path=path)
+
+
+def _apply_reviewed_report(report, path=None):
     """Apply high-confidence proposals only; candidates remain untouched.
 
     Callers must review the report before invoking this operation. No external
@@ -59,6 +66,13 @@ def apply_reviewed_report(report, path=None):
 
 
 def reapply(path=None, *,source_id=None):
+    from .daily import begin_daily_mutation,end_daily_mutation
+    token=begin_daily_mutation(catalog_path=path,reason='reapply_enrichment')
+    try:return _reapply(path,source_id=source_id)
+    finally:end_daily_mutation(token,catalog_path=path)
+
+
+def _reapply(path=None, *,source_id=None):
     with transaction(path) as conn:
         ensure_schema(conn)
         sql='SELECT r.* FROM event_enrichments r JOIN events e ON e.id=r.event_id'

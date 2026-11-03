@@ -4,6 +4,7 @@
   "data_dir": "/path/to/private/.local/vault",
   "export_root": "/path/to/Data Exports",
   "excluded_directory_names": [],
+  "capacity_paths": [],
   "collectors": {
     "local_git": {"repositories": [], "excluded_repositories": []},
     "github": {"repositories": [], "author_login": null, "excluded_repositories": []},

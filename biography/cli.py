@@ -22,6 +22,18 @@ def main():
     restore=sub.add_parser('restore',help='Verify a private snapshot and create a new catalog')
     restore.add_argument('snapshot',type=Path);restore.add_argument('database',type=Path)
     restore.add_argument('--vaultroot',type=Path,required=True)
+    daily=sub.add_parser('daily-build',help='Build or resume the day index')
+    daily.add_argument('--rebuild',action='store_true')
+    daily.add_argument('--max-seconds',type=float,default=300)
+    daily.add_argument('--batch-size',type=int,default=2000)
+    sub.add_parser('daily-status',help='Show day index progress')
+    backup=sub.add_parser('backup',help='Retain a fixed catalog, original files and completed import manifests')
+    backup.add_argument('destination',type=Path)
+    verify=sub.add_parser('backup-verify',help='Read back and verify a backup')
+    verify.add_argument('backup',type=Path)
+    full_restore=sub.add_parser('backup-restore',help='Restore a backup into a new directory')
+    full_restore.add_argument('backup',type=Path)
+    full_restore.add_argument('destination',type=Path)
     args=parser.parse_args()
     init_db()
     if args.command=='init':print(json.dumps({'database':str(settings.database)}))
@@ -62,5 +74,29 @@ def main():
     elif args.command=='restore':
         from .snapshots import restore_snapshot
         print(json.dumps(restore_snapshot(args.snapshot,args.database,vaultroot=args.vaultroot),indent=2))
+    elif args.command=='daily-build':
+        from .daily import build_daily
+        if args.max_seconds<=0:parser.error('--max-seconds must be positive')
+        result=build_daily(settings.database,settings.daily_database,rebuild=args.rebuild,
+                           batch_size=args.batch_size,max_seconds=args.max_seconds,
+                           capacity_paths=settings.capacity_paths,reserve_bytes=settings.reserve_bytes)
+        print(json.dumps(result,indent=2))
+    elif args.command=='daily-status':
+        from .daily import daily_status
+        print(json.dumps(daily_status(settings.database,settings.daily_database),indent=2))
+    elif args.command=='backup':
+        from .backups import create_backup
+        result=create_backup(settings.database,settings.data_dir,args.destination,
+                             manifests_dir=settings.data_dir/'manifests',
+                             reserve_bytes=settings.reserve_bytes,capacity_paths=settings.capacity_paths)
+        print(json.dumps(result,indent=2))
+    elif args.command=='backup-verify':
+        from .backups import verify_backup
+        print(json.dumps(verify_backup(args.backup),indent=2))
+    elif args.command=='backup-restore':
+        from .backups import restore_backup
+        result=restore_backup(args.backup,args.destination,reserve_bytes=settings.reserve_bytes,
+                              capacity_paths=settings.capacity_paths)
+        print(json.dumps(result,indent=2))
 
 if __name__=='__main__':main()

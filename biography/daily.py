@@ -69,6 +69,16 @@ def _metadata(value):
     return value if isinstance(value,dict) else {}
 
 
+def _sqlite_lock(error):
+    """Only SQLite's explicit contention codes/messages are retryable."""
+    if not isinstance(error,sqlite3.OperationalError):return False
+    code=getattr(error,'sqlite_errorcode',None)
+    if isinstance(code,int):return code&0xff in {sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED}
+    message=str(error).strip().casefold()
+    return any(message==prefix or message.startswith(prefix+':') for prefix in (
+        'database is locked','database table is locked','database schema is locked'))
+
+
 def _active_mutations(catalog,sidecar):
     result=[]
     for path in (sidecar.parent/'mutations').glob('*.active.json'):
@@ -434,13 +444,15 @@ def build_daily(catalog_path=None,sidecar_path=None,*,batch_size=2000,max_batche
         with conn:
             if _active_mutations(catalog,sidecar) or _state(conn).get('invalidated_reason'):raise ImportPaused('daily_source_mutation_active')
             complete=checkpoint>=target
-            _set(conn,status='caught_up' if complete else 'paused',updated_at=_now(),**({'completed_at':_now()} if complete else {}))
+            _set(conn,status='caught_up' if complete else 'paused',last_error=None,last_pause_reason=None,updated_at=_now(),**({'completed_at':_now()} if complete else {}))
             conn.execute('UPDATE builds SET status=?,finished_at=? WHERE id=?',('complete' if complete else 'paused',_now() if complete else None,job))
         conn.execute('PRAGMA wal_checkpoint(PASSIVE)')
     except BaseException as error:
+        contention=ImportPaused('daily_database_locked',sqlite_errorcode=getattr(error,'sqlite_errorcode',None)) if _sqlite_lock(error) else None
         try:
-            with conn:_set(conn,status='paused' if isinstance(error,(ImportPaused,KeyboardInterrupt)) else 'failed',last_error=type(error).__name__,updated_at=_now())
+            with conn:_set(conn,status='paused' if contention or isinstance(error,(ImportPaused,KeyboardInterrupt)) else 'failed',last_error=type(error).__name__,last_pause_reason=contention.reason if contention else getattr(error,'reason',None),updated_at=_now())
         except sqlite3.Error:pass
+        if contention:raise contention from error
         raise
     finally:
         conn.close();lock.close()
@@ -489,6 +501,20 @@ def daily_days(catalog_path=None,sidecar_path=None,*,q='',source='',category='',
         days=[row[0] for row in conn.execute('SELECT DISTINCT day FROM day_counts'+where+" ORDER BY day='undated',day DESC",args) if qdays is None or row[0] in qdays]
         result['total']=len(days)
         result['items']=[_summary(conn,day,source,category) for day in days[result['offset']:result['offset']+result['limit']]]
+    return result
+
+
+def daily_categories(catalog_path=None,sidecar_path=None):
+    """Derived type choices counted as observed projected source records.
+
+    Counts include undated records, source variants, and duplicate copies. They
+    are not counts of unique activities or deduplicated measurement identities.
+    """
+    catalog,sidecar=_paths(catalog_path,sidecar_path);projection=daily_status(catalog,sidecar)
+    result={'items':[],'projection':projection}
+    if not sidecar.exists() or not projection.get('epoch') or projection.get('schema_version')!=SCHEMA_VERSION:return result
+    with _readonly(sidecar) as conn:
+        result['items']=[dict(row) for row in conn.execute('SELECT category AS name,category,sum(observed_records) AS count FROM day_counts GROUP BY category ORDER BY count DESC,category')]
     return result
 
 
@@ -613,4 +639,4 @@ def rollup_records(rollup_id,catalog_path=None,sidecar_path=None,*,limit=50,offs
     return result
 
 
-__all__=['build_daily','daily_days','daily_detail','daily_rollups','rollup_records','daily_status','invalidate_daily','begin_daily_mutation','end_daily_mutation']
+__all__=['build_daily','daily_days','daily_categories','daily_detail','daily_rollups','rollup_records','daily_status','invalidate_daily','begin_daily_mutation','end_daily_mutation']

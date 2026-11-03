@@ -84,6 +84,7 @@ def test_trip_api_validates_filters_and_keeps_full_adjacency(client):
 def test_day_routes_preserve_evidence_and_report_unbuilt_index(client):
     from biography.daily import build_daily
     assert client.get('/api/daily/status').json()['status']=='not_built'
+    assert client.get('/api/daily/categories').json()['items']==[]
     assert client.get('/api/days').json()['items']==[]
     with db.transaction() as conn:
         conn.execute("INSERT INTO sources(id,name,created_at,updated_at) VALUES('s','Synthetic','now','now')")
@@ -95,6 +96,8 @@ def test_day_routes_preserve_evidence_and_report_unbuilt_index(client):
     detail=client.get('/api/days/2024-06-01').json()
     assert detail['items'][0]['id']=='note'
     assert detail['items'][0]['body']=='Original wording'
+    categories=client.get('/api/daily/categories').json()['items']
+    assert any(item['name']=='note' and item['count']==1 for item in categories)
     assert client.get('/api/days/2024-99-01').status_code==400
     assert client.get('/api/days?from=invalid').status_code==400
     assert client.get('/api/rollups/missing').status_code==404

@@ -19,14 +19,14 @@ class AcceptanceBoundaryTests(unittest.TestCase):
                 api_origin(value)
 
     def test_synthetic_search_and_filters_reduce_records(self):
-        self.assertEqual(fixture_api("/api/events")["total"], 3)
+        self.assertEqual(fixture_api("/api/events")["total"], 4)
         self.assertEqual(fixture_api("/api/events?q=alder")["total"], 1)
         self.assertEqual(fixture_api("/api/events?source=qa-one&category=activity")["total"], 0)
-        self.assertEqual(fixture_api("/api/events?from=2024-01-01")["total"], 3)
+        self.assertEqual(fixture_api("/api/events?from=2024-01-01")["total"], 4)
         self.assertEqual(fixture_api("/api/map")["total"], 2)
         self.assertEqual(fixture_api("/api/map?category=post")["total"], 0)
         context = fixture_api("/api/events?from=2024-04-05&to=2024-04-05")["items"]
-        self.assertEqual(len(context), 2)
+        self.assertEqual(len(context), 3)
         self.assertTrue(all("latitude" not in event for event in context))
         self.assertNotIn("media", next(event for event in context if event["id"] == "qa-alder"))
         self.assertIn("media", next(event for event in context if event["id"] == "qa-birch"))
@@ -51,7 +51,7 @@ class AcceptanceBoundaryTests(unittest.TestCase):
     def test_coverage_and_daily_fixtures_keep_evidence_and_progress_distinct(self):
         coverage = fixture_api("/api/coverage")
         self.assertFalse(coverage["continuous_coverage_asserted"])
-        self.assertEqual(coverage["totals"]["events"], 3)
+        self.assertEqual(coverage["totals"]["events"], 4)
         progress = coverage["active_imports"][0]
         self.assertEqual(progress["files"]["fraction"], .25)
         self.assertEqual(progress["bytes"]["fraction"], .75)
@@ -68,6 +68,16 @@ class AcceptanceBoundaryTests(unittest.TestCase):
         self.assertEqual(focused["status"], "missing")
         self.assertIsNone(focused["result"])
         self.assertNotEqual(focused["key"], saved["key"])
+        raw_types = {row["name"] for row in fixture_api("/api/overview")["categories"]}
+        derived = fixture_api("/api/daily/categories")
+        self.assertIn("health_sample", {row["name"] for row in derived["items"]})
+        self.assertNotIn("health_sample", raw_types)
+        health = fixture_api("/api/days/2024-04-05?category=health_sample")
+        self.assertEqual(health["summary"]["raw_samples"], 1)
+        self.assertEqual(health["items"], [])
+        self.assertEqual(health["rollups"][0]["metric"], "heart_rate")
+        samples = fixture_api("/api/rollups/qa-heart-rate")
+        self.assertEqual([record["id"] for record in samples["items"]], ["qa-pulse"])
 
     def test_candidate_cannot_mutate_get_tokens_download_files_or_follow_symlinks(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -83,7 +93,7 @@ class AcceptanceBoundaryTests(unittest.TestCase):
             origin = f"http://127.0.0.1:{server.server_port}"
             try:
                 with urlopen(origin + "/api/events") as response:
-                    self.assertEqual(json.load(response)["total"], 3)
+                    self.assertEqual(json.load(response)["total"], 4)
                 for path in ("/api/session", "/api/files/id/download"):
                     with self.subTest(path=path), self.assertRaises(HTTPError) as error:
                         urlopen(origin + path)

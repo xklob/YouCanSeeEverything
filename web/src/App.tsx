@@ -50,6 +50,7 @@ import {
   type Overview,
   type Page,
   type Source,
+  type DailyCategories,
 } from "./api";
 import MapWorkspace from "./MapWorkspace";
 import MediaGallery from "./MediaGallery";
@@ -443,6 +444,18 @@ function Timeline({
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [category, setCategory] = useState("");
+  const [dailyCategories, setDailyCategories] = useState<
+    DailyCategories["items"]
+  >([]);
+  const [dailyCategoryLoading, setDailyCategoryLoading] = useState(false);
+  const [dailyCategoryError, setDailyCategoryError] = useState("");
+  const categoryDomain = presentation === "daily" ? "derived" : "raw";
+  const [previousCategoryDomain, setPreviousCategoryDomain] =
+    useState(categoryDomain);
+  if (previousCategoryDomain !== categoryDomain) {
+    setPreviousCategoryDomain(categoryDomain);
+    setCategory("");
+  }
   const [from, setFrom] = useState(tripMapRequest?.from || "");
   const [to, setTo] = useState(tripMapRequest?.to || "");
   const [undated, setUndated] = useState(false);
@@ -455,6 +468,24 @@ function Timeline({
   const [selected, setSelected] = useState<string | null>(null);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const searchInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (presentation !== "daily") return;
+    const controller = new AbortController();
+    setDailyCategoryLoading(true);
+    setDailyCategoryError("");
+    api<DailyCategories>("/daily/categories", { signal: controller.signal })
+      .then((result) => {
+        if (!controller.signal.aborted) setDailyCategories(result.items);
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted) setDailyCategoryError(cause.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDailyCategoryLoading(false);
+      });
+    return () => controller.abort();
+  }, [presentation, refreshKey, retry]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -668,17 +699,29 @@ function Timeline({
             <Layers3 size={14} />
             <select
               aria-label="Filter by type"
+              aria-busy={presentation === "daily" && dailyCategoryLoading}
               value={category}
               onChange={(event) => setCategory(event.target.value)}
             >
               <option value="">All types</option>
-              {overview?.categories.map((item) => (
+              {(presentation === "daily"
+                ? dailyCategories
+                : (overview?.categories ?? [])
+              ).map((item) => (
                 <option key={item.name} value={item.name}>
                   {humanize(item.name)} ({count(item.count)})
                 </option>
               ))}
             </select>
           </label>
+          {presentation === "daily" && dailyCategoryError && (
+            <span className="filter-type-error" role="alert">
+              Day types unavailable.{" "}
+              <button onClick={() => setRetry((value) => value + 1)}>
+                Retry
+              </button>
+            </span>
+          )}
           <div className="date-inputs">
             <CalendarDays size={14} />
             <input

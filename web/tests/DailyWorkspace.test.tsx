@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import DailyWorkspace from "../src/DailyWorkspace";
 
@@ -216,4 +222,59 @@ it("keeps undated evidence outside chronology and lets users opt into technical 
   expect(
     screen.getByText(/without a specific trustworthy day stay here/),
   ).toBeTruthy();
+});
+
+it("shows source conflicts and distinguishes occurrences, variants and duplicate copies without statistics", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, options) => {
+    const response = await original(input, options);
+    if (!String(input).startsWith("/api/days/")) return response;
+    const data = await response.json();
+    data.rollups = [
+      {
+        ...rollup,
+        sample_count: 2,
+        occurrence_count: 2,
+        variant_count: 3,
+        source_record_count: 4,
+        duplicate_count: 1,
+        conflicting_occurrences: 1,
+        numeric_count: 1,
+        min: null,
+        max: null,
+        sample_mean: null,
+        sum: null,
+        latest: null,
+        notes: [
+          "Two retained variants report different values for one occurrence.",
+        ],
+      },
+    ];
+    return new Response(JSON.stringify(data));
+  });
+  const user = userEvent.setup();
+  render(
+    <DailyWorkspace filters={filters} refreshKey={0} onOpenEvent={vi.fn()} />,
+  );
+  const heading = await screen.findByRole("heading", { name: "Steps" });
+  const card = within(heading.closest("article")!);
+  expect(
+    card.getByText("Source values conflict; statistics omitted."),
+  ).toBeTruthy();
+  expect(
+    card.getByText(
+      "2 occurrences · 3 variants · 4 retained records · 1 duplicate copy",
+    ),
+  ).toBeTruthy();
+  expect(card.queryByText("6")).toBeNull();
+  const notes = card.getByText("Calculation notes").closest("details")!;
+  expect(notes.open).toBe(false);
+  await user.click(card.getByText("Calculation notes"));
+  expect(notes.open).toBe(true);
+  expect(
+    card.getByText(
+      "Two retained variants report different values for one occurrence.",
+    ),
+  ).toBeTruthy();
+  expect(heading.closest("article")!.textContent).not.toContain("{");
 });

@@ -114,6 +114,11 @@ def daily_index_status():
     from .daily import daily_status
     return daily_status(settings.database,settings.daily_database)
 
+@app.get('/api/daily/categories')
+def daily_category_options():
+    from .daily import daily_categories
+    return daily_categories(settings.database,settings.daily_database)
+
 @app.get('/api/days')
 def days(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),
          limit:int=Query(90,ge=1,le=366),offset:int=Query(0,ge=0),undated:bool=False):

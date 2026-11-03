@@ -233,8 +233,17 @@ function RollupEvidence({
   );
 }
 function MetricSummary({ rollup }: { rollup: DailyRollup }) {
-  const value =
-    rollup.aggregation === "sum"
+  const conflicted = (rollup.conflicting_occurrences ?? 0) > 0;
+  const occurrences = rollup.occurrence_count ?? rollup.sample_count;
+  const countsDiffer =
+    (typeof rollup.variant_count === "number" &&
+      rollup.variant_count !== occurrences) ||
+    (typeof rollup.source_record_count === "number" &&
+      rollup.source_record_count !== occurrences) ||
+    (rollup.duplicate_count ?? 0) > 0;
+  const value = conflicted
+    ? null
+    : rollup.aggregation === "sum"
       ? rollup.sum
       : rollup.aggregation === "latest"
         ? rollup.latest
@@ -253,7 +262,7 @@ function MetricSummary({ rollup }: { rollup: DailyRollup }) {
         </strong>
       ) : (
         <strong>
-          {count(rollup.sample_count)}
+          {count(occurrences)}
           <span>sample occurrences</span>
         </strong>
       )}
@@ -265,20 +274,39 @@ function MetricSummary({ rollup }: { rollup: DailyRollup }) {
         {count(rollup.numeric_count)} numeric / {count(rollup.sample_count)}{" "}
         sample occurrences{rollup.unit ? ` · ${rollup.unit}` : ""}
       </p>
+      {conflicted && (
+        <p className="daily-basis-note">
+          Source values conflict; statistics omitted.
+        </p>
+      )}
+      {countsDiffer && (
+        <p className="day-metric-counts">
+          {count(occurrences)} occurrences
+          {typeof rollup.variant_count === "number"
+            ? ` · ${count(rollup.variant_count)} variants`
+            : ""}
+          {typeof rollup.source_record_count === "number"
+            ? ` · ${count(rollup.source_record_count)} retained records`
+            : ""}
+          {typeof rollup.duplicate_count === "number"
+            ? ` · ${count(rollup.duplicate_count)} duplicate ${rollup.duplicate_count === 1 ? "copy" : "copies"}`
+            : ""}
+        </p>
+      )}
       <details className="metric-details">
         <summary>Measurement details</summary>
         <dl>
           <div>
             <dt>Observed minimum</dt>
-            <dd>{number(rollup.min)}</dd>
+            <dd>{conflicted ? "Omitted" : number(rollup.min)}</dd>
           </div>
           <div>
             <dt>Observed maximum</dt>
-            <dd>{number(rollup.max)}</dd>
+            <dd>{conflicted ? "Omitted" : number(rollup.max)}</dd>
           </div>
           <div>
             <dt>Sample mean</dt>
-            <dd>{number(rollup.sample_mean)}</dd>
+            <dd>{conflicted ? "Omitted" : number(rollup.sample_mean)}</dd>
           </div>
           <div>
             <dt>First sample</dt>
@@ -294,6 +322,12 @@ function MetricSummary({ rollup }: { rollup: DailyRollup }) {
           measurement of the day.
         </p>
       </details>
+      {rollup.notes && rollup.notes.length > 0 && (
+        <details className="metric-details">
+          <summary>Calculation notes</summary>
+          <ReadableData value={rollup.notes} />
+        </details>
+      )}
     </article>
   );
 }

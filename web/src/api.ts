@@ -137,6 +137,9 @@ export interface DailyRollup {
   device?: string | null;
   aggregation: string;
   sample_count: number;
+  occurrence_count?: number;
+  variant_count?: number;
+  conflicting_occurrences?: number;
   numeric_count: number;
   min: number | null;
   max: number | null;
@@ -155,6 +158,10 @@ export interface DailyRollup {
 export interface DaysPage extends Page<DaySummary> {
   projection: ProjectionStatus;
   q_scope?: string;
+}
+export interface DailyCategories {
+  items: { name: string; category: string; count: number }[];
+  projection: ProjectionStatus;
 }
 export interface DayDetail extends Page<DailyRecord> {
   day: string;

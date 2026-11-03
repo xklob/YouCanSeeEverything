@@ -38,6 +38,7 @@ def test_readonly_getters_do_not_create_sidecar(catalog):
     with sqlite3.connect(catalog[0]) as conn:before=list(conn.iterdump())
     assert daily.daily_status(*catalog)['status']=='not_built'
     assert daily.daily_days(*catalog)['items']==[]
+    assert daily.daily_categories(*catalog)['items']==[]
     assert daily.daily_detail('2024-06-01',*catalog)['items']==[]
     assert not catalog[1].exists()
     with sqlite3.connect(catalog[0]) as conn:assert list(conn.iterdump())==before
@@ -306,3 +307,54 @@ def test_daily_and_rollup_originals_include_readonly_existing_media_links(catalo
     raw=daily.rollup_records(detail['rollups'][0]['id'],*catalog)
     assert raw['items'][0]['media'][0]['url']=='/api/files/photo-file/media'
     assert raw['items'][0]['provenance'][0]['path']=='export.zip!samples.json'
+
+
+@pytest.mark.parametrize('code',[sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED,sqlite3.SQLITE_BUSY|0x200])
+def test_transient_source_lock_pauses_at_committed_checkpoint_and_resumes(catalog,monkeypatch,code):
+    for identity in ('a','b','c'):event(catalog,identity,category='post')
+    before=build(catalog,batch_size=2,max_batches=1)
+    assert before['checkpoint_rowid']==2 and before['processed_records']==2
+    original=daily._batch
+    def locked_source(*args,**kwargs):
+        error=sqlite3.OperationalError('database is locked')
+        error.sqlite_errorcode=code
+        raise error
+    monkeypatch.setattr(daily,'_batch',locked_source)
+    with pytest.raises(ImportPaused) as paused:build(catalog,batch_size=2)
+    assert paused.value.reason=='daily_database_locked'
+    state=daily.daily_status(*catalog)
+    assert state['status']=='paused' and state['last_pause_reason']=='daily_database_locked'
+    assert state['checkpoint_rowid']==2 and state['processed_records']==2 and state['watermark_rowid']==3
+    assert daily.daily_detail('2024-06-01',*catalog)['summary']['observed_records']==2
+    monkeypatch.setattr(daily,'_batch',original)
+    resumed=build(catalog,batch_size=2)
+    assert resumed['status']=='caught_up' and resumed['checkpoint_rowid']==3 and resumed['processed_records']==3
+    assert resumed['last_error'] is None and resumed['last_pause_reason'] is None
+    assert daily.daily_detail('2024-06-01',*catalog)['summary']['observed_records']==3
+
+
+def test_unrelated_source_operational_error_is_not_retried_as_a_pause(catalog,monkeypatch):
+    for identity in ('a','b','c'):event(catalog,identity,category='post')
+    build(catalog,batch_size=2,max_batches=1)
+    def broken_source(*args,**kwargs):
+        error=sqlite3.OperationalError('no such table: source_events')
+        error.sqlite_errorcode=sqlite3.SQLITE_ERROR
+        raise error
+    monkeypatch.setattr(daily,'_batch',broken_source)
+    with pytest.raises(sqlite3.OperationalError):build(catalog)
+    state=daily.daily_status(*catalog)
+    assert state['status']=='failed' and state['last_pause_reason'] is None
+    assert state['checkpoint_rowid']==2 and state['processed_records']==2
+
+
+def test_daily_categories_use_classified_types_and_observed_record_counts(catalog):
+    with transaction(catalog[0]) as conn:conn.execute("UPDATE sources SET name='Google Fit' WHERE id='source-a'")
+    event(catalog,'reading',native='reading-one',metadata=metric(value=70))
+    event(catalog,'reading-copy',native='reading-one',metadata=metric(value=70))
+    event(catalog,'post',category='post',when=None,precision='unknown')
+    build(catalog)
+    result=daily.daily_categories(*catalog)
+    assert result['items']==[{'name':'health_sample','category':'health_sample','count':2},{'name':'post','category':'post','count':1}]
+    assert result['projection']['processed_records']==3
+    with sqlite3.connect(catalog[0]) as conn:
+        assert dict(conn.execute('SELECT category,count(*) FROM events GROUP BY category'))=={'record':2,'post':1}

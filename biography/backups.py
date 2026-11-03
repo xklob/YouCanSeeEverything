@@ -30,6 +30,7 @@ from .storage import (CHUNK_BYTES, DEFAULT_RESERVE_BYTES, FileSnapshot,
 FORMAT = "biography-retained-originals-backup"
 VERSION = 1
 MAX_MANIFEST_BYTES = 64 * 1024**2
+VALIDATION_CACHE_KIB = 256 * 1024
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -153,6 +154,8 @@ def _writer_lock(root: Path, external: bool):
 
 
 def _checks(connection: sqlite3.Connection) -> None:
+    # Connection-local memory only; persistent database settings are unchanged.
+    connection.execute(f"PRAGMA cache_size=-{VALIDATION_CACHE_KIB}")
     if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
         raise BackupError("Catalog failed integrity_check")
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
@@ -523,12 +526,26 @@ def _create_backup(database: Path, vaultroot: Path, root: Path, *, reserve_bytes
             _catalog_cut(database, catalog, guard, snapshot_timeout, max_wal_growth_bytes,
                          externally_private, progress)
         _private(catalog, False, externally_private)
-        actual_hash, size = hash_file(catalog)
+        state.update({"stage": "catalog_readback", "catalog_bytes_read_back": 0})
+        update(True)
+        def catalog_readback(length):
+            state["catalog_bytes_read_back"] += length
+            update()
+        actual_hash, size = hash_file(catalog, progress=catalog_readback)
         if manifest.get("catalog") and manifest["catalog"] != {"path": "catalog.sqlite3", "sha256": actual_hash, "bytes": size}:
             raise IntegrityError("Fixed catalog failed manifest readback")
         _member(root, "catalog.sqlite3.part").unlink(missing_ok=True)
         with closing(_connect(catalog)) as cut:
-            _checks(cut)
+            state["stage"] = "catalog_validation"
+            update(True)
+            def validation_progress():
+                update()
+                return 0
+            cut.set_progress_handler(validation_progress, 250000)
+            try:
+                _checks(cut)
+            finally:
+                cut.set_progress_handler(None, 0)
             watermark = _watermark(cut)
             manifest.update({"status": "copying", "catalog": {"path": "catalog.sqlite3", "sha256": actual_hash,
                              "bytes": size}, "catalog_cut_at": manifest.get("catalog_cut_at", _now()),

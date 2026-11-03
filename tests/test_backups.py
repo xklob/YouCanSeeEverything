@@ -205,6 +205,27 @@ def test_complete_backup_restores_original_bytes_remapped_paths_and_provenance(t
     assert all(not stat.S_IMODE(path.stat().st_mode) & 0o077 for path in output.rglob("*"))
 
 
+@pytest.mark.parametrize("broken_reference", [False, True])
+def test_bounded_validation_cache_keeps_catalog_immutable_and_fk_checks_enforced(tmp_path, broken_reference):
+    database, _, _ = seed(tmp_path)
+    if broken_reference:
+        with sqlite3.connect(database) as writer:
+            writer.execute("UPDATE files SET object_hash=?", ("0" * 64,))
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    connection = backups._connect(database)
+    try:
+        if broken_reference:
+            with pytest.raises(backups.BackupError, match="foreign_key_check"):
+                backups._checks(connection)
+        else:
+            backups._checks(connection)
+        assert connection.execute("PRAGMA cache_size").fetchone()[0] == -256 * 1024
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+    finally:
+        connection.close()
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+
+
 def test_resume_retains_fixed_cut_and_independently_rehashes_existing_objects(tmp_path, monkeypatch):
     database, vault, objects = seed(tmp_path)
     output = tmp_path / "backup"

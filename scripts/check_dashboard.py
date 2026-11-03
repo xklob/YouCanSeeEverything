@@ -61,24 +61,24 @@ def fixture_coverage(sources: list[dict]) -> dict:
             "classification": dict(status="source_label_only", label=source["name"])})
     return dict(scope="observed_imported_records", continuous_coverage_asserted=False, generated_at=measured_at,
         totals=dict(sources=2, files=8, bytes=2048, parsed_files=2, metadata_only_files=2, retained_only_files=2,
-                    review_files=2, events=3, dated_events=3, undated_events=0), sources=rows,
+                    review_files=2, events=sum(s["event_count"] for s in sources), dated_events=sum(s["event_count"] for s in sources), undated_events=0), sources=rows,
         active_imports=[dict(id="qa-import", source_id="qa-one", source="QA journal", status="running",
             files=dict(completed=1, total=4, fraction=.25), bytes=dict(completed=768, total=1024, fraction=.75),
             events_reported=9, started_at=measured_at, error=None)],
         queue=[dict(source_id="qa-two", source="QA calendar", status="paused", position=2, snapshot_bytes=1024,
                     error=dict(code="SyntheticReview", message="Synthetic source awaits review."))],
-        indexing=dict(catalog_max_event_rowid=3,
-            coverage_stats=dict(status="current", measured_at=measured_at, catalog_max_event_rowid=3),
+        indexing=dict(catalog_max_event_rowid=4,
+            coverage_stats=dict(status="current", measured_at=measured_at, catalog_max_event_rowid=4),
             daily=dict(status="ready", watermark_rowid=2, checkpoint_rowid=2, processed_records=2,
-                       current_catalog_max_rowid=3, caught_up_to_watermark=True, append_backlog_rowid_span=1,
+                       current_catalog_max_rowid=4, caught_up_to_watermark=True, append_backlog_rowid_span=2,
                        rebuild_required=False)), backup=dict(status="not_supplied"), limitations=[])
 
 
 def fixture_daily(path: str, records: list[dict], params: dict) -> dict:
-    projection = dict(status="ready", watermark_rowid=3, checkpoint_rowid=3, processed_records=3,
-                      current_catalog_max_rowid=3, caught_up_to_watermark=True, append_backlog_rowid_span=0,
+    projection = dict(status="ready", watermark_rowid=4, checkpoint_rowid=4, processed_records=4,
+                      current_catalog_max_rowid=4, caught_up_to_watermark=True, append_backlog_rowid_span=0,
                       rebuild_required=False)
-    selected = records
+    selected = [{**r, "category": "health_sample" if r["category"] == "measurement" else r["category"]} for r in records]
     for key, field in (("source", "source_id"), ("category", "category")):
         if params.get(key):
             selected = [r for r in selected if r[field] == params[key][0]]
@@ -86,8 +86,9 @@ def fixture_daily(path: str, records: list[dict], params: dict) -> dict:
         selected = [r for r in selected if params["q"][0].casefold() in (r["title"] + r["body"]).casefold()]
     def summary(day):
         own = [r for r in selected if r["occurred_at"][:10] == day]
-        return dict(day=day, date=day, observed_records=len(own), raw_samples=0, substantive_records=len(own),
-                    technical_records=0, display_groups=len(own), measurement_groups=0,
+        samples = sum(r["category"] == "health_sample" for r in own)
+        return dict(day=day, date=day, observed_records=len(own), raw_samples=samples, substantive_records=len(own)-samples,
+                    technical_records=0, display_groups=len(own)-samples, measurement_groups=int(bool(samples)),
                     source_count=len({r["source_id"] for r in own}), date_bases=[dict(basis="source_timestamp", count=len(own))])
     limit, offset = int(params.get("limit", [31])[0]), int(params.get("offset", [0])[0])
     if path == "/api/days":
@@ -95,10 +96,18 @@ def fixture_daily(path: str, records: list[dict], params: dict) -> dict:
         if params.get("undated") == ["true"]:
             items = []
         return dict(items=items[offset:offset+limit], total=len(items), limit=limit, offset=offset, projection=projection)
-    day = unquote(path.rsplit("/", 1)[-1])
+    day = "2024-04-05" if path.startswith("/api/rollups/") else unquote(path.rsplit("/", 1)[-1])
     own = [{**r, "display_class": "substantive", "date_basis": "source_timestamp", "duplicate_count": 0}
            for r in selected if r["occurred_at"][:10] == day]
-    return dict(day=day, summary=summary(day), rollups=[], items=own[offset:offset+limit], total=len(own),
+    samples = [{**r, "display_class": "measurement"} for r in own if r["category"] == "health_sample"]
+    rollup = dict(id="qa-heart-rate", day=day, source_id="qa-one", source="QA journal", category="health_sample",
+                  metric="heart_rate", unit="bpm", aggregation="none", sample_count=1, numeric_count=1,
+                  min=72, max=72, sample_mean=72, sum=None, latest=None, first_at="2024-04-05T10:00:00Z",
+                  last_at="2024-04-05T10:00:00Z", evidence_ids=["qa-pulse"], watermark=4)
+    if path.startswith("/api/rollups/"):
+        return dict(items=samples[offset:offset+limit], total=len(samples), limit=limit, offset=offset, rollup=rollup, projection=projection)
+    readable = [r for r in own if r["category"] != "health_sample"]
+    return dict(day=day, summary=summary(day), rollups=[rollup] if samples else [], items=readable[offset:offset+limit], total=len(readable),
                 limit=limit, offset=offset, projection=projection)
 
 
@@ -119,6 +128,9 @@ def fixture_api(path: str) -> dict:
         {"id": "qa-cedar", "title": "Cedar acceptance stop", "body": "An earlier explicitly recorded stop, outside the map point page.",
          "occurred_at": "2024-04-04T12:00:00Z", "source_id": "qa-one", "source": "QA journal",
          "category": "location", "time_precision": "second"},
+        {"id": "qa-pulse", "title": "Heart rate sample", "body": "72 bpm.",
+         "occurred_at": "2024-04-05T10:00:00Z", "source_id": "qa-one", "source": "QA journal",
+         "category": "measurement", "time_precision": "second", "metadata": {"heart_rate": 72, "unit": "bpm"}},
     ]
     sources = []
     for suffix, name in (("one", "QA journal"), ("two", "QA calendar")):
@@ -128,29 +140,36 @@ def fixture_api(path: str) -> dict:
                             first_event=min(record["occurred_at"] for record in own),
                             last_event=max(record["occurred_at"] for record in own), notes=[]))
     if parsed.path == "/api/overview":
-        return dict(total_events=3, sources_count=2, files_count=3, stored_bytes=384,
+        return dict(total_events=4, sources_count=2, files_count=4, stored_bytes=512,
                     date_range={"start": records[2]["occurred_at"], "end": records[0]["occurred_at"]},
-                    activity=[{"month": "2024-04", "count": 3}],
-                    categories=[{"name": "location", "count": 2}, {"name": "post", "count": 1}], undated_count=0)
+                    activity=[{"month": "2024-04", "count": 4}],
+                    categories=[{"name": "location", "count": 2}, {"name": "post", "count": 1}, {"name": "measurement", "count": 1}], undated_count=0)
     if parsed.path == "/api/sources":
         return {"items": sources}
     if parsed.path == "/api/coverage":
         return fixture_coverage(sources)
-    if parsed.path == "/api/days" or parsed.path.startswith("/api/days/"):
+    if parsed.path == "/api/daily/categories":
+        counts = {}
+        for record in records:
+            category = "health_sample" if record["category"] == "measurement" else record["category"]
+            counts[category] = counts.get(category, 0) + 1
+        return {"items": [{"name": name, "category": name, "count": count} for name, count in sorted(counts.items())],
+                "projection": fixture_daily("/api/days", records, {})["projection"]}
+    if parsed.path == "/api/days" or parsed.path.startswith(("/api/days/", "/api/rollups/")):
         return fixture_daily(parsed.path, records, params)
     if parsed.path == "/api/summaries":
         period, model = params.get("period", ["2024-04"])[0], params.get("model", ["gpt-6.1-sol"])[0]
-        coverage = dict(total_events_in_scope=3, selected_events=3, candidate_events=3, undated_events_excluded=0,
+        coverage = dict(total_events_in_scope=4, selected_events=4, candidate_events=4, undated_events_excluded=0,
                         sources=[], retrieval_limited=False, time_basis="source_timestamp", limitations=[])
         result = dict(kind="period_summary", period=period, title="Saved synthetic monthly note",
             answer="The synthetic journal includes an Alder visit.", citations=["qa-alder"],
             sections=[dict(heading="Observed evidence", sentences=[dict(text="The synthetic journal includes an Alder visit.", citations=["qa-alder"])])],
             coverage=coverage, selection={}, model=model,
-            cache=dict(status="fresh", key="qa-summary", generated_at="2024-04-05T13:00:00Z", fixed_watermark="3", current_watermark="3"), limitations=[])
+            cache=dict(status="fresh", key="qa-summary", generated_at="2024-04-05T13:00:00Z", fixed_watermark="4", current_watermark="4"), limitations=[])
         focused = bool(params.get("focus", [""])[0].strip())
         return dict(status="missing" if focused else "fresh", period=period, key="qa-summary-focused" if focused else "qa-summary",
-                    model=model, fixed_watermark=None if focused else "3",
-                    current_watermark="3", current_coverage=coverage, result=None if focused else result)
+                    model=model, fixed_watermark=None if focused else "4",
+                    current_watermark="4", current_coverage=coverage, result=None if focused else result)
     if parsed.path in {"/api/imports", "/api/jobs"}:
         return {"items": []}
     if parsed.path == "/api/map-config":
@@ -208,7 +227,7 @@ class CandidateServer(ThreadingHTTPServer):
 
     def api(self, path: str) -> dict:
         # Do not expose a session token or download private file objects to candidate code.
-        if not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|map-config|coverage|days|rollups|summaries)(/[^/?]+)?", urlsplit(path).path):
+        if urlsplit(path).path != "/api/daily/categories" and not re.fullmatch(r"/api/(overview|sources|imports|jobs|events|map|trips|map-config|coverage|days|rollups|summaries)(/[^/?]+)?", urlsplit(path).path):
             raise ValueError("Endpoint is outside the read-only acceptance API")
         if urlsplit(path).path == "/api/map-config":
             # The QA proxy port is not the configured browser-key origin. Never
@@ -335,16 +354,30 @@ def run(args: argparse.Namespace, report: dict) -> None:
     def passed(name: str, **details):
         checks.append({"name": name, "passed": True, **details})
 
+    def preflight(path: str, stage: str):
+        report["preflight_stage"] = stage
+        started = time.monotonic()
+        try:
+            return server.api(path)
+        finally:
+            report.setdefault("preflight_seconds", {})[stage] = round(time.monotonic() - started, 3)
+
     try:
-        initial = server.api("/api/events?limit=40&offset=0&sort=desc")
+        initial = preflight("/api/events?limit=40&offset=0&sort=desc", "records")
         if not initial.get("items"):
             raise ValueError("Acceptance requires at least one known API record; use --fixture for an empty archive")
         known = initial["items"][0]
-        detail = server.api("/api/events/" + quote(known["id"], safe=""))
+        detail = preflight("/api/events/" + quote(known["id"], safe=""), "record_evidence")
         if not detail.get("provenance"):
             raise ValueError("Known API record must have original-file provenance")
-        sources = server.api("/api/sources")["items"]
-        points = server.api("/api/map?limit=2000")
+        sources = preflight("/api/sources", "sources")["items"]
+        points = preflight("/api/map?limit=2000", "locations")
+        daily_types = preflight("/api/daily/categories", "daily_types")
+        assert isinstance(daily_types.get("items"), list), "Daily types must provide projected items"
+        assert isinstance(daily_types.get("projection"), dict), "Daily types must include projection status"
+        assert all(isinstance(item.get("name"), str) and item.get("name") == item.get("category") and
+                   isinstance(item.get("count"), int) and item["count"] >= 0 for item in daily_types["items"]), "Daily type schema is invalid"
+        passed("daily_type_endpoint_returns_projected_counts", category_count=len(daily_types["items"]))
         report["record_fingerprint"] = hashlib.sha256(known["id"].encode()).hexdigest()
         report["initial_total"] = initial["total"]
 
@@ -650,7 +683,27 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 expect(daily.get_by_role("heading", name="Saved synthetic monthly note", exact=True)).to_have_count(0)
                 expect(daily.get_by_text("No saved summary for this selection", exact=True)).to_be_visible()
                 passed("summary_focus_changes_saved_cache_without_starting_model")
+                type_filter = page.get_by_role("combobox", name="Filter by type", exact=True)
+                expect(type_filter).to_have_attribute("aria-busy", "false")
+                expect(type_filter.get_by_role("option", name="Health sample (1)", exact=True)).to_have_count(1)
+                expect(type_filter.get_by_role("option", name="Measurement (1)", exact=True)).to_have_count(0)
+                with page.expect_response(lambda response: urlsplit(response.url).path.startswith("/api/days/") and
+                        parse_qs(urlsplit(response.url).query).get("category") == ["health_sample"]):
+                    type_filter.select_option("health_sample")
+                expect(daily.get_by_role("heading", name="Measurement streams", exact=True)).to_be_visible()
+                expect(daily.get_by_role("heading", name="Heart rate", exact=True)).to_be_visible()
+                daily.get_by_text(re.compile(r"^Heart rate: inspect raw samples")).click()
+                expect(daily.get_by_role("heading", name="Heart rate sample", exact=True)).to_be_visible()
+                daily.get_by_role("button", name=re.compile(r"Heart rate sample.*Open record")).click()
+                expect(page.get_by_role("dialog").get_by_role("heading", name="Heart rate sample", exact=True)).to_be_visible()
+                page.keyboard.press("Escape")
+                passed("derived_measurement_type_filters_days_and_opens_raw_sample_evidence")
                 screenshot("daily.png")
+                archive_modes.get_by_role("button", name=re.compile(r"^(Records|Timeline)$")).click()
+                expect(type_filter).to_have_value("")
+                expect(type_filter.get_by_role("option", name="Measurement (1)", exact=True)).to_have_count(1)
+                expect(type_filter.get_by_role("option", name="Health sample (1)", exact=True)).to_have_count(0)
+                passed("leaving_days_resets_derived_type_and_restores_raw_type_domain")
             assert not report["page_errors"], "Browser page errors occurred"
             assert not report["browser_console_errors"], "Browser console errors occurred"
             assert not report["blocked_requests"] and not server.violations, "Candidate attempted prohibited network access"

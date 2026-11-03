@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+import threading
 
 import pytest
 
@@ -107,3 +108,66 @@ def test_file_evidence_batches_use_covering_index_without_sort(tmp_path):
             plan = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + sql, args)]
             assert any('COVERING INDEX evidence_file' in row for row in plan)
             assert not any('TEMP B-TREE' in row for row in plan)
+
+
+def test_reindex_waits_for_background_writer_before_final_projections(tmp_path, monkeypatch):
+    path, raw, fid = fixture(tmp_path, count=2)
+    acquired, release = threading.Event(), threading.Event()
+
+    def competing_writer():
+        with transaction(path) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            acquired.set()
+            assert release.wait(5)
+
+    worker = threading.Thread(target=competing_writer)
+    timer = threading.Timer(.6, release.set)
+
+    def index(*args, **kwargs):
+        with transaction(path) as conn:
+            conn.execute("""INSERT INTO events(id,source_id,title,category,metadata,created_at)
+                VALUES('new-record','s','Synthetic visit','place_visit',?,'now')""",
+                (json.dumps({'latitude': 12.5, 'longitude': 45.25}),))
+            conn.execute("INSERT INTO evidence VALUES('new-record',?,'row:0','fixture')", (fid,))
+        return 1
+
+    reconcile_media = media.reconcile_media
+
+    def reconcile(*args, **kwargs):
+        if kwargs.get('event_ids') == []:
+            return {}
+        return reconcile_media(*args, **kwargs)
+
+    original_transaction = pipeline.transaction
+    from contextlib import contextmanager
+
+    @contextmanager
+    def after_read(*args, **kwargs):
+        with original_transaction(*args, **kwargs) as conn:
+            yield conn
+        # Start contention only after the new-ID read. The initial schema
+        # check precedes indexing, so the replacement event is still absent.
+        with original_transaction(path) as conn:
+            indexed = conn.execute("SELECT 1 FROM events WHERE id='new-record'").fetchone()
+        if indexed and not acquired.is_set():
+            worker.start()
+            assert acquired.wait(5)
+            timer.start()
+
+    monkeypatch.setattr(pipeline, 'index_stored', index)
+    monkeypatch.setattr(pipeline, 'transaction', after_read)
+    monkeypatch.setattr(enrichment, 'reapply', lambda *a, **k: 0)
+    monkeypatch.setattr(media, 'reconcile_media', reconcile)
+    try:
+        assert pipeline._reindex_files([fid], path) == [{'file_id': fid, 'events_added': 1}]
+        assert acquired.is_set()
+    finally:
+        release.set()
+        if worker.ident is not None:
+            worker.join(5)
+        timer.cancel()
+    with transaction(path) as conn:
+        point = conn.execute("SELECT latitude,longitude FROM event_locations WHERE event_id='new-record'").fetchone()
+        assert tuple(point) == (12.5, 45.25)
+        assert conn.execute("SELECT count(*) FROM events WHERE id='old-00000'").fetchone()[0] == 1
+    assert raw.read_bytes() == b'{"synthetic":"immutable original"}'

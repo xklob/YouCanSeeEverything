@@ -274,7 +274,7 @@ def _reindex_files(file_ids,db_path=None):
         if 'evidence_file' not in indexes:
             raise RuntimeError('The evidence_file index must be installed before targeted reindexing')
     for file_id in selected:
-        with transaction(db_path) as conn:
+        with write_transaction(db_path) as conn:
             row=conn.execute('''SELECT f.*,o.path,s.name source FROM files f
                 JOIN objects o ON o.sha256=f.object_hash JOIN sources s ON s.id=f.source_id WHERE f.id=?''',(file_id,)).fetchone()
             if row is None:raise ValueError('Retained file not found')
@@ -296,7 +296,8 @@ def _reindex_files(file_ids,db_path=None):
     for sid in sources:
         reapply(db_path,source_id=sid)
         # Index retained media/manifest files once, without selecting any events.
-        reconcile_media(db_path,source_id=sid,event_ids=[])
+        with write_transaction(db_path) as conn:
+            reconcile_media(conn,source_id=sid,event_ids=[])
     for file_id in selected:
         after=None
         while True:
@@ -306,8 +307,12 @@ def _reindex_files(file_ids,db_path=None):
                     (' AND event_id>?' if after is not None else '')+' ORDER BY event_id LIMIT 800',
                     (file_id,after) if after is not None else (file_id,))]
             if not batch:break
-            reconcile_locations(db_path,event_ids=batch)
-            reconcile_media(db_path,event_ids=batch,index_files=False)
+            # Acquire one writer before either derived projection reads. Both
+            # helpers share it, so background discovery cannot invalidate a
+            # read snapshot or exhaust its short interactive lock timeout.
+            with write_transaction(db_path) as conn:
+                reconcile_locations(conn,event_ids=batch)
+                reconcile_media(conn,event_ids=batch,index_files=False)
             after=batch[-1]
     return results
 

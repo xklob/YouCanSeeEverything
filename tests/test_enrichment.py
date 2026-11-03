@@ -56,13 +56,13 @@ def test_source_reapply_drives_from_sparse_reviews_and_preserves_other_sources(t
         conn.execute("INSERT INTO event_enrichments VALUES('missing-event',?,'now')",(payload,))
         conn.executemany("INSERT INTO events(id,source_id,title,category,created_at) VALUES(?,?,'Unreviewed fixture','note','now')",[(f'bulk-{i}',sid) for i in range(100)])
     statements=[]
-    original=enrichment.transaction
+    original=enrichment.write_transaction
     @contextmanager
     def traced(path=None):
         with original(path) as conn:
             conn.set_trace_callback(statements.append)
             yield conn
-    monkeypatch.setattr(enrichment,'transaction',traced)
+    monkeypatch.setattr(enrichment,'write_transaction',traced)
     assert reapply(path,source_id=sid)==1
     sql=next(statement for statement in statements if statement.startswith('SELECT r.* FROM event_enrichments'))
     with transaction(path) as conn:

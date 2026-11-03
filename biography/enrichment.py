@@ -2,7 +2,7 @@
 from datetime import date
 import hashlib
 import json
-from .db import transaction, now
+from .db import transaction, write_transaction, now
 
 
 def ensure_schema(conn):
@@ -77,7 +77,7 @@ def reapply(path=None, *,source_id=None):
 
 
 def _reapply(path=None, *,source_id=None):
-    with transaction(path) as conn:
+    with write_transaction(path) as conn:
         ensure_schema(conn)
         # Reviews are sparse. Keep them outermost so a source filter cannot
         # turn reapplication into a scan of every event in that source.

@@ -166,3 +166,19 @@ def test_cli_uses_external_profile_and_inherits_global_directory_policy(tmp_path
     summary = json.loads(capsys.readouterr().out)
     assert summary["agents"]["files"][0]["records"] == 0
     assert not (output / "shell-history").exists()
+
+
+def test_visible_session_redaction_handles_encoded_auth_queries_and_preserves_public_addresses():
+    from urllib.parse import quote, unquote
+
+    opaque = "12345678-1234-1234-1234-123456789abc"
+    ordinary = "fedcba98-7654-3210-abcd-0123456789ab"
+    address = "0x" + "1234567890abcdef" * 2 + "12345678"
+    text = f"Public UUID {ordinary}. " + quote(quote(f"https://example.test/?token={opaque}", safe=""), safe="")
+    cleaned, changed = sanitize_visible(text)
+    assert changed
+    assert opaque not in unquote(unquote(cleaned))
+    assert ordinary in cleaned
+    for key in ("token", "access_token", "refresh_token", "tokenAddress", "inputCurrency"):
+        url = f"https://example.test/swap?{key}={address}"
+        assert sanitize_visible(url)[0] == url

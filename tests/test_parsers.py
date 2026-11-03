@@ -237,6 +237,147 @@ def test_chatgpt_retains_structured_media_references_without_duplicating_text(tm
     assert all(not isinstance(part, str) for part in parts)
 
 
+def test_google_legacy_activity_presentation_preserves_source_metadata(tmp_path):
+    activity = {"activityType": "IN_PASSENGER_VEHICLE", "distance": 1500, "duration": {"startTimestamp": "2024-01-01T12:00:00Z", "endTimestamp": "2024-01-01T13:05:00Z"}, "startLocation": {"latitudeE7": 10000000, "longitudeE7": 20000000}, "endLocation": {"latitudeE7": 20000000, "longitudeE7": 30000000}, "confidence": "HIGH"}
+    result = export(tmp_path, "timeline.json", {"timelineObjects": [{"activitySegment": activity}]}, "Google")
+    record = result.events[0]
+    assert record["title"] == "In a vehicle"
+    assert record["body"] == "In a vehicle\nDistance: 1.5 km\nDuration: 1 h 5 min"
+    assert record["metadata"]["activityType"] == activity["activityType"]
+    assert record["metadata"]["startLocation"] == activity["startLocation"]
+    assert record["locator"] == "$.timelineObjects[0].activitySegment"
+
+
+def test_google_place_name_and_address_are_readable_without_json(tmp_path):
+    place = {"location": {"name": "Example Cafe", "address": "123 Example Street", "placeId": "ChIJ-opaque-source-id"}, "duration": {"startTimestampMs": "1704110400000", "endTimestampMs": "1704112200000"}}
+    record = export(tmp_path, "timeline.json", [{"placeVisit": place}], "Google").events[0]
+    assert record["title"] == "Example Cafe"
+    assert record["body"] == "Example Cafe\nAddress: 123 Example Street\nDuration: 30 min"
+    assert "placeId" not in record["body"]
+    assert record["metadata"]["location"]["placeId"] == "ChIJ-opaque-source-id"
+
+
+def test_google_semantic_place_id_is_not_a_human_place_name(tmp_path):
+    value = {"semanticSegments": [{"startTime": "2024-01-01T12:00:00Z", "endTime": "2024-01-01T12:10:00Z", "visit": {"topCandidate": {"placeID": "ChIJ-opaque-source-id", "placeLocation": {"latLng": "geo:1,2"}}}}]}
+    record = export(tmp_path, "timeline.json", value, "Google").events[0]
+    assert record["title"] == "Place visit"
+    assert record["body"] == "Place visit\nDuration: 10 min"
+    assert record["metadata"]["visit"]["topCandidate"]["placeID"] == "ChIJ-opaque-source-id"
+
+
+def test_google_semantic_activity_uses_top_candidate_and_explicit_metrics(tmp_path):
+    value = {"startTime": "2024-01-01T12:00:00Z", "activity": {"topCandidate": {"type": "ON_BICYCLE"}, "distanceMeters": 2400, "durationSeconds": 125}}
+    record = export(tmp_path, "timeline.json", value, "Google").events[0]
+    assert record["title"] == "Cycling"
+    assert record["body"] == "Cycling\nDistance: 2.4 km\nDuration: 2 min 5 s"
+
+
+def test_google_activity_does_not_infer_distance_from_coordinates_or_local_timezones(tmp_path):
+    value = {"startTime": "2024-01-01T12:00:00", "endTime": "2024-01-01T13:00:00", "activity": {"type": "WALKING", "start": {"latLng": "geo:1,2"}, "end": {"latLng": "geo:2,3"}}}
+    record = export(tmp_path, "timeline.json", value, "Google").events[0]
+    assert record["title"] == "Walking"
+    assert record["body"] == "Walking"
+    assert record["metadata"]["activity"] == value["activity"]
+
+
+def test_google_legacy_preserves_all_waypoints_and_complete_metadata_fields(tmp_path):
+    from biography.locations import extract_points
+
+    points = [{"latitudeE7": 10000000 + i, "longitudeE7": 20000000 + i} for i in range(85)]
+    activity = {"activityType": "WALKING", "simplifiedRawPath": {"points": points}, "custom": {f"field_{i}": i for i in range(120)}, "description": "a" * 3500, "deep": {"a": {"b": {"c": {"d": {"e": "original"}}}}}, "access_token": "private-value"}
+    record = export(tmp_path, "timeline.json", [{"activitySegment": activity}], "Google").events[0]
+    metadata = record["metadata"]
+    assert metadata["simplifiedRawPath"]["points"] == points
+    assert metadata["custom"] == activity["custom"]
+    assert metadata["description"] == activity["description"]
+    assert metadata["deep"] == activity["deep"]
+    assert metadata["access_token"] == "[REDACTED CREDENTIAL]"
+    extracted = extract_points(metadata, category="travel")
+    assert len(extracted) == 85
+    assert [(p["latitude"], p["longitude"]) for p in extracted] == [(p["latitudeE7"]/1e7, p["longitudeE7"]/1e7) for p in points]
+
+
+def test_google_semantic_preserves_every_explicit_path_point_and_no_extra_points(tmp_path):
+    from biography.locations import extract_points
+
+    points = [{"point": f"geo:1.{i:03},2.{i:03}", "durationMinutesOffsetFromStartTime": str(i)} for i in range(75)]
+    value = {"startTime": "2024-01-01T12:00:00Z", "timelinePath": points}
+    record = export(tmp_path, "timeline.json", value, "Google").events[0]
+    assert record["metadata"]["timelinePath"] == points
+    extracted = extract_points(record["metadata"], record["occurred_at"], category="travel")
+    assert len(extracted) == 75
+    assert [point["locator"] for point in extracted] == [f"$.timelinePath[{i}]" for i in range(75)]
+
+
+def test_google_candidate_arrays_remain_metadata_without_becoming_visits(tmp_path):
+    from biography.locations import extract_points
+
+    value = {"location": {"name": "Recorded place", "latitudeE7": 10000000, "longitudeE7": 20000000}, "otherCandidateLocations": [{"latitudeE7": i, "longitudeE7": i} for i in range(70)]}
+    record = export(tmp_path, "timeline.json", [{"placeVisit": value}], "Google").events[0]
+    assert record["metadata"]["otherCandidateLocations"] == value["otherCandidateLocations"]
+    assert len(extract_points(record["metadata"], category="place_visit")) == 1
+
+
+def test_non_map_metadata_stays_bounded(tmp_path):
+    value = {"title": "A generic record", "points": [{"value": i} for i in range(80)], "deep": {"a": {"b": {"c": {"d": {"e": "original"}}}}}}
+    record = export(tmp_path, "other.json", value, "Unknown").events[0]
+    assert len(record["metadata"]["points"]) == 31
+    assert record["metadata"]["points"][-1] == {"additional_items_retained_in_source": 50}
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 4])
+def test_auth_query_uuid_redaction_preserves_unrelated_text_and_encoding(depth):
+    from urllib.parse import quote, unquote
+    from biography.parsers.common import clean_text, redact_auth_query_values
+
+    first = "12345678-1234-1234-1234-123456789abc"
+    second = "abcdef12-3456-7890-abcd-ef1234567890"
+    ordinary = "fedcba98-7654-3210-abcd-0123456789ab"
+    address = "0x" + "1234567890abcdef" * 2 + "12345678"
+    url = f"https://example.test/start?token={first}&access_token={second}&token_address={address}&request_id={ordinary}"
+    encoded = url
+    for _ in range(depth):
+        encoded = quote(encoded, safe="")
+    text = f"Ordinary UUID {ordinary}. URL: {encoded}."
+    redacted = redact_auth_query_values(text)
+    assert first not in redacted
+    assert second not in redacted
+    assert redacted.startswith(f"Ordinary UUID {ordinary}. URL: ")
+    decoded = redacted
+    for _ in range(depth):
+        decoded = unquote(decoded)
+    assert f"token_address={address}" in decoded
+    assert f"request_id={ordinary}" in decoded
+    assert decoded.count("[REDACTED CREDENTIAL]") == 2
+    assert redact_auth_query_values(redacted) == redacted
+    assert clean_text(text, len(text) + 1000) == redacted
+
+
+def test_nested_percent_encoded_auth_keys_and_values_are_redacted_without_truncation():
+    from urllib.parse import quote, unquote
+    from biography.parsers.common import redact_auth_query_values
+
+    opaque = "12345678-1234-1234-1234-123456789abc"
+    url = "https://example.test/?%74%6f%6b%65%6e=" + "".join(f"%{ord(c):02x}" for c in opaque)
+    text = "Long public introduction. " * 15000 + quote(url, safe="") + " END"
+    cleaned = redact_auth_query_values(text)
+    assert cleaned.endswith(" END")
+    assert cleaned.startswith("Long public introduction. " * 15000)
+    decoded = unquote(unquote(cleaned))
+    assert opaque not in decoded
+    assert "[REDACTED CREDENTIAL]" in decoded
+
+
+def test_public_blockchain_token_query_addresses_remain_visible():
+    from biography.parsers.common import clean_text, redact_auth_query_values
+
+    address = "0x" + "1234567890abcdef" * 2 + "12345678"
+    for key in ("token", "access_token", "refresh_token", "tokenAddress"):
+        text = f"https://example.test/swap?{key}={address}"
+        assert redact_auth_query_values(text) == text
+        assert clean_text(text) == text
+
+
 def test_eventbrite_orders_and_etsy_purchases_use_meaningful_dates(tmp_path):
     order = export(tmp_path, "orders.json", [{"event_data": {"event_name": "Concert", "start_date": "2024-05-01 19:00:00", "end_date": "2024-05-01 22:00:00", "venue": "Venue"}}], "Eventbrite").events[0]
     assert order["title"] == "Concert"

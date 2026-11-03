@@ -3436,3 +3436,40 @@ button:hover {
     font-size: 10px;
   }
 }
+/* Keep desktop map context close to its selected place; mobile follows the page. */
+@media (min-width: 641px) {
+  .map-context-grid {
+    align-items: start;
+  }
+  .location-list-section {
+    display: flex;
+    flex-direction: column;
+    max-height: 60vh;
+    min-height: 0;
+  }
+  .location-list-section > .map-section-heading,
+  .location-list-section > .list-limit-note {
+    flex-shrink: 0;
+  }
+  .recorded-location-list {
+    min-height: 0;
+    max-height: none;
+    overflow-y: auto;
+  }
+  .day-context-section {
+    max-height: 60vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+  }
+  .day-context-section > .map-section-heading {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #fff;
+  }
+}
+.recorded-location-list:focus-visible,
+.day-context-section:focus-visible {
+  outline: 2px solid #7195c5;
+  outline-offset: -3px;
+}

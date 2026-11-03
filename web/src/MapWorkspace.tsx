@@ -411,7 +411,12 @@ export default function MapWorkspace({
                 <h3>Recorded locations</h3>
                 <span>{count(locations.length)} loaded</span>
               </div>
-              <div className="recorded-location-list">
+              <div
+                className="recorded-location-list"
+                tabIndex={0}
+                role="region"
+                aria-label="Recorded locations list"
+              >
                 {locations.slice(0, 200).map((point) => (
                   <button
                     key={point.id}
@@ -448,7 +453,12 @@ export default function MapWorkspace({
                 </p>
               )}
             </section>
-            <section className="day-context-section" aria-live="polite">
+            <section
+              className="day-context-section"
+              aria-live="polite"
+              tabIndex={0}
+              aria-label="Same-day context panel"
+            >
               <div className="map-section-heading">
                 <h3>
                   <CalendarDays size={14} />

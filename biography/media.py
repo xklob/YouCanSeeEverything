@@ -8,6 +8,8 @@ Remote references remain unresolved and are never downloaded.
 from __future__ import annotations
 
 import hashlib
+import csv
+import io
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -19,6 +21,9 @@ from .config import settings
 from .locations import _connection
 
 INDEX_VERSION = 1
+ASSOCIATION_VERSION = 3
+MANIFEST_VERSION = 1
+MANIFEST_BYTE_LIMIT = 8 * 1024 * 1024
 SAFE_MIME_TYPES = {
     "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp",
     "video/mp4", "video/quicktime", "video/webm", "video/ogg",
@@ -54,6 +59,15 @@ def ensure_schema(conn_or_path=None):
                 status TEXT NOT NULL,match_basis TEXT,
                 PRIMARY KEY(event_id,ordinal))""",
             "CREATE INDEX IF NOT EXISTS event_media_file ON event_media_refs(file_id)",
+            """CREATE TABLE IF NOT EXISTS media_manifest_state (
+                file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                version INTEGER NOT NULL,probe_status TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS media_manifest_refs (
+                manifest_file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,source_id TEXT NOT NULL,native_id TEXT NOT NULL,
+                reference TEXT NOT NULL,object_hash TEXT,status TEXT NOT NULL,locator TEXT NOT NULL,
+                PRIMARY KEY(manifest_file_id,ordinal,native_id))""",
+            "CREATE INDEX IF NOT EXISTS media_manifest_native ON media_manifest_refs(source_id,native_id)",
             """CREATE TABLE IF NOT EXISTS media_event_state (
                 event_id TEXT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
                 version INTEGER NOT NULL,generation INTEGER NOT NULL,
@@ -201,6 +215,141 @@ def index_media_files(path=None, *, source_id=None, file_ids=None, refresh=False
         return {"files":file_count,"media_files":media_count}
 
 
+def _filename_list(value) -> list[str]:
+    """Read an export's explicit filename list without guessing whitespace splits.
+
+    X CSV exports use semicolon-space separators. JSON arrays, quoted CSV,
+    newlines and common list delimiters are also accepted. A comma inside an
+    unquoted filename is preserved when splitting would produce a nonfilename.
+    """
+    if isinstance(value, list):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    if not isinstance(value, str) or not value.strip():
+        return []
+    text = value.strip()
+    if text.startswith("["):
+        try:
+            items = json.loads(text)
+        except (ValueError, TypeError):
+            items = None
+        if isinstance(items, list):
+            return _filename_list(items)
+    # Find delimiters outside CSV quotes. Filenames can legitimately contain
+    # spaces, commas, semicolons and pipes when the export quotes them.
+    counts = {delimiter: 0 for delimiter in (";", "\t", "|", ",")}
+    quoted = False
+    for char in text:
+        if char == '"':
+            quoted = not quoted
+        elif not quoted and char in counts:
+            counts[char] += 1
+    delimiter = next((item for item in counts if counts[item]), ",")
+    try:
+        rows = csv.reader(io.StringIO(text), delimiter=delimiter, skipinitialspace=True, strict=True)
+        result = [item.strip() for row in rows for item in row if item.strip()]
+    except csv.Error:
+        return [text]
+    if len(result) > 1 and not ('"' in text or "\n" in text or "\r" in text):
+        if any(not PurePosixPath(item.replace("\\", "/")).suffix for item in result):
+            return [text]
+    return result
+
+
+def index_explicit_manifests(path=None, *, source_id=None) -> dict:
+    """Index bounded retained manifests that explicitly name event IDs and files.
+
+    A supported entry has references[].fullname/native_id/source_native_id and a
+    file or URL; downloaded bytes additionally need a declared SHA256. No URLs
+    are fetched, and a manifest file path is never opened as a filesystem path.
+    """
+    with _connection(path) as conn:
+        ensure_schema(conn)
+        clauses = ["lower(f.original_path) LIKE '%manifest.json'", "(st.file_id IS NULL OR st.version<>? OR st.probe_status='unavailable')"]
+        args = [MANIFEST_VERSION]
+        if source_id:
+            clauses.append("f.source_id=?")
+            args.append(source_id)
+        rows = conn.execute("""SELECT f.id,f.source_id,f.original_path,o.path FROM files f
+            JOIN objects o ON o.sha256=f.object_hash
+            LEFT JOIN media_manifest_state st ON st.file_id=f.id WHERE """ + " AND ".join(clauses), args)
+        counts = {"manifest_files": 0, "manifest_references": 0}
+        touched = set()
+        for row in rows:
+            if posixpath.basename(row["original_path"].replace("\\", "/")) != "manifest.json":
+                continue
+            physical = Path(row["path"])
+            if not physical.is_file() or physical.is_symlink():
+                conn.execute("INSERT OR REPLACE INTO media_manifest_state VALUES(?,?,?)", (row["id"], MANIFEST_VERSION, "unavailable"))
+                continue
+            counts["manifest_files"] += 1
+            entries = []
+            status = "unsupported"
+            try:
+                if physical.stat().st_size > MANIFEST_BYTE_LIMIT:
+                    raise ValueError("bounded manifest limit")
+                payload = json.loads(physical.read_text(encoding="utf-8-sig"))
+                items = payload.get("items") if isinstance(payload, dict) else None
+                if isinstance(items, list):
+                    for ordinal, item in enumerate(items):
+                        if not isinstance(item, dict) or not isinstance(item.get("references"), list):
+                            continue
+                        local = item.get("file")
+                        remote = item.get("url")
+                        reference = local if isinstance(local, str) and local.strip() else remote if isinstance(remote, str) else None
+                        if not reference or len(reference) > 8_000:
+                            continue
+                        digest = item.get("sha256")
+                        digest = digest.lower() if isinstance(digest, str) and re.fullmatch(r"[0-9a-fA-F]{64}", digest) else None
+                        declared = "downloaded" if item.get("status") == "downloaded" and isinstance(local, str) and local.strip() and digest else "unavailable"
+                        natives = set()
+                        for ref in item["references"]:
+                            if isinstance(ref, dict):
+                                native = ref.get("fullname") or ref.get("native_id") or ref.get("source_native_id")
+                                if isinstance(native, str):
+                                    natives.add(native)
+                        for native in natives:
+                            if isinstance(native, str) and native.strip() and len(native) <= 300:
+                                entries.append((row["id"], ordinal, row["source_id"], native, reference.strip(), digest, declared, f"$.items[{ordinal}]"))
+                    if entries:
+                        status = "explicit_references"
+            except (OSError, UnicodeError, ValueError, TypeError):
+                # Source content and error payloads stay private. Unsupported
+                # manifests are retained; they never authorize a guessed link.
+                entries = []
+            conn.execute("DELETE FROM media_manifest_refs WHERE manifest_file_id=?", (row["id"],))
+            conn.executemany("INSERT OR IGNORE INTO media_manifest_refs VALUES(?,?,?,?,?,?,?,?)", entries)
+            conn.execute("INSERT OR REPLACE INTO media_manifest_state VALUES(?,?,?)", (row["id"], MANIFEST_VERSION, status))
+            counts["manifest_references"] += len(entries)
+            if entries:
+                touched.add(row["source_id"])
+        for source in touched:
+            conn.execute("""INSERT INTO media_source_generation(source_id,generation) VALUES(?,1)
+                ON CONFLICT(source_id) DO UPDATE SET generation=generation+1""", (source,))
+        return counts
+
+
+def _manifest_references(conn, event, evidence):
+    if not event["native_id"]:
+        return []
+    containers = {row["original_path"].rpartition("!")[0] for row in evidence}
+    rows = conn.execute("""SELECT r.*,f.original_path AS manifest_path FROM media_manifest_refs r
+        JOIN files f ON f.id=r.manifest_file_id WHERE r.source_id=? AND r.native_id=?
+        ORDER BY r.manifest_file_id,r.ordinal""", (event["source_id"], event["native_id"])).fetchall()
+    return [
+        {"reference": row["reference"], "caption": None, "manifest_hash": row["object_hash"], "manifest_status": row["status"], "manifest_file_id": row["manifest_file_id"], "locator": row["locator"]}
+        for row in rows if row["manifest_path"].rpartition("!")[0] in containers
+    ]
+
+
+def _resolve_manifest(conn, event, reference):
+    if reference["manifest_status"] != "downloaded" or not reference["manifest_hash"]:
+        return None, "manifest_unavailable"
+    rows = conn.execute("""SELECT * FROM media_file_index WHERE source_id=? AND object_hash=?
+        ORDER BY file_id LIMIT 21""", (event["source_id"], reference["manifest_hash"])).fetchall()
+    chosen, basis = _choose(rows, "explicit_manifest_native_id_and_hash")
+    return chosen, basis or "manifest_missing_retained_media"
+
+
 def explicit_references(metadata: dict) -> list[dict]:
     """Extract declared media/file fields without treating arbitrary URLs as files."""
     result,seen = [],set()
@@ -216,7 +365,13 @@ def explicit_references(metadata: dict) -> list[dict]:
                 visit(item,f"{trail}[{index}]",active)
         elif isinstance(value,dict):
             for key,item in value.items():
-                if key in reference_keys and active and isinstance(item,str):
+                normalized_key = re.sub(r"[\s_-]+", " ", str(key)).casefold()
+                if normalized_key in {"media file names", "media filenames", "media file name", "media filename"}:
+                    for index, reference in enumerate(_filename_list(item)):
+                        if reference not in seen:
+                            seen.add(reference)
+                            result.append({"reference": reference, "locator": trail + "." + str(key) + f"[{index}]", "caption": None})
+                elif key in reference_keys and active and isinstance(item,str):
                     reference = item.strip()
                     if reference and reference not in seen:
                         seen.add(reference)
@@ -248,9 +403,24 @@ def _resolve_for_evidence(conn,event,evidence,reference):
     raw = reference.strip()
     parsed = urlsplit(raw)
     remote = parsed.scheme in {"http","https"}
-    pointer = parsed.scheme == "file-service"
+    pointer = parsed.scheme in {"file-service", "sediment"}
     if parsed.scheme and not remote and not pointer and parsed.scheme != "file":
         return None,"unsupported_reference"
+    asset = None
+    modern_asset = False
+    if pointer:
+        if parsed.query or parsed.fragment or (parsed.netloc and parsed.path not in {"", "/"}):
+            return None, "unsupported_reference"
+        asset = parsed.netloc or parsed.path.lstrip("/")
+        modern_asset = bool(re.fullmatch(r"file_[0-9a-fA-F]{32}", asset))
+        if parsed.scheme == "sediment" and not modern_asset:
+            return None, "unsupported_reference"
+        if not modern_asset and not re.fullmatch(r"file-[A-Za-z0-9_-]+", asset):
+            return None, "unsupported_reference"
+    elif re.fullmatch(r"file_[0-9a-fA-F]{32}", raw):
+        asset, modern_asset = raw, True
+    elif re.fullmatch(r"file-[A-Za-z0-9_-]+", raw):
+        asset = raw
     value = unquote(parsed.path if parsed.scheme == "file" else raw).replace("\\","/")
     if "\x00" in value:
         return None,"invalid_reference"
@@ -273,15 +443,23 @@ def _resolve_for_evidence(conn,event,evidence,reference):
                 if chosen is not None or basis == "ambiguous":
                     return chosen,basis
             continue
+        if asset:
+            candidates = query("m.basename LIKE ? ESCAPE '\\'", [asset.replace("_", "\\_") + "%"])
+            if modern_asset:
+                # Current exports retain sediment assets as file_<32hex>.<ext>.
+                # Exact stem equality avoids treating a longer ID or a similar
+                # filename as evidence for this pointer.
+                candidates = [row for row in candidates if PurePosixPath(row["basename"]).stem == asset]
+            else:
+                candidates = [row for row in candidates if row["basename"] == asset or (row["basename"].startswith(asset) and row["basename"][len(asset):len(asset)+1] in {"-", "_", "."})]
+            chosen,basis = _choose(candidates, "explicit_sediment_asset_id" if parsed.scheme == "sediment" else "explicit_asset_id")
+            if chosen is not None or basis == "ambiguous":
+                return chosen,basis
+            continue
         digest = re.search(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])",value,re.I)
         if digest:
             chosen,basis = _choose(query("m.object_hash=?",[digest.group().lower()]),"explicit_content_hash")
             if chosen is not None:
-                return chosen,basis
-        asset = raw.removeprefix("file-service://") if pointer else raw if raw.startswith("file-") else None
-        if asset and re.fullmatch(r"file-[A-Za-z0-9_-]+",asset):
-            chosen,basis = _choose(query("m.basename LIKE ? ESCAPE '\\'",[asset.replace("_","\\_")+"%"]),"explicit_asset_id")
-            if chosen is not None or basis == "ambiguous":
                 return chosen,basis
         normalized = posixpath.normpath(value.lstrip("/"))
         if normalized == ".." or normalized.startswith("../"):
@@ -303,6 +481,13 @@ def _resolve_for_evidence(conn,event,evidence,reference):
         chosen,basis = _choose(list(exact_matches.values()),"explicit_local_path")
         if chosen is not None or basis == "ambiguous":
             return chosen,basis
+        if normalized and "/" not in normalized and not pointer:
+            # A bare filename explicitly supplied by an export is exact evidence.
+            # Keep it inside the same source and virtual export, and reject
+            # competing bytes instead of choosing an arbitrary same-name file.
+            chosen,basis = _choose(query("m.basename=?", [normalized]), "explicit_export_basename")
+            if chosen is not None or basis == "ambiguous":
+                return chosen,basis
         if normalized and "/" in normalized:
             rows = conn.execute("""SELECT m.* FROM media_path_suffixes x
                 JOIN media_file_index m ON m.file_id=x.file_id WHERE """ + base +
@@ -334,7 +519,11 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
     """Reconcile explicit refs after a batch/import; unresolved refs stay visible."""
     with _connection(path) as conn:
         ensure_schema(conn)
+        conn.create_function("biography_media_metadata_sha256", 1,
+                             lambda value: hashlib.sha256((value or "{}").encode()).hexdigest(), deterministic=True)
         indexed = index_media_files(conn,source_id=source_id) if index_files else {"files":0,"media_files":0}
+        manifests = index_explicit_manifests(conn,source_id=source_id) if index_files else {"manifest_files":0,"manifest_references":0}
+        indexed.update(manifests)
         clauses,args = [],[]
         if source_id:
             clauses.append("e.source_id=?")
@@ -353,8 +542,8 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
             clauses.append("e.id IN (" + ",".join("?" for _ in event_ids) + ")")
             args.extend(event_ids)
         elif not refresh:
-            clauses.append("(st.event_id IS NULL OR st.version<>? OR (st.needs_refresh=1 AND st.generation<>coalesce(g.generation,0)) OR st.evidence_count<>(SELECT count(*) FROM evidence ev WHERE ev.event_id=e.id))")
-            args.append(INDEX_VERSION)
+            clauses.append("(st.event_id IS NULL OR st.version<>? OR (st.needs_refresh=1 AND st.generation<>coalesce(g.generation,0)) OR st.evidence_count<>(SELECT count(*) FROM evidence ev WHERE ev.event_id=e.id) OR st.metadata_sha256<>biography_media_metadata_sha256(e.metadata))")
+            args.append(ASSOCIATION_VERSION)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = conn.execute("""SELECT e.*,coalesce(g.generation,0) AS media_generation FROM events e
             LEFT JOIN media_event_state st ON st.event_id=e.id
@@ -369,10 +558,11 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
             evidence = conn.execute("""SELECT DISTINCT f.id,f.original_path,f.import_id,f.object_hash FROM evidence v
                 JOIN files f ON f.id=v.file_id WHERE v.event_id=? ORDER BY f.original_path""",(event["id"],)).fetchall()
             conn.execute("DELETE FROM event_media_refs WHERE event_id=?",(event["id"],))
-            refs = explicit_references(metadata)
+            refs = explicit_references(metadata) + _manifest_references(conn,event,evidence)
             resolved_hashes = set()
             ordinal = 0
-            needs_refresh = False
+            # Native-ID manifests may arrive later in the same source import.
+            needs_refresh = bool(event["native_id"])
             if event["category"] == "media":
                 for source_file in evidence:
                     own = conn.execute("SELECT * FROM media_file_index WHERE file_id=?",(source_file["id"],)).fetchone()
@@ -386,7 +576,7 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
                         probe = conn.execute("SELECT probe_status FROM media_object_index WHERE object_hash=?",(source_file["object_hash"],)).fetchone()
                         needs_refresh |= probe is None or probe["probe_status"] == "unavailable"
             for ref in refs:
-                matched,basis = _resolve(conn,event,evidence,ref["reference"])
+                matched,basis = _resolve_manifest(conn,event,ref) if "manifest_status" in ref else _resolve(conn,event,evidence,ref["reference"])
                 if matched is not None and matched["object_hash"] in resolved_hashes:
                     continue
                 status = "resolved" if matched is not None else "ambiguous" if basis == "ambiguous" else "unresolved"
@@ -397,10 +587,10 @@ def reconcile_media(path=None, *, event_ids=None, source_id=None, refresh=False,
                 counts["resolved" if matched is not None else "unresolved"] += 1
                 if matched is not None:
                     resolved_hashes.add(matched["object_hash"])
-                needs_refresh |= matched is None or basis in {"unique_export_suffix","explicit_asset_id"}
+                needs_refresh |= matched is None or basis in {"unique_export_suffix","explicit_asset_id","explicit_sediment_asset_id","explicit_export_basename"}
             digest = hashlib.sha256((event["metadata"] or "{}").encode()).hexdigest()
             conn.execute("INSERT OR REPLACE INTO media_event_state(event_id,version,generation,needs_refresh,metadata_sha256,evidence_count) VALUES(?,?,?,?,?,?)",
-                         (event["id"],INDEX_VERSION,event["media_generation"],int(needs_refresh),digest,evidence_count))
+                         (event["id"],ASSOCIATION_VERSION,event["media_generation"],int(needs_refresh),digest,evidence_count))
             counts["events"] += 1
         return counts
 
@@ -454,5 +644,5 @@ def media_file_info(file_id,path=None,*,objects_root=None):
                 "filename":posixpath.basename(row["original_path"].replace("\\","/")).replace("\r","").replace("\n","")}
 
 
-__all__ = ["ensure_schema","index_media_files","explicit_references","reconcile_media",
+__all__ = ["ensure_schema","index_media_files","index_explicit_manifests","explicit_references","reconcile_media",
            "media_for_events","media_for_event","media_file_info","sniff_media","SAFE_MIME_TYPES"]

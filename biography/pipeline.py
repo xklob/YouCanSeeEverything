@@ -191,6 +191,34 @@ def reindex(source_name=None,db_path=None):
         reconcile_media(db_path,source_id=sid)
     return results
 
+def reindex_files(file_ids,db_path=None):
+    """Refresh selected retained files, preserving records with other evidence."""
+    from .importer import StoredFile
+    from .enrichment import reapply
+    from .locations import reconcile_locations
+    from .media import reconcile_media
+    results=[];sources=set()
+    for file_id in dict.fromkeys(file_ids):
+        with transaction(db_path) as conn:
+            row=conn.execute('''SELECT f.*,o.path,s.name source FROM files f
+                JOIN objects o ON o.sha256=f.object_hash JOIN sources s ON s.id=f.source_id WHERE f.id=?''',(file_id,)).fetchone()
+            if row is None:raise ValueError('Retained file not found')
+            event_ids=[r[0] for r in conn.execute('SELECT event_id FROM evidence WHERE file_id=?',(file_id,))]
+            conn.execute('DELETE FROM evidence WHERE file_id=?',(file_id,))
+            for start in range(0,len(event_ids),800):
+                batch=event_ids[start:start+800]
+                conn.execute('DELETE FROM events WHERE id IN ('+','.join('?' for _ in batch)+') AND NOT EXISTS (SELECT 1 FROM evidence WHERE event_id=events.id)',batch)
+            conn.execute("UPDATE files SET parse_status='pending' WHERE id=?",(file_id,))
+        meta=json.loads(row['metadata'])
+        stored=StoredFile(row['object_hash'],row['bytes'],Path(row['path']),row['original_path'],'',meta.get('archive_chain',[]),meta.get('media_type'),meta.get('disposition','retained_leaf'))
+        count=index_stored(stored,row['source_id'],row['import_id'],row['source'],db_path,index_content=meta.get('index_content',True))
+        results.append({'file_id':file_id,'events_added':count});sources.add(row['source_id'])
+    for sid in sources:
+        reapply(db_path,source_id=sid)
+        reconcile_locations(db_path,source_id=sid)
+        reconcile_media(db_path,source_id=sid)
+    return results
+
 def replay_manifests(data_dir=None,db_path=None):
     """Recover catalog entries after a crash between retained bytes and index commit."""
     from .importer import StoredFile,read_manifest

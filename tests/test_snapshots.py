@@ -269,10 +269,11 @@ def test_unknown_persistent_table_is_never_silently_omitted(tmp_path):
         snapshots.export_snapshot(database, tmp_path / "snapshot")
 
 
-def test_misnamed_custom_table_cannot_masquerade_as_a_derived_cache(tmp_path):
+@pytest.mark.parametrize("table", ["event_locations", "media_manifest_state", "media_manifest_refs"])
+def test_misnamed_custom_table_cannot_masquerade_as_a_derived_cache(tmp_path, table):
     database, _, _, _, _ = seed(tmp_path)
     with sqlite3.connect(database) as connection:
-        connection.execute("CREATE TABLE event_locations(private_notes TEXT)")
+        connection.execute(f'CREATE TABLE "{table}"(private_notes TEXT)')
     with pytest.raises(snapshots.SnapshotError, match="unsupported schema"):
         snapshots.export_snapshot(database, tmp_path / "snapshot")
 
@@ -295,3 +296,33 @@ def test_known_legacy_media_cache_is_omitted_without_migrating_live_catalog(tmp_
     with sqlite3.connect(restored) as connection:
         assert "evidence_count" in {row[1] for row in connection.execute("PRAGMA table_info(media_event_state)")}
         assert connection.execute("SELECT count(*) FROM media_event_state").fetchone()[0] == 0
+
+
+def test_media_manifest_caches_are_omitted_and_older_snapshots_still_restore(tmp_path):
+    from biography.media import ensure_schema
+    database, _, _, digest, _ = seed(tmp_path)
+    with sqlite3.connect(database) as connection:
+        ensure_schema(connection)
+        connection.execute("INSERT INTO media_manifest_state VALUES(?,?,?)", ("file-0", 1, "parsed"))
+        connection.execute("INSERT INTO media_manifest_refs VALUES(?,?,?,?,?,?,?,?)",
+                           ("file-0", 0, "source-1", "synthetic-native-id", "attachment.png", digest,
+                            "downloaded", "$.items[0]"))
+    output = tmp_path / "snapshot"
+    manifest = snapshots.export_snapshot(database, output)
+    new_caches = {"media_manifest_state", "media_manifest_refs"}
+    assert new_caches.issubset(manifest["derived_tables_not_exported"])
+    assert new_caches.isdisjoint(manifest["tables"])
+    assert not (output / "tables/media_manifest_refs").exists()
+    # Earlier format-v1 manifests enumerate only caches known at export time.
+    # This descriptive list must not prevent rebuilding newer optional caches.
+    rewrite_manifest(output, lambda value: value.update(
+        derived_tables_not_exported=[name for name in value["derived_tables_not_exported"] if name not in new_caches]))
+    restored = tmp_path / "restored.sqlite3"
+    snapshots.restore_snapshot(output, restored)
+    with sqlite3.connect(restored) as connection:
+        for table in new_caches:
+            assert connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 9
+        assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 9
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT count(*) FROM media_manifest_refs").fetchone()[0] == 1

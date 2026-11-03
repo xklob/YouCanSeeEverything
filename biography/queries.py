@@ -77,6 +77,7 @@ def sources(path=None):
     try:
         rows=conn.execute('''SELECT s.*,
           (SELECT count(*) FROM files f WHERE f.source_id=s.id) file_count,
+          (SELECT count(*) FROM files f WHERE f.source_id=s.id AND f.parse_status IN ('error','needs_fallback','partial')) review_file_count,
           (SELECT count(*) FROM events e WHERE e.source_id=s.id) event_count,
           (SELECT coalesce(sum(bytes),0) FROM files f WHERE f.source_id=s.id) bytes,
           (SELECT min(occurred_at) FROM events e WHERE e.source_id=s.id) first_event,
@@ -84,7 +85,12 @@ def sources(path=None):
           FROM sources s ORDER BY s.queue_order,s.name''').fetchall()
         items=[]
         for row in rows:
-            v=dict(row);v['roots']=json.loads(v['roots']);v['notes']=json.loads(v['notes']);items.append(v)
+            v=dict(row);v['roots']=json.loads(v['roots']);v['notes']=json.loads(v['notes'])
+            if v['review_file_count']:
+                if v['status']=='ready':v['status']='partial'
+                note=f"{v['review_file_count']} retained files need further content extraction."
+                if note not in v['notes']:v['notes'].append(note)
+            items.append(v)
         return {'items':items}
     finally:conn.close()
 

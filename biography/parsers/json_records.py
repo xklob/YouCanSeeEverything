@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from .common import clean_text, document_text, event, pick, safe_value
+from .common import clean_text, document_text, event, parse_date, pick, safe_value
 from .normalized_history import ethereum_record, git_commit
 
 
@@ -186,7 +188,7 @@ def adapt(record: Any, locator: str, source: str, path: str, limit: int) -> tupl
         return "google.timeline", [google_semantic(record, locator, limit)]
     if "latitudeE7" in record and "longitudeE7" in record:
         when = pick(record, "timestamp", "timestampMs")
-        return "google.location", [event("Location observation", f"{record['latitudeE7']/1e7}, {record['longitudeE7']/1e7}", locator, when=when, category="location", metadata=record, limit=limit)]
+        return "google.location", [event("Location observation", f"{record['latitudeE7']/1e7}, {record['longitudeE7']/1e7}", locator, when=when, category="location", metadata=record, limit=limit, metadata_array_limit=None)]
     if "Messages" in record and isinstance(record["Messages"], list) and "tinder" in low_source:
         return "tinder.export", tinder(record, locator, limit)
     if isinstance(record.get("event_data"), dict) and "event_name" in record["event_data"]:
@@ -275,21 +277,129 @@ def meta_message(record: dict, locator: str, context: dict, limit: int) -> dict:
     return event(sender, body, locator, native_id=pick(record, "message_id", "id"), when=record.get("timestamp_ms"), unit="ms", category="message", metadata=metadata, limit=limit)
 
 
+_ACTIVITY_LABELS = {
+    "WALKING": "Walking", "ON_FOOT": "Walking", "RUNNING": "Running",
+    "CYCLING": "Cycling", "ON_BICYCLE": "Cycling", "BICYCLE": "Cycling",
+    "IN_PASSENGER_VEHICLE": "In a vehicle", "IN_VEHICLE": "In a vehicle",
+    "IN_CAR": "In a vehicle", "DRIVING": "In a vehicle",
+    "MOTORCYCLING": "Motorcycling", "ON_MOTORCYCLE": "Motorcycling",
+    "IN_BUS": "By bus", "IN_CITY_BUS": "By bus",
+    "IN_TRAIN": "By train", "IN_COMMUTER_TRAIN": "By train",
+    "IN_HIGH_SPEED_TRAIN": "By train", "IN_SUBWAY": "By subway",
+    "FLYING": "Flying", "IN_AIRPLANE": "Flying",
+    "IN_FERRY": "By boat", "BOATING": "By boat", "SAILING": "Sailing",
+    "SKIING": "Skiing", "IN_WHEELCHAIR": "In a wheelchair",
+    "STILL": "Stationary", "STATIONARY": "Stationary",
+}
+
+
+def _timeline_activity_label(value) -> str:
+    normalized = re.sub(r"([a-z])([A-Z])", r"\1_\2", str(value or "")).replace(" ", "_").upper()
+    return _ACTIVITY_LABELS.get(normalized, "Travel")
+
+
+def _timeline_place(value) -> tuple[str, str]:
+    """Use explicit display fields only; coordinates and place IDs are not names."""
+    if not isinstance(value, dict):
+        return "", ""
+    def display(*keys):
+        for key in keys:
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                text = text.strip()
+                if not re.fullmatch(r"(?:ChIJ\S+|0x[0-9a-fA-F]+:0x[0-9a-fA-F]+|[0-9a-fA-F-]{36})", text) and not text.startswith("geo:"):
+                    return text
+        return ""
+    name = display("name", "placeName", "displayName")
+    address = display("address", "formattedAddress")
+    return name, address
+
+
+def _timeline_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _timeline_duration(value: dict, start, end) -> float | None:
+    # Direct duration fields and recorded interval endpoints are source facts.
+    # No speed, route geometry, distance, or local-timezone guesses are used.
+    containers = [value]
+    if isinstance(value.get("duration"), dict):
+        containers.insert(0, value["duration"])
+    for container in containers:
+        for key, scale in (("durationSeconds", 1), ("durationMillis", .001), ("durationMs", .001), ("durationMinutes", 60)):
+            number = _timeline_number(container.get(key))
+            if number is not None:
+                return number * scale
+    normalized_start, _, _ = parse_date(start)
+    normalized_end, _, _ = parse_date(end)
+    if not normalized_start or not normalized_end or "T" not in normalized_start or "T" not in normalized_end:
+        return None
+    elapsed = (datetime.fromisoformat(normalized_end.replace("Z", "+00:00")) - datetime.fromisoformat(normalized_start.replace("Z", "+00:00"))).total_seconds()
+    return elapsed if elapsed >= 0 else None
+
+
+def _timeline_duration_label(seconds: float) -> str:
+    seconds = round(seconds)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = [f"{count} {unit}" for count, unit in ((days, "d"), (hours, "h"), (minutes, "min"), (seconds, "s")) if count]
+    return " ".join(parts) or "0 s"
+
+
+def _timeline_summary(title: str, value: dict, start, end, *, place=None, start_place=None, end_place=None) -> str:
+    lines = [title]
+    if place:
+        name, address = _timeline_place(place)
+        if address and address not in {name, title}:
+            lines.append("Address: " + address)
+    for label, point in (("From", start_place), ("To", end_place)):
+        if point:
+            name, address = _timeline_place(point)
+            if name or address:
+                lines.append(f"{label}: {name or address}")
+    for key in ("distanceMeters", "distance", "distanceInMeters"):
+        meters = _timeline_number(value.get(key))
+        if meters is not None:
+            distance = f"{meters/1000:.2f}".rstrip("0").rstrip(".") + " km" if meters >= 1000 else f"{meters:.1f}".rstrip("0").rstrip(".") + " m"
+            lines.append("Distance: " + distance)
+            break
+    duration = _timeline_duration(value, start, end)
+    if duration is not None:
+        lines.append("Duration: " + _timeline_duration_label(duration))
+    return "\n".join(lines)
+
+
 def google_timeline(record: dict, locator: str, limit: int) -> dict:
     key = "placeVisit" if "placeVisit" in record else "activitySegment"
     value = record[key]
     duration = value.get("duration", {})
     location = value.get("location", {})
-    title = pick(location, "name", "address", default=value.get("activityType", "Place visit" if key == "placeVisit" else "Travel"))
-    return event(title, document_text(value, limit), f"{locator}.{key}", native_id=None, when=pick(duration, "startTimestamp", "startTimestampMs"), end=pick(duration, "endTimestamp", "endTimestampMs"), category="place_visit" if key == "placeVisit" else "travel", metadata=value, limit=limit)
+    start = pick(duration, "startTimestamp", "startTimestampMs")
+    end = pick(duration, "endTimestamp", "endTimestampMs")
+    name, address = _timeline_place(location)
+    title = (name or address or "Place visit") if key == "placeVisit" else _timeline_activity_label(value.get("activityType"))
+    body = _timeline_summary(title, value, start, end, place=location if key == "placeVisit" else None, start_place=value.get("startLocation"), end_place=value.get("endLocation"))
+    return event(title, body, f"{locator}.{key}", native_id=None, when=start, end=end, category="place_visit" if key == "placeVisit" else "travel", metadata=value, limit=limit, metadata_array_limit=None)
 
 
 def google_semantic(record: dict, locator: str, limit: int) -> dict:
     visit = record.get("visit", {})
     candidate = visit.get("topCandidate", {})
     activity = record.get("activity", {})
-    title = pick(candidate, "placeName", "placeID", default=pick(activity, "type", default="Timeline segment"))
-    return event(title, document_text(record, limit), locator, when=record.get("startTime"), end=record.get("endTime"), category="place_visit" if visit else "travel", metadata=record, limit=limit)
+    name, address = _timeline_place(candidate)
+    top_activity = activity.get("topCandidate", {})
+    title = (name or address or "Place visit") if visit else _timeline_activity_label(pick(activity, "type", default=top_activity.get("type")))
+    start, end = record.get("startTime"), record.get("endTime")
+    details = {**record, **(visit if visit else activity)}
+    body = _timeline_summary(title, details, start, end, place=candidate if visit else None, start_place=activity.get("startLocation") or activity.get("start"), end_place=activity.get("endLocation") or activity.get("end"))
+    return event(title, body, locator, when=start, end=end, category="place_visit" if visit else "travel", metadata=record, limit=limit, metadata_array_limit=None)
 
 
 def tinder(record: dict, locator: str, limit: int) -> list[dict]:

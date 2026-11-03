@@ -96,6 +96,166 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(media_for_event("chat",self.database)[0]["file_id"],"chat-image")
         self.assertEqual(media_for_event("tweet",self.database)[0]["file_id"],"tweet-image")
 
+    def test_chatgpt_sediment_asset_id_matches_exact_retained_stem(self):
+        asset = "file_0123456789abcdef0123456789abcdef"
+        self.file("document", "chat.zip!conversations.json", b"[]")
+        self.file("image", f"chat.zip!{asset}.png")
+        self.event("message", {"content_parts": [{"asset_pointer": f"sediment://{asset}"}]}, ["document"])
+        result = reconcile_media(self.database)
+        self.assertEqual(result["resolved"], 1)
+        attachment = media_for_event("message", self.database)[0]
+        self.assertEqual(attachment["file_id"], "image")
+        self.assertEqual(attachment["match_basis"], "explicit_sediment_asset_id")
+
+    def test_sediment_id_cannot_match_longer_similar_id_or_other_export(self):
+        asset = "file_0123456789abcdef0123456789abcdef"
+        self.file("document", "chat.zip!conversations.json", b"[]")
+        self.file("longer-id", f"chat.zip!{asset}1.png")
+        self.file("other-export", f"another.zip!{asset}.png")
+        self.event("message", {"content_parts": [{"asset_pointer": f"sediment://{asset}"}]}, ["document"])
+        reconcile_media(self.database)
+        refs = media_for_event("message", self.database, include_unresolved=True)
+        self.assertEqual(refs[0]["status"], "unresolved")
+        self.assertEqual(refs[0]["match_basis"], "not_found")
+
+    def test_sediment_conflicting_bytes_remain_ambiguous(self):
+        asset = "file_0123456789abcdef0123456789abcdef"
+        self.file("document", "chat.zip!conversations.json", b"[]")
+        self.file("png", f"chat.zip!{asset}.png")
+        self.file("jpeg", f"chat.zip!{asset}.jpg", PNG + b"different bytes")
+        self.event("message", {"content_parts": [{"asset_pointer": f"sediment://{asset}"}]}, ["document"])
+        reconcile_media(self.database)
+        self.assertEqual(media_for_event("message", self.database, include_unresolved=True)[0]["status"], "ambiguous")
+
+    def test_unknown_file_library_namespace_stays_explicitly_unsupported(self):
+        self.file("document", "chat.zip!conversations.json", b"[]")
+        self.file("image", "chat.zip!opaque-pointer.png")
+        self.event("message", {"content_parts": [{"asset_pointer": "file-library:///opaque-pointer"}]}, ["document"])
+        reconcile_media(self.database)
+        refs = media_for_event("message", self.database, include_unresolved=True)
+        self.assertEqual(refs[0]["status"], "unresolved")
+        self.assertEqual(refs[0]["match_basis"], "unsupported_reference")
+
+    def test_twitter_csv_filename_lists_attach_retained_media_to_posts(self):
+        self.file("tweet-doc", "social.zip!tweets.csv", b"Date,Link,Text Content,Media File Names")
+        self.file("first", "social.zip!data/tweets_media/first image.png")
+        self.file("second", "social.zip!data/tweets_media/second.png", PNG + b"different")
+        self.event("tweet", {"Media File Names": "first image.png; second.png"}, ["tweet-doc"], category="post")
+        result = reconcile_media(self.database)
+        self.assertEqual(result["resolved"], 2)
+        attachments = media_for_event("tweet", self.database)
+        self.assertEqual({item["file_id"] for item in attachments}, {"first", "second"})
+        self.assertEqual({item["match_basis"] for item in attachments}, {"explicit_export_basename"})
+
+    def test_filename_lists_preserve_quoted_delimiters_and_spaces(self):
+        examples = [
+            ("one.png; two.mp4", ["one.png", "two.mp4"]),
+            ("one.png, two.mp4", ["one.png", "two.mp4"]),
+            ("one.png|two.mp4", ["one.png", "two.mp4"]),
+            ("one.png\ntwo.mp4", ["one.png", "two.mp4"]),
+            ('"photo, edited.png"; "photo; two.png"', ["photo, edited.png", "photo; two.png"]),
+            ("photo with spaces.png", ["photo with spaces.png"]),
+            ("photo, edited.png", ["photo, edited.png"]),
+            ('["one.png", "two.mp4"]', ["one.png", "two.mp4"]),
+            (["one.png", "two.mp4", ""], ["one.png", "two.mp4"]),
+        ]
+        for value, expected in examples:
+            with self.subTest(value=value):
+                refs = explicit_references({"Media File Names": value})
+                self.assertEqual([ref["reference"] for ref in refs], expected)
+
+    def test_bare_filename_cannot_cross_export_or_choose_conflicting_bytes(self):
+        self.file("document", "social.zip!tweets.csv", b"CSV")
+        self.file("other-export", "other.zip!data/tweets_media/other.png")
+        self.file("one", "social.zip!data/tweets_media/shared.png")
+        self.file("two", "social.zip!data/other/shared.png", PNG + b"different")
+        self.event("tweet", {"Media File Names": "other.png; shared.png"}, ["document"], category="post")
+        reconcile_media(self.database)
+        refs = media_for_event("tweet", self.database, include_unresolved=True)
+        self.assertEqual([ref["status"] for ref in refs], ["unresolved", "ambiguous"])
+
+    def test_reparsed_event_metadata_refreshes_attachments_without_new_evidence(self):
+        self.file("document", "social.zip!tweets.csv", b"CSV")
+        self.file("image", "social.zip!data/tweets_media/image.png")
+        self.event("tweet", {}, ["document"], category="post")
+        reconcile_media(self.database)
+        self.assertEqual(media_for_event("tweet", self.database), [])
+        with connect(self.database) as conn:
+            conn.execute("UPDATE events SET metadata=? WHERE id='tweet'", (json.dumps({"Media File Names": "image.png"}),))
+        self.assertEqual(reconcile_media(self.database)["resolved"], 1)
+        self.assertEqual(media_for_event("tweet", self.database)[0]["file_id"], "image")
+        self.assertEqual(reconcile_media(self.database)["events"], 0)
+
+    def manifest(self, identity, original, items, *, source="source-a"):
+        return self.file(identity, original, json.dumps({"items": items}).encode(), source=source)
+
+    def test_explicit_manifest_native_id_and_hash_attaches_media_to_actual_post(self):
+        self.file("document", "archive.zip!posts.json", b"[]")
+        self.file("image", "archive.zip!media/images/renamed.png")
+        digest = hashlib.sha256(PNG).hexdigest()
+        self.manifest("manifest", "archive.zip!media/manifest.json", [{"status": "downloaded", "file": "images/declared-original-name.png", "sha256": digest, "references": [{"fullname": "t3_post", "role": "post"}]}])
+        self.event("post", {}, ["document"], category="post", native="t3_post")
+        result = reconcile_media(self.database)
+        self.assertEqual(result["manifest_references"], 1)
+        attachment = media_for_event("post", self.database)[0]
+        self.assertEqual(attachment["file_id"], "image")
+        self.assertEqual(attachment["match_basis"], "explicit_manifest_native_id_and_hash")
+        self.assertEqual(reconcile_media(self.database)["events"], 0)
+
+    def test_manifest_unavailable_item_is_not_inferred_from_similar_filename(self):
+        self.file("document", "archive.zip!posts.json", b"[]")
+        self.file("image", "archive.zip!media/image.png")
+        self.manifest("manifest", "archive.zip!media/manifest.json", [{"status": "unavailable", "url": "https://example.invalid/image.png", "file": "media/image.png", "references": [{"fullname": "t3_post"}]}])
+        self.event("post", {}, ["document"], category="post", native="t3_post")
+        reconcile_media(self.database)
+        attachments = media_for_event("post", self.database, include_unresolved=True)
+        self.assertEqual(attachments[0]["status"], "unresolved")
+        self.assertEqual(attachments[0]["match_basis"], "manifest_unavailable")
+
+    def test_manifest_variants_preserved_and_identical_byte_attachments_deduplicated(self):
+        self.file("document", "archive.zip!posts.json", b"[]")
+        self.file("one", "archive.zip!media/one.png")
+        self.file("two", "archive.zip!media/two.png", PNG + b"variant")
+        hashes = [hashlib.sha256(data).hexdigest() for data in (PNG, PNG, PNG + b"variant")]
+        self.manifest("manifest", "archive.zip!media/manifest.json", [{"status": "downloaded", "file": f"media/{i}.png", "sha256": digest, "references": [{"native_id": "t3_post"}]} for i, digest in enumerate(hashes)])
+        self.event("post", {}, ["document"], category="post", native="t3_post")
+        result = reconcile_media(self.database)
+        self.assertEqual(result["manifest_references"], 3)
+        self.assertEqual(result["resolved"], 2)
+        self.assertEqual({ref["file_id"] for ref in media_for_event("post", self.database)}, {"one", "two"})
+
+    def test_manifest_exact_native_ids_and_export_containers_do_not_cross(self):
+        self.file("document", "archive.zip!posts.json", b"[]")
+        self.file("image", "archive.zip!media/image.png")
+        digest = hashlib.sha256(PNG).hexdigest()
+        items = [{"status": "downloaded", "file": "media/image.png", "sha256": digest, "references": [{"fullname": "t3_post"}]}]
+        self.manifest("other-export", "another.zip!media/manifest.json", items)
+        self.manifest("other-source", "archive.zip!media/manifest.json", items, source="source-b")
+        self.manifest("wrong-id", "archive.zip!manifest.json", [{**items[0], "references": [{"fullname": "post"}]}])
+        self.event("post", {}, ["document"], category="post", native="t3_post")
+        reconcile_media(self.database)
+        self.assertEqual(media_for_event("post", self.database, include_unresolved=True), [])
+
+    def test_manifest_added_later_refreshes_an_existing_native_post(self):
+        self.file("document", "archive.zip!posts.json", b"[]")
+        self.file("image", "archive.zip!media/image.png")
+        self.event("post", {}, ["document"], category="post", native="t3_post")
+        reconcile_media(self.database)
+        self.assertEqual(media_for_event("post", self.database), [])
+        self.manifest("manifest", "archive.zip!media/manifest.json", [{"status": "downloaded", "file": "media/image.png", "sha256": hashlib.sha256(PNG).hexdigest(), "references": [{"source_native_id": "t3_post"}]}])
+        self.assertEqual(reconcile_media(self.database)["resolved"], 1)
+        self.assertEqual(media_for_event("post", self.database)[0]["file_id"], "image")
+
+    def test_bare_filename_match_is_rechecked_when_a_competing_file_arrives(self):
+        self.file("document", "social.zip!tweets.csv", b"CSV")
+        self.file("image", "social.zip!data/tweets_media/shared.png")
+        self.event("post", {"Media File Names": "shared.png"}, ["document"], category="post")
+        reconcile_media(self.database)
+        self.assertEqual(media_for_event("post", self.database)[0]["file_id"], "image")
+        self.file("conflict", "social.zip!data/other/shared.png", PNG + b"different")
+        reconcile_media(self.database)
+        self.assertEqual(media_for_event("post", self.database, include_unresolved=True)[0]["status"], "ambiguous")
+
     def test_new_media_reconciles_prior_unresolved_reference_without_reprocessing_every_event(self):
         self.file("document","export.zip!messages/thread/message.json",b"{}")
         self.event("event",{"photos":[{"uri":"photos/new.png"}]},["document"])

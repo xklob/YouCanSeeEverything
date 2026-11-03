@@ -26,7 +26,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .parsers.common import clean_text
+from .parsers.common import clean_text, preserve_public_token_query, redact_auth_query_values
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROOT = PROJECT_ROOT / ".local/history-staging"
@@ -57,11 +57,11 @@ def now():
 
 def sanitize_visible(text: str) -> tuple[str, bool]:
     """Redact credential contexts without blanket-redacting ordinary short words."""
-    value = str(text)
+    value = redact_auth_query_values(str(text))
     # Credential headers can contain spaces and JWTs. Redact them before more
     # general assignment patterns consume only the scheme/first word.
     for pattern in (HEADER, COOKIE, PHRASE, PRIVATE_KEY, ASSIGNMENT, FLAG, OPAQUE_KEY, PASS_MARKER):
-        value = pattern.sub(lambda match: match[0] if "[REDACTED" in match[0] else match[1] + "[REDACTED CREDENTIAL]", value)
+        value = pattern.sub(lambda match: match[0] if "[REDACTED" in match[0] or preserve_public_token_query(match) else match[1] + "[REDACTED CREDENTIAL]", value)
     value = URL_AUTH.sub(r"\1[REDACTED CREDENTIAL]@", value)
     value = JWT.sub("[REDACTED JWT]", value)
     value = KNOWN_TOKEN.sub("[REDACTED CREDENTIAL]", value)
@@ -73,6 +73,8 @@ def sanitize_visible(text: str) -> tuple[str, bool]:
     value = HEX_KEY.sub("[REDACTED OPAQUE VALUE]", value)
     def redact_entropy(match):
         token = match[0]
+        if re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_-]*=)?0x[0-9a-fA-F]{40}", token, re.I):
+            return token
         counts = Counter(token)
         entropy = -sum((count/len(token))*math.log2(count/len(token)) for count in counts.values())
         return "[REDACTED OPAQUE VALUE]" if entropy >= 4.5 or (re.fullmatch("[a-fA-F0-9]+", token) and entropy >= 3) else token

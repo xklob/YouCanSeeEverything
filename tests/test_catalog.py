@@ -40,3 +40,20 @@ def test_undated_and_punctuation_search_are_supported(tmp_path):
     assert list_events(path,undated=True)['total']==1
     assert list_events(path,q='"hello"')['total']==1
     assert list_events(path,q="nothing' OR '1'='1")['total']==0
+
+
+def test_targeted_reindex_preserves_records_with_other_evidence(tmp_path,monkeypatch):
+    from biography.pipeline import reindex_files
+    from biography import parsers
+    path=tmp_path/'catalog.sqlite3';sid=fixture(path)
+    result=ParseResult(parser='fixture',events=[{'source_native_id':'native-1','title':'Shared record','body':'Original','category':'note','metadata':{},'locator':'row:0'}])
+    with transaction(path) as c:
+        add_events(c,sid,'f1','a'*64,result);add_events(c,sid,'f2','a'*64,result)
+    monkeypatch.setattr(parsers,'parse_file',lambda *args,**kwargs:result)
+    # index_stored's normal identity, unlike this test's short fixture IDs.
+    reindex_files(['f1'],path)
+    rows=list_events(path)['items']
+    assert len(rows)==1
+    links=event_detail(rows[0]['id'],path)['provenance']
+    assert 'f2' in {link['file_id'] for link in links}
+    assert len(links)==2

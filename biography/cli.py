@@ -58,7 +58,7 @@ def main():
         from .snapshots import export_snapshot
         with worker_lock():
             result=export_snapshot(settings.database,args.destination,manifests_dir=settings.data_dir/'manifests')
-        print(json.dumps({'destination':str(args.destination),'raw_objects_backed_up':False,'tables':result.get('table_counts')},indent=2))
+        print(json.dumps({'destination':str(args.destination),'raw_objects_backed_up':False,'tables':{name:entry['rows'] for name,entry in result['tables'].items()}},indent=2))
     elif args.command=='restore':
         from .snapshots import restore_snapshot
         print(json.dumps(restore_snapshot(args.snapshot,args.database,vaultroot=args.vaultroot),indent=2))

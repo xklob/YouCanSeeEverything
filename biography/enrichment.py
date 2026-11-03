@@ -22,6 +22,10 @@ def _apply(conn, event_id, payload):
     metadata['enrichment']=payload
     conn.execute('UPDATE events SET occurred_at=?,end_at=?,time_precision=?,metadata=? WHERE id=?',
         (payload['occurred_at'],payload.get('end_at'),payload['time_precision'],json.dumps(metadata,ensure_ascii=False),event_id))
+    # Reviewed coordinates/time edits can sit behind a legacy discovery cursor.
+    # Refresh only the explicitly touched record in this existing transaction.
+    from .locations import reconcile_locations
+    reconcile_locations(conn,event_ids=[event_id])
     return True
 
 

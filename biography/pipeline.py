@@ -112,6 +112,7 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
         conn.execute('INSERT INTO imports(id,source_id,status,total_files,total_bytes,started_at) VALUES(?,?,?,?,?,?)',(iid,sid,'running',len(paths),sum(p.stat().st_size for p in paths),now()))
         conn.execute("UPDATE sources SET status='importing',updated_at=? WHERE id=?",(now(),sid))
     completed=byte_count=events=failures=0
+    raw_complete=False
     def index_item(stored):
         allowed=dataset.get('index_files')
         return index_stored(stored,sid,iid,dataset['name'],db_path,index_content=allowed is None or stored.original_path in allowed)
@@ -149,27 +150,50 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
             if parse_errors:notes.append(f'{parse_errors} retained files need further content extraction.')
             if remaining:notes.append(f'{remaining} Windows source files remain, including exclusions or unresolved archives.')
             conn.execute('UPDATE sources SET status=?,updated_at=?,notes=? WHERE id=?',(state,now(),json.dumps(notes),sid))
-            conn.execute('UPDATE imports SET status=?,finished_at=? WHERE id=?',(state,now(),iid))
+            checkpoint=json.loads(conn.execute('SELECT checkpoint FROM imports WHERE id=?',(iid,)).fetchone()[0] or '{}')
+            checkpoint.update(raw_complete=True,phase='postprocessing',postprocessing_complete=False)
+            conn.execute('UPDATE imports SET status=?,finished_at=?,checkpoint=? WHERE id=?',(state,now(),json.dumps(checkpoint),iid))
+        raw_complete=True
         # Empty export directories are removed only after their individual files were verified.
         if move:
             for base,dirs,names in os.walk(root,topdown=False,followlinks=False):
                 try:Path(base).rmdir()
                 except OSError:pass
         from .enrichment import reapply
-        from .locations import reconcile_locations
+        from .locations import drain_locations
         from .media import reconcile_media
         reapply(db_path,source_id=sid)
-        reconcile_locations(db_path,source_id=sid)
+        drain_locations(db_path,source_id=sid)
         # File/manifest indexing enqueues sparse candidates; bounded maintenance
         # resolves them without extending source completion into an event scan.
         reconcile_media(db_path,source_id=sid,event_ids=[])
+        mark_postprocessing_complete(sid,db_path,import_id=iid)
         return {'id':iid,'source':dataset['name'],'status':state,'files':completed,'events_added':events,'storage_exceptions':failures,'parse_errors':parse_errors}
     except Exception as error:
         state='paused' if isinstance(error,ImportPaused) else 'failed'
         with transaction(db_path) as conn:
-            conn.execute('UPDATE sources SET status=?,updated_at=? WHERE id=?',(state,now(),sid))
-            conn.execute('UPDATE imports SET status=?,error=?,finished_at=? WHERE id=?',(state,f'{type(error).__name__}: {error}',now(),iid))
+            checkpoint=json.loads(conn.execute('SELECT checkpoint FROM imports WHERE id=?',(iid,)).fetchone()[0] or '{}')
+            checkpoint.update(raw_complete=raw_complete,phase='postprocessing' if raw_complete else 'ingestion',postprocessing_complete=False)
+            if raw_complete:
+                checkpoint['postprocessing_status']=state
+                conn.execute('UPDATE imports SET error=?,checkpoint=? WHERE id=?',(f'{type(error).__name__}: {str(error)[:500]}',json.dumps(checkpoint),iid))
+            else:
+                conn.execute('UPDATE sources SET status=?,updated_at=? WHERE id=?',(state,now(),sid))
+                conn.execute('UPDATE imports SET status=?,error=?,finished_at=?,checkpoint=? WHERE id=?',(state,f'{type(error).__name__}: {str(error)[:500]}',now(),json.dumps(checkpoint),iid))
         raise
+
+
+def mark_postprocessing_complete(source_id,db_path=None,*,import_id=None):
+    """Clear a resumed derived-work error without rewriting raw import status."""
+    with transaction(db_path) as conn:
+        row=conn.execute('SELECT id,status,checkpoint FROM imports WHERE source_id=?'+(' AND id=?' if import_id else '')+' ORDER BY started_at DESC,id DESC LIMIT 1',
+            [source_id,import_id] if import_id else [source_id]).fetchone()
+        if row is None:return False
+        if row['status'] not in {'ready','partial'}:raise ValueError('Raw import is not complete')
+        checkpoint=json.loads(row['checkpoint'] or '{}')
+        checkpoint.update(raw_complete=True,phase='complete',postprocessing_complete=True,postprocessing_status='complete')
+        conn.execute('UPDATE imports SET checkpoint=?,error=NULL WHERE id=?',(json.dumps(checkpoint),row['id']))
+    return True
 
 def reindex(source_name=None,db_path=None):
     from .daily import begin_daily_mutation,end_daily_mutation
@@ -200,10 +224,10 @@ def _reindex(source_name=None,db_path=None):
             count+=index_stored(stored,sid,row['import_id'],source['name'],db_path,index_content=metadata.get('index_content',True))
         results.append({'source':source['name'],'files':len(rows),'events':count})
         from .enrichment import reapply
-        from .locations import reconcile_locations
+        from .locations import drain_locations
         from .media import reconcile_media
         reapply(db_path,source_id=sid)
-        reconcile_locations(db_path,source_id=sid)
+        drain_locations(db_path,source_id=sid,refresh=True)
         reconcile_media(db_path,source_id=sid,event_ids=[])
     return results
 

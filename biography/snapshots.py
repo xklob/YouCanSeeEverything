@@ -27,7 +27,8 @@ VERSION = 1
 MAX_SHARD_BYTES = 20 * 1024 * 1024
 TABLES = ("sources", "imports", "objects", "files", "events", "evidence", "jobs",
           "event_enrichments")
-DERIVED_TABLES = frozenset({"event_locations", "location_index_state", "media_object_index",
+DERIVED_TABLES = frozenset({"event_locations", "location_index_state", "location_discovery_state",
+                          "media_object_index",
                           "media_file_index", "media_path_suffixes", "media_file_state",
                           "media_source_generation", "event_media_refs", "media_event_state",
                           "media_manifest_state", "media_manifest_refs", "media_candidates",

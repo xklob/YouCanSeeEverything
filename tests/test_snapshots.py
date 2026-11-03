@@ -387,3 +387,49 @@ def test_partial_counters_are_omitted_and_restore_rebuilds_for_new_rowids(tmp_pa
     assert completed['total_events'] == 9
     assert completed['undated_count'] == 1
     assert completed['by_source']['source-1']['total_events'] == 9
+
+
+def test_location_discovery_checkpoint_is_discarded_on_normalized_restore(tmp_path):
+    from contextlib import closing
+    from biography import catalog_counts, locations
+    from biography.db import connect
+    database, _, original, _, _ = seed(tmp_path)
+    retained_bytes = original.read_bytes()
+    assert catalog_counts.count_status(database)['total_events'] == 9
+    with closing(connect(database)) as connection, connection:
+        # Discovery uses implicit rowids, which normalized restore renumbers.
+        connection.execute("UPDATE events SET rowid=100 WHERE id='event-8'")
+        connection.execute("UPDATE events SET metadata=? WHERE id='event-8'",
+                           (json.dumps({'coordinates': {'latitude': 0, 'longitude': 0}}),))
+        locations.ensure_schema(connection)
+        connection.execute('''INSERT INTO location_discovery_state
+            (scope,source_id,version,watermark_rowid,watermark_event_id,
+             checkpoint_rowid,scanned_records,candidate_records,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?)''',
+            ('source:source-1','source-1',locations.INDEX_VERSION,100,'event-8',6,6,1,'2025-01-01'))
+    # New derived DDL does not invalidate completed exact catalog counters.
+    status = catalog_counts.count_status(database)
+    assert status['stats']['status'] == 'current'
+    assert status['total_events'] == 9
+    output = tmp_path / 'location-checkpoint-snapshot'
+    manifest = snapshots.export_snapshot(database, output)
+    assert 'location_discovery_state' not in manifest['tables']
+    restored = tmp_path / 'location-checkpoint-restored.sqlite3'
+    snapshots.restore_snapshot(output, restored)
+    with closing(connect(restored)) as connection:
+        assert connection.execute('SELECT max(rowid) FROM events').fetchone()[0] == 9
+        assert connection.execute('SELECT count(*) FROM location_discovery_state').fetchone()[0] == 0
+    locations.reconcile_locations(restored, source_id='source-1')
+    with closing(connect(restored)) as connection:
+        assert connection.execute('SELECT event_id FROM event_locations').fetchall()[0][0] == 'event-8'
+    assert original.read_bytes() == retained_bytes
+
+
+def test_unknown_location_checkpoint_column_is_not_silently_dropped(tmp_path):
+    from biography import locations
+    database, _, _, _, _ = seed(tmp_path)
+    with sqlite3.connect(database) as connection:
+        locations.ensure_schema(connection)
+        connection.execute('ALTER TABLE location_discovery_state ADD COLUMN private_note TEXT')
+    with pytest.raises(snapshots.SnapshotError, match='unsupported schema'):
+        snapshots.export_snapshot(database, tmp_path / 'unsupported-location-checkpoint')

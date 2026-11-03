@@ -39,6 +39,8 @@ Original files are retained by content hash. Identical bytes share one copy. Rec
 
 Day indexing and media discovery resume where they stopped. Repeat `daily-build` and `media-build` to continue, or after more imports.
 
+Location indexing runs in small batches during import and saves its progress between batches.
+
 Existing catalogs need an initial count with `counts-build`; repeat it until complete. Later inserts, edits and deletions update totals automatically. While counting, the app labels the known subtotal instead of guessing the total.
 
 `--move` deletes export copies only after verified retention. Use it on export folders. Active notes, repositories and application histories should be snapshotted first.

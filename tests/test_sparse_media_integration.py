@@ -90,7 +90,7 @@ def test_source_completion_enqueues_files_without_draining_all_events(tmp_path,m
     monkeypatch.setattr(pipeline,'settings',local)
     from biography import enrichment,locations
     monkeypatch.setattr(enrichment,'reapply',lambda *args,**kwargs:None)
-    monkeypatch.setattr(locations,'reconcile_locations',lambda *args,**kwargs:None)
+    monkeypatch.setattr(locations,'drain_locations',lambda *args,**kwargs:None)
     seen=[]
     monkeypatch.setattr(media,'reconcile_media',lambda *args,**kwargs:seen.append(kwargs))
     result=pipeline.run_dataset({'id':sid,'name':'Synthetic export','root':str(source)},data_dir=local.data_dir,db_path=path)

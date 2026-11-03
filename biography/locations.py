@@ -8,16 +8,19 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import hashlib
 import json
 import math
 import re
 import sqlite3
+import time
 
 from .db import connect
+from . import db
 from .queries import event_filters
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 LOCATION_CATEGORIES = ("location", "place_visit", "travel")
 
 
@@ -56,6 +59,11 @@ def ensure_schema(conn_or_path=None):
                 version INTEGER NOT NULL,
                 metadata_sha256 TEXT NOT NULL,
                 point_count INTEGER NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS location_discovery_state (
+                scope TEXT PRIMARY KEY,source_id TEXT,version INTEGER NOT NULL,
+                watermark_rowid INTEGER NOT NULL,watermark_event_id TEXT,
+                checkpoint_rowid INTEGER NOT NULL,scanned_records INTEGER NOT NULL,
+                candidate_records INTEGER NOT NULL,updated_at TEXT NOT NULL)""",
         ]
         for statement in statements:
             conn.execute(statement)
@@ -188,69 +196,227 @@ def extract_points(metadata: dict, occurred_at=None, *, category="location", end
     return result
 
 
-def reconcile_locations(path=None, *, event_ids=None, source_id=None, limit=None,
-                        refresh=False) -> dict:
-    """Index new location events; explicit IDs also refresh existing points.
+def _scope(source_id):
+    return 'source:'+source_id if source_id else '*'
 
-    Run after imports or at startup, not for each map request. An explicit ID
-    batch keeps ongoing import work proportional to the batch size.
+
+def _location_busy(error):
+    code=getattr(error,'sqlite_errorcode',None)
+    return isinstance(error,sqlite3.OperationalError) and (code&255 in {sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED}
+        if isinstance(code,int) else str(error).startswith(('database is locked','database table is locked','database schema is locked')))
+
+
+@contextmanager
+def _location_writer(path):
+    owned=not isinstance(path,sqlite3.Connection);conn=connect(path) if owned else path
+    saved=False
+    try:
+        if owned:conn.execute('PRAGMA busy_timeout=250')
+        if not conn.in_transaction:conn.execute('BEGIN IMMEDIATE')
+        conn.execute('SAVEPOINT location_batch');saved=True
+        yield conn
+        conn.execute('RELEASE location_batch');saved=False
+        if owned:conn.commit()
+    except BaseException:
+        if saved:
+            conn.execute('ROLLBACK TO location_batch');conn.execute('RELEASE location_batch')
+        if owned:conn.rollback()
+        raise
+    finally:
+        if owned:conn.close()
+
+
+def _discovery_status(conn,source_id):
+    head=conn.execute('SELECT rowid,id FROM events ORDER BY rowid DESC LIMIT 1').fetchone()
+    current=head[0] if head else 0
+    exists=conn.execute("SELECT 1 FROM sqlite_schema WHERE name='location_discovery_state' AND type='table'").fetchone()
+    row=conn.execute('SELECT * FROM location_discovery_state WHERE scope=?',(_scope(source_id),)).fetchone() if exists else None
+    result={'status':'not_started','version':INDEX_VERSION,'source_id':source_id,'watermark_rowid':0,
+        'checkpoint_rowid':0,'scanned_records':0,'candidate_records':0,'current_rowid':current,'has_more':current>0}
+    if row:
+        result.update(dict(row));anchor=conn.execute('SELECT id FROM events WHERE rowid=?',(row['watermark_rowid'],)).fetchone() if row['watermark_rowid'] else None
+        invalid=row['version']!=INDEX_VERSION or bool(row['watermark_rowid'] and (not anchor or anchor[0]!=row['watermark_event_id'])) or current<row['checkpoint_rowid']
+        result['status']='rebuild_required' if invalid else 'complete' if row['checkpoint_rowid']>=row['watermark_rowid'] else 'paused'
+        result['has_more']=invalid or row['checkpoint_rowid']<row['watermark_rowid'] or current>row['watermark_rowid']
+    result['append_backlog_rowid_span']=max(0,current-result['watermark_rowid'])
+    result['limitations']=['Discovery covers inserts through its checkpoint; refresh touched IDs or reset after old-row edits, full reindex or VACUUM. Unindexed source media/history is outside this derived point index.']
+    return result
+
+
+@contextmanager
+def _location_reader(path):
+    if isinstance(path,sqlite3.Connection):
+        yield path
+        return
+    conn=sqlite3.connect(Path(path or db.settings.database).resolve().as_uri()+'?mode=ro',uri=True,timeout=.25)
+    try:
+        conn.row_factory=sqlite3.Row;conn.execute('PRAGMA query_only=ON')
+        conn.execute('BEGIN')
+        yield conn
+    finally:conn.close()
+
+
+def location_discovery_status(path=None,*,source_id=None):
+    if not isinstance(path,sqlite3.Connection) and not Path(path or db.settings.database).exists():
+        return {'status':'not_started','source_id':source_id,'watermark_rowid':0,'checkpoint_rowid':0,
+                'scanned_records':0,'candidate_records':0,'has_more':False}
+    with _location_reader(path) as conn:return _discovery_status(conn,source_id)
+
+
+def _discover_location_rows(path,checkpoint,watermark,batch_size,max_batch_bytes):
+    # Physical LIMIT precedes source filtering. The rowid range is the driving
+    # access path, never source-time/category indexes or a full JSON predicate.
+    with _location_reader(path) as conn:
+        cursor=conn.execute('SELECT e.rowid AS catalog_rowid,e.id,e.source_id,e.metadata,e.occurred_at,e.end_at,e.category\n            FROM events e NOT INDEXED WHERE e.rowid>? AND e.rowid<=? ORDER BY e.rowid LIMIT ?',
+            (checkpoint,watermark,batch_size))
+        rows=[];size=0
+        try:
+            for row in cursor:
+                added=len((row['metadata'] or '').encode())
+                if rows and size+added>max_batch_bytes:break
+                rows.append(dict(row));size+=added
+        finally:cursor.close()
+    return rows
+
+
+_COORDINATE_ROOTS={'latitudeE7','latE7','latitude','lat','latLng','point','type','location','startLocation','endLocation',
+    'visit','activity','coordinates','venue','event_data','enrichment','reviewed_enrichment',
+    'timelinePath','waypointPath','simplifiedRawPath','rawPath','transitPath'}
+_COORDINATE_TEXT=re.compile('|'.join(re.escape('"'+key+'"') for key in sorted(_COORDINATE_ROOTS)))
+
+
+def _prepare_location(row):
+    raw=row['metadata'] or '{}'
+    # Escaped JSON keys must still be decoded. Ordinary non-coordinate records
+    # avoid JSON parsing, while literal/nested nulls never become candidates.
+    if isinstance(raw,str) and not _COORDINATE_TEXT.search(raw) and '\\' not in raw:
+        return []
+    try:metadata=json.loads(raw) if isinstance(raw,str) else raw
+    except (ValueError,TypeError):return []
+    if not isinstance(metadata,dict) or not any(metadata.get(key) is not None for key in _COORDINATE_ROOTS):return []
+    return extract_points(metadata,row['occurred_at'],category=row['category'],end_at=row['end_at'])
+
+
+def _current_location_rows(conn,values,*,rowids=False):
+    result=[]
+    for start in range(0,len(values),800):
+        batch=values[start:start+800]
+        access='NOT INDEXED' if rowids else 'INDEXED BY sqlite_autoindex_events_1'
+        column='rowid' if rowids else 'id'
+        result.extend(dict(row) for row in conn.execute('SELECT e.rowid AS catalog_rowid,e.id,e.source_id,e.metadata,e.occurred_at,e.end_at,e.category FROM events e '+access+
+            ' WHERE e.'+column+' IN ('+','.join('?' for _ in batch)+')',batch))
+    return sorted(result,key=lambda row:row['catalog_rowid'])
+
+
+def _write_location_rows(conn,rows,*,source_id=None,prepared=None,force=False):
+    events=points=0;prepared=prepared or {}
+    states={}
+    for start in range(0,len(rows),800):
+        ids=[row['id'] for row in rows[start:start+800]]
+        if ids:states.update({state['event_id']:state for state in conn.execute('SELECT * FROM location_index_state WHERE event_id IN ('+','.join('?' for _ in ids)+')',ids)})
+    for row in rows:
+        if source_id and row['source_id']!=source_id:continue
+        prior=states.get(row['id']);raw=row['metadata'] or '{}'
+        cached=prepared.get(row['catalog_rowid']);extracted=cached[1] if cached and cached[0]==row else _prepare_location(row)
+        candidate=row['category'] in LOCATION_CATEGORIES or bool(extracted)
+        if not candidate and prior is None:
+            if force:conn.execute('DELETE FROM event_locations WHERE event_id=?',(row['id'],))
+            continue
+        digest=hashlib.sha256(json.dumps([raw,row['occurred_at'],row['end_at'],row['category']],separators=(',',':')).encode()).hexdigest()
+        if not force and prior and prior['version']==INDEX_VERSION and prior['metadata_sha256']==digest:continue
+        conn.execute('DELETE FROM event_locations WHERE event_id=?',(row['id'],))
+        if not candidate:
+            conn.execute('DELETE FROM location_index_state WHERE event_id=?',(row['id'],))
+            events+=1
+            continue
+        inserts=[]
+        for index,point in enumerate(extracted):
+            point_id=hashlib.sha256(f"{row['id']}:{point['locator']}".encode()).hexdigest()
+            inserts.append((point_id,row['id'],index,point['latitude'],point['longitude'],point['occurred_at'],point['kind'],point['locator'],json.dumps(point['metadata'],ensure_ascii=True)))
+        conn.executemany('INSERT INTO event_locations(id,event_id,point_index,latitude,longitude,occurred_at,kind,locator,metadata) VALUES(?,?,?,?,?,?,?,?,?)',inserts)
+        conn.execute('INSERT INTO location_index_state(event_id,version,metadata_sha256,point_count) VALUES(?,?,?,?)\n            ON CONFLICT(event_id) DO UPDATE SET version=excluded.version,metadata_sha256=excluded.metadata_sha256,point_count=excluded.point_count',(row['id'],INDEX_VERSION,digest,len(extracted)))
+        events+=1;points+=len(extracted)
+    return {'events':events,'points':points}
+
+
+def reconcile_locations(path=None, *, event_ids=None, source_id=None, limit=None,refresh=False,
+                        batch_size=500,max_batches=1,max_seconds=2,max_batch_bytes=8*1024**2) -> dict:
+    """Commit bounded location batches; source discovery resumes from a durable cut.
+
+    Owned-path discovery closes its read connection before parsing and before a
+    short writer transaction rechecks every scanned row. Explicit IDs refresh
+    their whole bounded input and preserve caller-owned transaction control.
     """
-    with _connection(path) as conn:
-        ensure_schema(conn)
-        # JSON predicates select only explicit coordinate holders outside known
-        # map categories. Names, text, and arbitrary candidate arrays never count.
-        coordinate_paths = ("latitudeE7","latitude","lat","location","coordinates",
-                            "venue","event_data.venue","enrichment.location","reviewed_enrichment.location")
-        explicit = " OR ".join("json_type(e.metadata,'$." + value + "') IS NOT NULL" for value in coordinate_paths)
-        clauses = ["(e.category IN ('location','place_visit','travel') OR CASE WHEN json_valid(e.metadata) THEN (" + explicit + ") ELSE 0 END)"]
-        args = []
-        if event_ids is not None:
-            event_ids = list(dict.fromkeys(event_ids))
-            if not event_ids:
-                return {"events": 0, "points": 0}
-            if len(event_ids) > 800:
-                totals = {"events": 0, "points": 0}
-                for start in range(0, len(event_ids), 800):
-                    batch = reconcile_locations(conn, event_ids=event_ids[start:start + 800], source_id=source_id)
-                    for key in totals:
-                        totals[key] += batch[key]
-                return totals
-            clauses.append("e.id IN (" + ",".join("?" for _ in event_ids) + ")")
-            args.extend(event_ids)
-        elif not refresh:
-            clauses.append("(st.event_id IS NULL OR st.version<>?)")
-            args.append(INDEX_VERSION)
-        if source_id:
-            clauses.append("e.source_id=?")
-            args.append(source_id)
-        sql = ("SELECT e.id,e.metadata,e.occurred_at,e.end_at,e.category FROM events e "
-               "LEFT JOIN location_index_state st ON st.event_id=e.id WHERE " + " AND ".join(clauses) + " ORDER BY e.rowid")
-        if limit is not None:
-            sql += " LIMIT ?"
-            args.append(max(0, int(limit)))
-        events = points = 0
-        for row in conn.execute(sql, args):
-            try:
-                metadata = json.loads(row["metadata"] or "{}")
-            except (ValueError, TypeError):
-                metadata = {}
-            extracted = extract_points(metadata, row["occurred_at"], category=row["category"],end_at=row["end_at"])
-            conn.execute("DELETE FROM event_locations WHERE event_id=?", (row["id"],))
-            for index, point in enumerate(extracted):
-                point_id = hashlib.sha256(f"{row['id']}:{point['locator']}".encode()).hexdigest()
-                conn.execute("""INSERT INTO event_locations
-                    (id,event_id,point_index,latitude,longitude,occurred_at,kind,locator,metadata)
-                    VALUES(?,?,?,?,?,?,?,?,?)""", (point_id,row["id"],index,
-                    point["latitude"],point["longitude"],point["occurred_at"],point["kind"],
-                    point["locator"],json.dumps(point["metadata"],ensure_ascii=True)))
-            digest = hashlib.sha256((row["metadata"] or "{}").encode()).hexdigest()
-            conn.execute("""INSERT INTO location_index_state(event_id,version,metadata_sha256,point_count)
-                VALUES(?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET version=excluded.version,
-                metadata_sha256=excluded.metadata_sha256,point_count=excluded.point_count""",
-                (row["id"],INDEX_VERSION,digest,len(extracted)))
-            events += 1
-            points += len(extracted)
-        return {"events": events, "points": points}
+    if event_ids is not None:
+        selected=list(dict.fromkeys(event_ids));selected=selected[:max(0,int(limit))] if limit is not None else selected
+        total={'events':0,'points':0}
+        for start in range(0,len(selected),800):
+            with _location_writer(path) as conn:
+                ensure_schema(conn)
+                result=_write_location_rows(conn,_current_location_rows(conn,selected[start:start+800]),source_id=source_id,force=True)
+                for key in total:total[key]+=result[key]
+        return total
+    batch_size=max(1,min(10000,int(batch_size)));max_batches=max(0,int(max_batches));max_batch_bytes=max(1,int(max_batch_bytes))
+    if limit is not None:batch_size=min(batch_size,max(1,int(limit)));max_batches=min(max_batches,1) if int(limit)>0 else 0
+    deadline=time.monotonic()+max(0,float(max_seconds));total={'events':0,'points':0,'batches':0,'scanned_in_run':0,'paused':None,'reset_applied':False}
+    try:
+        with _location_writer(path) as conn:
+            ensure_schema(conn)
+            if refresh:conn.execute('DELETE FROM location_discovery_state WHERE scope=?',(_scope(source_id),))
+            state=_discovery_status(conn,source_id)
+            if state['status']=='rebuild_required':raise ValueError('Location discovery requires refresh after version or rowid change')
+            if state['status']=='not_started' or state['status']=='complete' and state['append_backlog_rowid_span']:
+                head=conn.execute('SELECT rowid,id FROM events ORDER BY rowid DESC LIMIT 1').fetchone()
+                conn.execute('INSERT OR REPLACE INTO location_discovery_state VALUES(?,?,?,?,?,?,?,?,?)',
+                    (_scope(source_id),source_id,INDEX_VERSION,head[0] if head else 0,head[1] if head else None,state['checkpoint_rowid'],state['scanned_records'],state['candidate_records'],datetime.now(timezone.utc).isoformat()))
+        total['reset_applied']=bool(refresh)
+        while total['batches']<max_batches and time.monotonic()<deadline:
+            state=location_discovery_status(path,source_id=source_id)
+            if state['checkpoint_rowid']>=state['watermark_rowid']:break
+            rows=_discover_location_rows(path,state['checkpoint_rowid'],state['watermark_rowid'],batch_size,max_batch_bytes)
+            prepared={row['catalog_rowid']:(row,_prepare_location(row)) for row in rows if not source_id or row['source_id']==source_id}
+            with _location_writer(path) as conn:
+                current=_discovery_status(conn,source_id)
+                if current['status']=='rebuild_required':raise ValueError('Location discovery requires refresh after version or rowid change')
+                if (current['checkpoint_rowid'],current['watermark_rowid'])!=(state['checkpoint_rowid'],state['watermark_rowid']):
+                    total['paused']='discovery_advanced_by_other_worker';break
+                # Re-read ALL scanned physical rowids, including noncandidates
+                # which another writer may have given coordinates meanwhile.
+                fresh=_current_location_rows(conn,[row['catalog_rowid'] for row in rows],rowids=True)
+                result=_write_location_rows(conn,fresh,source_id=source_id,prepared=prepared)
+                checkpoint=rows[-1]['catalog_rowid'] if rows else state['watermark_rowid']
+                conn.execute('UPDATE location_discovery_state SET checkpoint_rowid=?,scanned_records=scanned_records+?,candidate_records=candidate_records+?,updated_at=? WHERE scope=?',
+                    (checkpoint,len(rows),result['events'],datetime.now(timezone.utc).isoformat(),_scope(source_id)))
+            for key in ('events','points'):total[key]+=result[key]
+            total['batches']+=1;total['scanned_in_run']+=len(rows)
+    except sqlite3.OperationalError as error:
+        if not _location_busy(error):raise
+        total['paused']='catalog_busy'
+    discovery=location_discovery_status(path,source_id=source_id)
+    return {**total,'has_more':discovery['has_more'],'discovery':discovery}
+
+
+def drain_locations(path=None,*,source_id=None,refresh=False,batch_size=5000,progress=None,busy_timeout_seconds=60):
+    """Import completion drains bounded commits, yielding to concurrent writers."""
+    total={'events':0,'points':0,'scanned_in_run':0};busy=0;busy_started=None;target=None
+    while True:
+        result=reconcile_locations(path,source_id=source_id,refresh=refresh,batch_size=batch_size)
+        reset_pending=refresh and not result['reset_applied']
+        if result['reset_applied']:refresh=False
+        if target is None and not reset_pending and result['discovery'].get('status')!='not_started':target=result['discovery'].get('watermark_rowid')
+        for key in total:total[key]+=result[key]
+        if progress:progress(result)
+        if result['paused']=='catalog_busy':
+            busy+=1
+            if busy_started is None:busy_started=time.monotonic()
+            if time.monotonic()-busy_started>=busy_timeout_seconds:
+                from .storage import ImportPaused
+                raise ImportPaused('location_catalog_busy',discovery=result['discovery'])
+            time.sleep(min(.05*2**busy,.5));continue
+        busy=0;busy_started=None
+        if not result['has_more'] or target is not None and result['discovery']['checkpoint_rowid']>=target:
+            return {**result,**total,'drained_watermark_rowid':target}
+        time.sleep(.01)
 
 
 def map_points(path=None, *, q="", source="", category="", start="", end="",
@@ -290,4 +456,4 @@ def map_points(path=None, *, q="", source="", category="", start="", end="",
         return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
-__all__ = ["ensure_schema", "extract_points", "reconcile_locations", "map_points"]
+__all__ = ["ensure_schema", "extract_points", "reconcile_locations", "drain_locations", "location_discovery_status", "map_points"]

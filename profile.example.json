@@ -1,0 +1,13 @@
+{
+  "account_key": "owner",
+  "state_dir": "/path/to/private/.local",
+  "data_dir": "/path/to/private/.local/vault",
+  "export_root": "/path/to/Data Exports",
+  "excluded_directory_names": [],
+  "collectors": {
+    "local_git": {"repositories": [], "excluded_repositories": []},
+    "github": {"repositories": [], "author_login": null, "excluded_repositories": []},
+    "agent_history": {"codex_roots": [], "claude_roots": []},
+    "shell_history": {"sources": {}}
+  }
+}

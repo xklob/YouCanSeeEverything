@@ -154,9 +154,10 @@ class ObjectStore:
             raise ValueError("Invalid SHA-256 object name")
         return self.objects / sha256[:2] / sha256
 
-    def verify_object(self, sha256: str, size: int | None = None) -> StoredObject:
+    def verify_object(self, sha256: str, size: int | None = None, *,
+                      progress: Callable[[int], None] | None = None) -> StoredObject:
         path = self.object_path(sha256)
-        actual, length = hash_file(path)
+        actual, length = hash_file(path, progress=progress)
         if actual != sha256 or (size is not None and size != length):
             raise IntegrityError(f"Canonical object failed readback: {sha256}")
         return StoredObject(sha256, length, path, True)

@@ -101,6 +101,24 @@ beforeEach(() => {
   );
 });
 
+it('distinguishes current archive verification from completed inputs and shows an old heartbeat', async () => {
+  const data = {...report, active_imports: [{...report.active_imports[0], activity: {
+    phase: 'source_cleanup_verification', label: 'Verifying input before cleanup',
+    filename: 'fictional-history.zip', retained_entries: 4500,
+    progress: {completed: 250, total: 1000, fraction: .25},
+    updated_at: '2025-01-01T00:00:00Z', seconds_since_update: 300,
+  }}]};
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(data))));
+  render(<CoverageWorkspace refreshKey={0} onBrowseSource={() => {}} />);
+  expect(await screen.findByText('Verifying input before cleanup')).toBeTruthy();
+  expect(screen.getByText('fictional-history.zip')).toBeTruthy();
+  expect(screen.getByText('4,500 entries verified from this input')).toBeTruthy();
+  expect(screen.getByText('Last update 5 min ago')).toBeTruthy();
+  expect(screen.getByRole('progressbar', {name: 'Example archive: current check'}).getAttribute('aria-valuenow')).toBe('25');
+  expect(screen.getByRole('progressbar', {name: 'Example archive: input bytes'}).getAttribute('aria-valuenow')).toBe('80');
+  expect(screen.getByRole('progressbar', {name: 'Example archive: input files'}).getAttribute('aria-valuenow')).toBe('50');
+});
+
 it("sorts the full coverage source inventory without changing execution queue order", async () => {
   const user = userEvent.setup();
   const sample = report.sources[0];

@@ -265,6 +265,15 @@ export interface CoverageReport {
     files: { completed: number; total: number; fraction: number | null };
     bytes: { completed: number; total: number; fraction: number | null };
     events_reported: number;
+    activity?: {
+      phase: string;
+      label: string;
+      filename: string | null;
+      retained_entries: number | null;
+      progress: { completed: number; total: number; fraction: number } | null;
+      updated_at: string | null;
+      seconds_since_update: number | null;
+    } | null;
     started_at: string;
     error: SafeImportError;
   }[];

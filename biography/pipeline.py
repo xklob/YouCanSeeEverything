@@ -113,6 +113,7 @@ def index_stored(stored,source_id,import_id,source_name,db_path=None,*,index_con
 
 def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,cleanup_root=None):
     from .importer import ingest_path,StoredFile
+    from .import_progress import InputProgress
     from .storage import ImportPaused
     data_dir=Path(data_dir or settings.data_dir)
     sid=dataset['id'];iid=uuid.uuid4().hex;root=Path(dataset['root'])
@@ -141,17 +142,17 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
         for source in paths:
             source_size=source.stat().st_size
             heartbeat=0.0
-            phase='starting'
+            activity=InputProgress(source,source_size)
             def storage_progress(update):
-                nonlocal events,heartbeat,phase
-                phase=update.get('phase',update.get('event',phase))
-                if update.get('event')=='object_verified' and update.get('file'):
-                    values=dict(update['file']);values['path']=Path(values['path'])
-                    events+=index_item(StoredFile(**values))
+                nonlocal events,heartbeat
+                activity.observe(update)
                 if time.monotonic()-heartbeat>2:
                     heartbeat=time.monotonic()
                     with write_transaction(db_path) as conn:
-                        conn.execute('UPDATE imports SET events=?,checkpoint=? WHERE id=?',(events,json.dumps({'current_source':str(source),'phase':phase}),iid))
+                        conn.execute('UPDATE imports SET events=?,checkpoint=? WHERE id=?',(events,json.dumps(activity.checkpoint()),iid))
+                if update.get('event')=='object_verified' and update.get('file'):
+                    values=dict(update['file']);values['path']=Path(values['path'])
+                    events+=index_item(StoredFile(**values))
             report=ingest_path(source,data_dir,delete_source=move,allowed_root=Path(cleanup_root or settings.export_root),
                 reserve_bytes=settings.reserve_bytes,windows_reserve_bytes=50*1024**3,progress=storage_progress,
                 excluded_directory_names=settings.excluded_directory_names,
@@ -190,8 +191,8 @@ def run_dataset(dataset, *,move=False,data_dir=None,db_path=None,progress=None,c
         reconcile_media(db_path,source_id=sid,event_ids=[])
         mark_postprocessing_complete(sid,db_path,import_id=iid)
         return {'id':iid,'source':dataset['name'],'status':state,'files':completed,'events_added':events,'storage_exceptions':failures,'parse_errors':parse_errors}
-    except Exception as error:
-        state='paused' if isinstance(error,ImportPaused) else 'failed'
+    except (Exception,KeyboardInterrupt,SystemExit) as error:
+        state='paused' if isinstance(error,(ImportPaused,KeyboardInterrupt,SystemExit)) else 'failed'
         with write_transaction(db_path) as conn:
             checkpoint=json.loads(conn.execute('SELECT checkpoint FROM imports WHERE id=?',(iid,)).fetchone()[0] or '{}')
             checkpoint.update(raw_complete=raw_complete,phase='postprocessing' if raw_complete else 'ingestion',postprocessing_complete=False)

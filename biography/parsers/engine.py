@@ -13,6 +13,7 @@ from .common import event
 from .json_records import adapt, json_items
 from .text_formats import calendar_events, csv_events, media_event, pdf_events, text_events
 from .extended_formats import activity_events, office_text_events, rtf_text_events, xml_text_events
+from ..source_policy import package_member
 
 
 CREDENTIAL_FILE = re.compile(
@@ -33,6 +34,9 @@ def parse(path: Path, original_path: str, source: str, *, max_text_chars: int, e
         return ParseResult(parser="policy.credentials", status="excluded", notes=["Credential material is excluded from history"])
     if path.is_symlink():
         return ParseResult(parser="policy.symlink", status="excluded", notes=["Symlink requires explicit source inventory handling"])
+    if package_member(original_path):
+        return ParseResult(parser="policy.package_contents", status="retained", notes=[
+            "Application package contents retained with their source; not indexed as personal records."])
     logical_path = Path(original_path.replace("\\", "/"))
     suffix = logical_path.suffix.casefold()
     result = ParseResult(parser="unknown", status="parsed")

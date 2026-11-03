@@ -5248,3 +5248,16 @@ button:hover {
 .saved-summary-list>button[aria-pressed=true] {border-color:#4778bc;background:#eff5ff}
 .saved-summary-list span,.saved-summary-list small {color:var(--muted);overflow-wrap:anywhere}
 .summary-trip-context {padding:12px;border:1px solid var(--border);border-radius:8px}
+.coverage-current {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid #dbe3eb;
+  border-radius: 8px;
+  background: #f5f8fb;
+  font-size: 12px;
+  color: #4c5c6e;
+}
+.coverage-current-file { overflow-wrap: anywhere; }
+.coverage-stale { color: #9a4c13; }

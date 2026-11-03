@@ -19,6 +19,7 @@ import time
 from .config import settings
 from .session_sources import sanitize_visible
 from .query_stats import get_catalog_stats
+from .import_progress import public_activity
 
 
 ACTIVE = {"queued", "pending", "running", "importing", "processing", "indexing"}
@@ -205,7 +206,7 @@ def coverage_overview(path=None, *, include_months=False, month_limit=120,
         source_rows = connection.execute("SELECT id,name,status,queue_order,snapshot_bytes,notes FROM sources ORDER BY queue_order,name,id").fetchall()
         file_groups = connection.execute("SELECT source_id,parse_status,count(*) AS files,coalesce(sum(bytes),0) AS bytes FROM files GROUP BY source_id,parse_status").fetchall()
         import_rows = connection.execute("""SELECT id,source_id,status,total_files,completed_files,total_bytes,
-            completed_bytes,events,error,started_at,finished_at FROM imports ORDER BY started_at DESC""").fetchall()
+            completed_bytes,events,error,started_at,finished_at,checkpoint FROM imports ORDER BY started_at DESC""").fetchall()
     finally:
         connection.close()
     measured=get_catalog_stats(path)
@@ -310,6 +311,7 @@ def coverage_overview(path=None, *, include_months=False, month_limit=120,
         report["active_imports"].append({"id": row["id"], "source_id": row["source_id"], "source": names.get(row["source_id"], "Source"),
             "status": row["status"], "files": _progress(row["completed_files"], row["total_files"]),
             "bytes": _progress(row["completed_bytes"], row["total_bytes"]), "events_reported": row["events"],
+            "activity": public_activity(row["checkpoint"]),
             "started_at": row["started_at"], "error": _safe_error(row["error"], row["status"])})
     report["totals"] = totals
     return report

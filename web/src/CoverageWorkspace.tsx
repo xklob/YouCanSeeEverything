@@ -227,6 +227,25 @@ export default function CoverageWorkspace({
                       {count(item.events_reported)} records reported by this
                       import
                     </p>
+                    {item.activity && (
+                      <div className="coverage-current" aria-label={`${item.source}: current input`}>
+                        <strong>{item.activity.label}</strong>
+                        {item.activity.filename && <span className="coverage-current-file">{item.activity.filename}</span>}
+                        {item.activity.progress && <CoverageProgress
+                          label={`${item.source}: current check`}
+                          {...item.activity.progress}
+                          asBytes
+                        />}
+                        {item.activity.retained_entries != null && <span>
+                          {count(item.activity.retained_entries)} entries verified from this input
+                        </span>}
+                        {item.activity.seconds_since_update != null && <span className={item.activity.seconds_since_update > 120 ? 'coverage-stale' : ''}>
+                          {item.activity.seconds_since_update < 60
+                            ? 'Updated just now'
+                            : `Last update ${Math.floor(item.activity.seconds_since_update / 60)} min ago`}
+                        </span>}
+                      </div>
+                    )}
                     {item.error && (
                       <p className="coverage-error">
                         {typeof item.error === "string"

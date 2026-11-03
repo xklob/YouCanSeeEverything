@@ -37,6 +37,10 @@ uv run biography counts-build
 
 Original files are retained by content hash. Identical bytes share one copy. Records keep links to their sources. Unsupported files remain available for later extraction.
 
+Application attachments such as APKs and JARs are retained whole. Their bundled
+resources are not expanded into personal records. Ordinary nested export archives
+are still processed.
+
 Day indexing and media discovery resume where they stopped. Repeat `daily-build` and `media-build` to continue, or after more imports.
 
 Location indexing runs in small batches during import and saves its progress between batches.

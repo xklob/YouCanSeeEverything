@@ -26,6 +26,7 @@ from .storage import (
     DEFAULT_RESERVE_BYTES, FileSnapshot, ImportPaused, IntegrityError,
     ObjectStore, SourceChangedError, StoredObject, fsync_directory, hash_file,
 )
+from .source_policy import application_package
 
 
 Progress = Callable[[dict], None]
@@ -119,7 +120,12 @@ def _normalized_member(name: str) -> str:
     return posixpath.normpath(name.replace("\\", "/"))
 
 
-def _archive_kind(path: Path) -> str | None:
+def _archive_kind(path: Path, logical_path: str | None = None) -> str | None:
+    # An application sent as an attachment is one original file. Preserve its
+    # complete verified bytes, without expanding bundled icons, binaries and
+    # resource tables into thousands of apparent personal-history records.
+    if application_package(logical_path or path.name):
+        return None
     # ZIP permits arbitrary prefixes and scans backwards for its end record.
     # A TAR with a ZIP attachment near the end can therefore also pass
     # is_zipfile(). Its real TAR header must take precedence or sibling files
@@ -246,7 +252,7 @@ class _Importer:
                                 obj = self.store.put_stream(
                                     stream, expected_size=info.file_size,
                                     progress=self.bytes_progress(source))
-                            nested = _archive_kind(obj.path)
+                            nested = _archive_kind(obj.path, name)
                             if nested:
                                 self.retain(obj, member_logical, source, member_chain,
                                             "verified_container")
@@ -308,7 +314,7 @@ class _Importer:
                                 obj = self.store.put_stream(
                                     stream, expected_size=info.size,
                                     progress=self.bytes_progress(source))
-                            nested = _archive_kind(obj.path)
+                            nested = _archive_kind(obj.path, name)
                             if nested:
                                 self.retain(obj, member_logical, source, member_chain,
                                             "verified_container")
@@ -412,7 +418,7 @@ class _Importer:
                            snapshot=before.to_dict())
         self.emit("source_started", source_path=str(path), size=before.size)
         first_file = len(self.report.files)
-        kind = _archive_kind(path)
+        kind = _archive_kind(path, logical)
         if kind:
             source_hash, _ = hash_file(path, snapshot=before,
                                       progress=self.read_progress(path, "source_hash"))
@@ -464,7 +470,8 @@ class _Importer:
         # Reopen every canonical object, including duplicates, immediately before
         # deletion. A previous successful copy cannot authorize deletion now.
         for item in record["objects"]:
-            self.store.verify_object(item["sha256"], item["size"])
+            self.store.verify_object(item["sha256"], item["size"],
+                                     progress=self.read_progress(path, 'retained_verification'))
         snapshot = FileSnapshot(**record["snapshot_before"])
         _verify_source(path, snapshot, record["sha256"],
                        self.read_progress(path, "source_cleanup_verification"))

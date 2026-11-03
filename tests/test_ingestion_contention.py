@@ -11,6 +11,7 @@ import pytest
 from biography import db, importer, parsers, pipeline
 from biography.parsers import ParseResult
 from biography.storage import ImportPaused
+from biography.config import Settings
 
 
 def catalog(tmp_path):
@@ -155,3 +156,25 @@ def test_catalog_pause_preserves_source_and_paused_manifest(tmp_path):
     manifest = [json.loads(line) for line in raised.value.manifest_path.read_text().splitlines()]
     assert any(row['kind'] == 'paused' for row in manifest)
     assert not any(row['kind'] == 'source_deleted' for row in manifest)
+
+
+def test_interrupted_serial_import_records_a_pause_and_preserves_input(tmp_path, monkeypatch):
+    path, source, _ = catalog(tmp_path)
+    inputs = tmp_path / 'exports' / 'Synthetic export'
+    inputs.mkdir(parents=True)
+    raw = inputs / 'original.txt'
+    raw.write_bytes(b'An immutable fictional note')
+    monkeypatch.setattr(pipeline, 'settings', Settings(data_dir=tmp_path/'vault',
+        state_dir=tmp_path/'state',export_root=inputs.parent,reserve_bytes=0))
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(importer, 'ingest_path', interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.run_dataset({'id':source,'name':'Synthetic export','root':str(inputs)},
+            db_path=path,move=True)
+    with db.transaction(path) as conn:
+        row=conn.execute('SELECT status,checkpoint FROM imports').fetchone()
+        assert row['status']=='paused'
+        assert json.loads(row['checkpoint'])['raw_complete'] is False
+        assert conn.execute('SELECT status FROM sources').fetchone()[0]=='paused'
+    assert raw.read_bytes()==b'An immutable fictional note'

@@ -65,7 +65,10 @@ def fixture_coverage(sources: list[dict]) -> dict:
                     review_files=2, events=sum(s["event_count"] for s in sources), dated_events=sum(s["event_count"] for s in sources), undated_events=0), sources=rows,
         active_imports=[dict(id="qa-import", source_id="qa-one", source="QA journal", status="running",
             files=dict(completed=1, total=4, fraction=.25), bytes=dict(completed=768, total=1024, fraction=.75),
-            events_reported=9, started_at=measured_at, error=None)],
+            events_reported=9, started_at=measured_at, error=None,
+            activity=dict(phase='source_hash', label='Checking input', filename='fictional-history.zip',
+                retained_entries=12, progress=dict(completed=256,total=512,fraction=.5),
+                updated_at=measured_at,seconds_since_update=3))],
         queue=[dict(source_id="qa-two", source="QA calendar", status="paused", position=2, snapshot_bytes=1024,
                     error=dict(code="SyntheticReview", message="Synthetic source awaits review."))],
         indexing=dict(catalog_max_event_rowid=4,
@@ -759,6 +762,10 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 expect(page.get_by_role("progressbar", name="QA journal: input bytes", exact=True)).to_have_attribute("aria-valuenow", "75")
                 expect(page.get_by_text("Synthetic source awaits review.", exact=True)).to_be_visible()
                 passed("coverage_distinguishes_input_files_bytes_and_observed_records")
+                expect(page.get_by_text('fictional-history.zip', exact=True)).to_be_visible()
+                expect(page.get_by_role('progressbar', name='QA journal: current check', exact=True)).to_have_attribute('aria-valuenow', '50')
+                expect(page.get_by_text('12 entries verified from this input', exact=True)).to_be_visible()
+                passed('coverage_shows_current_input_progress_separately')
                 source_card = page.get_by_role("article").filter(has=page.get_by_role("heading", name="QA journal", exact=True))
                 source_card.get_by_role("button", name="Browse records", exact=True).click()
                 expect(page.get_by_role("combobox", name="Filter by source")).to_have_value("qa-one")

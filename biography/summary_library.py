@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime,timezone
 
 MAX_DISCOVERY_FILES = 10_000
 MAX_IMPORT_FILES = 64
@@ -52,8 +53,24 @@ def register(root: Path, value: dict):
         conn.execute("INSERT OR IGNORE INTO discovered VALUES(?)", (metadata["key"],))
 
 
-def list_saved(root: Path, *, limit=20, offset=0):
+def _sort_order(sort,direction):
+    keys={'generated':"summary_instant_key(generated_at)",'period':"NULLIF(json_extract(metadata,'$.period'),'')",
+          'title':"NULLIF(trim(json_extract(metadata,'$.title')),'') COLLATE NOCASE"}
+    if sort not in keys or direction not in {'asc','desc'}:raise ValueError('Unknown saved-summary sort or direction')
+    value=keys[sort]
+    return value+' IS NULL,'+value+' '+direction.upper()+',key ASC'
+
+
+def _instant_key(value):
+    try:
+        parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
+        return parsed.astimezone(timezone.utc).isoformat(timespec='microseconds') if parsed.tzinfo else None
+    except (ValueError,TypeError,AttributeError,OverflowError):return None
+
+
+def list_saved(root: Path, *, limit=20, offset=0,sort='generated',direction='desc'):
     from .synthesis import _read_cache
+    order=_sort_order(sort,direction)
     limit, offset = max(1, min(int(limit), 100)), max(0, int(offset))
     names, discovery_limited = [], False
     with os.scandir(root) as entries:
@@ -65,6 +82,7 @@ def list_saved(root: Path, *, limit=20, offset=0):
                 names.append(entry.name[:-5])
     imported, byte_count = 0, 0
     with _connect(root) as conn:
+        conn.create_function('summary_instant_key',1,_instant_key,deterministic=True)
         known = {row[0] for row in conn.execute("SELECT key FROM discovered LIMIT ?", (MAX_DISCOVERY_FILES,))}
         for key in sorted(names):
             if key in known:
@@ -87,9 +105,9 @@ def list_saved(root: Path, *, limit=20, offset=0):
                 metadata = _metadata(value)
                 conn.execute("INSERT OR REPLACE INTO entries VALUES(?,?,?)", (key, metadata["generated_at"], json.dumps(metadata, ensure_ascii=False)))
             conn.execute("INSERT OR IGNORE INTO discovered VALUES(?)", (key,))
-        rows = conn.execute("SELECT metadata FROM entries ORDER BY generated_at DESC,key LIMIT ? OFFSET ?", (limit + 1, offset)).fetchall()
+        rows = conn.execute("SELECT metadata FROM entries ORDER BY "+order+" LIMIT ? OFFSET ?", (limit + 1, offset)).fetchall()
     items = [json.loads(row[0]) for row in rows[:limit]]
     return {"items": items, "limit": limit, "offset": offset,
             "has_more": len(rows) > limit, "discovery_limited": discovery_limited,
-            "freshness": "not_checked",
+            "freshness": "not_checked",'sort':sort,'direction':direction,
             "notice": "Saved narratives describe their original selected evidence. Current coverage and freshness have not been checked."}

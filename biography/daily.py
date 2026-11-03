@@ -511,15 +511,35 @@ def _summary(conn,day,source='',category=''):
     return value
 
 
-def daily_days(catalog_path=None,sidecar_path=None,*,q='',source='',category='',start='',end='',undated=False,limit=90,offset=0):
+def daily_days(catalog_path=None,sidecar_path=None,*,q='',source='',category='',start='',end='',undated=False,limit=90,offset=0,sort='date',direction='desc'):
+    if sort not in {'date','records','sources'} or direction not in {'asc','desc'}:raise ValueError('Unknown daily sort or direction')
     catalog,sidecar=_paths(catalog_path,sidecar_path);projection=daily_status(catalog,sidecar)
-    result={'items':[],'total':0,'limit':min(max(int(limit),1),366),'offset':max(int(offset),0),'projection':projection,'q_scope':'matching projected days; day counts remain complete selected source/category counts'}
+    result={'items':[],'total':0,'limit':min(max(int(limit),1),366),'offset':max(int(offset),0),'projection':projection,'q_scope':'matching projected days; day counts remain complete selected source/category counts','sort':sort,'direction':direction}
     if not sidecar.exists() or not projection.get('epoch') or projection.get('schema_version')!=SCHEMA_VERSION:return result
     with _readonly(sidecar) as conn:
-        where,args=_filters(source,category,start,end,undated);qdays=_qdays(conn,q,source,category)
-        days=[row[0] for row in conn.execute('SELECT DISTINCT day FROM day_counts'+where+" ORDER BY day='undated',day DESC",args) if qdays is None or row[0] in qdays]
-        result['total']=len(days)
-        result['items']=[_summary(conn,day,source,category) for day in days[result['offset']:result['offset']+result['limit']]]
+        where,args=_filters(source,category,start,end,undated)
+        if q.strip():
+            query=' AND '.join('"'+word.replace('"','""')+'"' for word in re.findall(r'\S+',q)[:30])
+            matching=['projection_fts MATCH ?'];matching_args=[query]
+            if source:matching.append('source_id=?');matching_args.append(source)
+            if category:matching.append('category=?');matching_args.append(category)
+            where+=(' AND ' if where else ' WHERE ')+'day IN (SELECT day FROM projection_fts WHERE '+' AND '.join(matching)+')';args+=matching_args
+        result['total']=conn.execute('SELECT count(DISTINCT day) FROM day_counts'+where,args).fetchone()[0]
+        order="day='undated',day "+direction.upper() if sort=='date' else ('observed_records' if sort=='records' else 'source_count')+' '+direction.upper()+',day ASC'
+        rows=conn.execute('''SELECT day,sum(observed_records) observed_records,sum(raw_samples) raw_samples,
+            sum(substantive_records) substantive_records,sum(technical_records) technical_records,
+            count(DISTINCT source_id) source_count FROM day_counts'''+where+' GROUP BY day ORDER BY '+order+' LIMIT ? OFFSET ?',args+[result['limit'],result['offset']]).fetchall()
+        result['items']=[{'day':row['day'],'date':None if row['day']=='undated' else row['day'],**dict(row),'date_bases':[],'display_groups':0,'measurement_groups':0} for row in rows]
+        by_day={item['day']:item for item in result['items']}
+        if by_day:
+            # Five bounded sidecar queries for any page size, rather than
+            # fetching every day or issuing four extra queries per returned day.
+            page_where,page_args=_filters(source,category)
+            page_where+=(' AND ' if page_where else ' WHERE ')+'day IN ('+','.join('?' for _ in by_day)+')';page_args+=list(by_day)
+            for basis in conn.execute('SELECT day,date_basis,sum(observed_records) FROM day_counts'+page_where+' GROUP BY day,date_basis ORDER BY date_basis',page_args):
+                by_day[basis[0]]['date_bases'].append({'basis':basis[1],'count':basis[2]})
+            for table,key in (('display_groups','display_groups'),('rollups','measurement_groups')):
+                for counts in conn.execute('SELECT day,count(*) FROM '+table+page_where+' GROUP BY day',page_args):by_day[counts[0]][key]=counts[1]
     return result
 
 

@@ -32,11 +32,14 @@ uv run biography plan
 uv run biography import --source "Example Service"
 uv run biography daily-build
 uv run biography media-build
+uv run biography counts-build
 ```
 
 Original files are retained by content hash. Identical bytes share one copy. Records keep links to their sources. Unsupported files remain available for later extraction.
 
 Day indexing and media discovery resume where they stopped. Repeat `daily-build` and `media-build` to continue, or after more imports.
+
+Existing catalogs need an initial count with `counts-build`; repeat it until complete. Later inserts, edits and deletions update totals automatically. While counting, the app labels the known subtotal instead of guessing the total.
 
 `--move` deletes export copies only after verified retention. Use it on export folders. Active notes, repositories and application histories should be snapshotted first.
 
@@ -49,6 +52,8 @@ Day indexing and media discovery resume where they stopped. Repeat `daily-build`
 - **Ask:** ask questions, generate day or month summaries, and browse saved summaries. Opening a saved result does not run a model.
 
 Records load before archive totals finish counting. Cached counts are labeled. Days may cover only part of the archive while the day index is building.
+
+Browse views have saved sort preferences. Trips sort by date, inferred straight-line distance, elapsed duration or stops. Sorting applies before pagination; import and assistant history ordering does not change the execution queue.
 
 Google Maps is the default when a key is configured. Otherwise the map uses OpenStreetMap. Either can be selected manually. See [Google Maps setup](docs/google-maps-setup.md).
 

@@ -11,6 +11,7 @@ import { readablePreview } from "./ReadableData";
 import type { TripConnection, TripStop } from "./maps/types";
 import "./TripsWorkspace.css";
 import TripSummary from "./TripSummary";
+import { SortControls, useSortPreference } from "./sorting";
 
 type EvidenceStop = TripStop & { provenance_total?: number };
 type Journey = {
@@ -82,6 +83,8 @@ export default function TripsWorkspace({
   onOpenEvent,
   onShowMap,
 }: Props) {
+  const sorting = useSortPreference("trips", "date", ["date", "distance", "duration", "stops"], "desc");
+  const [sort, direction] = sorting;
   const [filters, setFilters] = useState({
     from: "",
     to: "",
@@ -110,7 +113,7 @@ export default function TripsWorkspace({
     const params = new URLSearchParams({
       limit: String(PAGE_SIZE),
       offset: String(offset),
-      kind,
+      kind, sort, direction,
     });
     for (const [key, value] of Object.entries({ from, to, source }))
       if (value) params.set(key, value);
@@ -140,7 +143,7 @@ export default function TripsWorkspace({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [from, to, source, kind, offset, refreshKey, retry]);
+  }, [from, to, source, kind, sort, direction, offset, refreshKey, retry]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -171,6 +174,12 @@ export default function TripsWorkspace({
     return () => controller.abort();
   }, [selectedId, legOffset, refreshKey, detailRetry]);
 
+  function resetSorting() {
+    setOffset(0);
+    setSelectedId("");
+    setLegOffset(0);
+    setDetail(null);
+  }
   function filter(key: keyof typeof filters, value: string) {
     setFilters((previous) => ({ ...previous, [key]: value }));
     setOffset(0);
@@ -206,6 +215,7 @@ export default function TripsWorkspace({
         </div>
         <span>{loading ? "Loading…" : `${count(page?.total)} trips`}</span>
       </div>
+      <SortControls label="Trips" options={[["date", "Date"], ["distance", "Distance"], ["duration", "Duration"], ["stops", "Stops"]]} value={[sort, direction, value => { resetSorting(); sorting[2](value); }, value => { resetSorting(); sorting[3](value); }]} />
       <div className="trips-filters">
         <label>
           From

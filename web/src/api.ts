@@ -91,7 +91,7 @@ export interface Overview {
   stats?: StatsSnapshot;
 }
 export type TotalStatus =
-  "current" | "cached" | "stale" | "pending" | "unavailable";
+  "current" | "cached" | "stale" | "pending" | "counting" | "unavailable";
 export interface StatsSnapshot {
   status: TotalStatus | "partial" | "ready" | "refreshing";
   measured_at: string | null;
@@ -100,6 +100,7 @@ export interface StatsSnapshot {
   activity_status?: string;
   categories_status?: string;
   error?: unknown;
+  counted_events?: number | null;
 }
 export interface Page<T> {
   items: T[];
@@ -216,6 +217,7 @@ export interface CoverageSource {
   records: {
     status: string;
     total: number | null;
+    counted_events?: number | null;
     dated: number | null;
     undated: number | null;
     first_observed: string | null;
@@ -250,6 +252,7 @@ export interface CoverageReport {
     retained_only_files: number;
     review_files: number;
     events: number | null;
+    counted_events?: number | null;
     dated_events: number | null;
     undated_events: number | null;
   };
@@ -441,6 +444,14 @@ export function count(value?: number | null): string {
   return typeof value === "number" && Number.isFinite(value)
     ? value.toLocaleString("en-US")
     : "Unknown";
+}
+
+export function recordCount(value?: number | null, stats?: {status: string; counted_events?: number | null}): string {
+  if (typeof value === "number" && Number.isFinite(value)) return count(value);
+  if (stats?.status === "counting")
+    return typeof stats.counted_events === "number" && stats.counted_events > 0
+      ? `${count(stats.counted_events)}+ (counting)` : "Counting…";
+  return stats?.status === "pending" || stats?.status === "refreshing" ? "Counting…" : "Count unavailable";
 }
 export function hasMore(
   page: Pick<Page<unknown>, "total" | "items" | "offset" | "has_more">,

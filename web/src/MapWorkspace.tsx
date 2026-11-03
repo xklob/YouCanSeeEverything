@@ -21,6 +21,7 @@ import {
   type Page,
 } from "./api";
 import MediaGallery from "./MediaGallery";
+import { SortControls, useSortPreference } from "./sorting";
 import { readablePreview } from "./ReadableData";
 import LeafletCanvas from "./maps/LeafletCanvas";
 import GoogleCanvas from "./maps/GoogleCanvas";
@@ -150,6 +151,10 @@ export default function MapWorkspace({
     }
   });
   const [mapOffset, setMapOffset] = useState(0);
+  const [locationListOffset, setLocationListOffset] = useState(0);
+  const [tripListOffset, setTripListOffset] = useState(0);
+  const pointSort = useSortPreference("map-points", "date", ["date"], "desc");
+  const daySort = useSortPreference("map-day", "date", ["date", "imported"], "asc");
   const [fitRequest, setFitRequest] = useState(0);
   const [sameDay, setSameDay] = useState<Page<LifeEvent> | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
@@ -196,12 +201,17 @@ export default function MapWorkspace({
       setGoogleWasSelected(true);
   }, [provider, tilesEnabled, configLoading]);
   const { q, source, category, from, to, undated } = filters;
-  const filterKey = [q, source, category, from, to, undated].join("\0");
+  const filterKey = [q, source, category, from, to, undated, pointSort[1]].join("\0");
   const [previousFilters, setPreviousFilters] = useState(filterKey);
   if (previousFilters !== filterKey) {
     setPreviousFilters(filterKey);
     setMapOffset(0);
   }
+
+  useEffect(() => {
+    setLocationListOffset(0);
+    setTripListOffset(0);
+  }, [filterKey, mapOffset, refreshKey]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -210,6 +220,7 @@ export default function MapWorkspace({
     const params = new URLSearchParams({
       limit: "2000",
       offset: String(mapOffset),
+      direction: pointSort[1],
     });
     for (const [key, value] of Object.entries({
       q,
@@ -230,6 +241,7 @@ export default function MapWorkspace({
             Math.abs(point.latitude) <= 90 &&
             Math.abs(point.longitude) <= 180,
         );
+        setLocationListOffset(0);
         setPage({ ...result, items: valid });
         setSelectedId((previous) =>
           valid.some((point) => point.id === previous)
@@ -245,7 +257,7 @@ export default function MapWorkspace({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [q, source, category, from, to, undated, refreshKey, retry, mapOffset]);
+  }, [q, source, category, from, to, undated, refreshKey, retry, mapOffset, pointSort[1]]);
 
   useEffect(() => {
     if (!tripsEnabled) {
@@ -271,6 +283,7 @@ export default function MapWorkspace({
     api<TripsPage>(`/trips?${params}`, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
+        setTripListOffset(0);
         setTripsPage({
           ...result,
           items: result.items.filter(
@@ -324,6 +337,9 @@ export default function MapWorkspace({
   const gapCount = tripsPage?.gaps_total ?? tripsPage?.gaps?.length ?? 0;
   const selected = canvasLocations.find((point) => point.id === selectedId);
   const day = selected ? recordedDay(selected) : null;
+  const dayOrder = `${day}:${daySort[0]}:${daySort[1]}`;
+  const [previousDayOrder, setPreviousDayOrder] = useState(dayOrder);
+  if (previousDayOrder !== dayOrder) { setPreviousDayOrder(dayOrder); setDayOffset(0); }
   useEffect(() => {
     if (!day) {
       setSameDay(null);
@@ -339,7 +355,8 @@ export default function MapWorkspace({
       to: day,
       limit: "20",
       offset: String(dayOffset),
-      sort: "asc",
+      sort: daySort[0],
+      direction: daySort[1],
     });
     api<Page<LifeEvent>>(`/events?${params}`, { signal: controller.signal })
       .then((result) => {
@@ -352,7 +369,7 @@ export default function MapWorkspace({
         if (!controller.signal.aborted) setContextLoading(false);
       });
     return () => controller.abort();
-  }, [day, dayOffset, refreshKey]);
+  }, [day, dayOffset, refreshKey, daySort[0], daySort[1]]);
 
   const selectLocation = (id: string) => {
     setSelectedId(id);
@@ -614,7 +631,7 @@ export default function MapWorkspace({
                 transport, or path taken.
               </p>
               <div>
-                {trips.slice(0, 200).map((trip) => (
+                {trips.slice(tripListOffset, tripListOffset + 200).map((trip) => (
                   <button
                     key={trip.id}
                     className={selectedTripId === trip.id ? "selected" : ""}
@@ -632,10 +649,11 @@ export default function MapWorkspace({
                 ))}
               </div>
               {trips.length > 200 && (
-                <p>
-                  First 200 listed. All loaded connections are on the map;
-                  narrow the date filter for a shorter list.
-                </p>
+                <nav className="day-pagination" aria-label="Loaded connections pages">
+                  <span>{count(tripListOffset + 1)}–{count(Math.min(tripListOffset + 200, trips.length))} of {count(trips.length)} loaded connections</span>
+                  <button aria-label="Previous loaded connections" disabled={tripListOffset === 0} onClick={() => setTripListOffset(value => Math.max(0, value - 200))}>Previous</button>
+                  <button aria-label="Next loaded connections" disabled={tripListOffset + 200 >= trips.length} onClick={() => setTripListOffset(value => value + 200)}>Next</button>
+                </nav>
               )}
             </details>
           )}
@@ -653,12 +671,12 @@ export default function MapWorkspace({
                       setMapOffset((value) => Math.max(0, value - 2000))
                     }
                   >
-                    Newer points
+                    Previous points
                   </button>
                 )}
                 {mapOffset + 2000 < page.total && (
                   <button onClick={() => setMapOffset((value) => value + 2000)}>
-                    Older points
+                    Next points
                   </button>
                 )}
               </div>
@@ -670,13 +688,14 @@ export default function MapWorkspace({
                 <h3>Recorded locations</h3>
                 <span>{count(locations.length)} loaded</span>
               </div>
+              <SortControls label="Recorded locations" options={[["date", "Date"]]} value={pointSort} />
               <div
                 className="recorded-location-list"
                 tabIndex={0}
                 role="region"
                 aria-label="Recorded locations list"
               >
-                {locations.slice(0, 200).map((point) => (
+                {locations.slice(locationListOffset, locationListOffset + 200).map((point) => (
                   <button
                     key={point.id}
                     className={`recorded-location ${point.id === selectedId ? "selected" : ""}`}
@@ -706,10 +725,11 @@ export default function MapWorkspace({
                 ))}
               </div>
               {locations.length > 200 && (
-                <p className="list-limit-note">
-                  First 200 shown in the list. All loaded points are on the map;
-                  use filters to narrow your selection.
-                </p>
+                <nav className="day-pagination" aria-label="Loaded locations pages">
+                  <span>{count(locationListOffset + 1)}–{count(Math.min(locationListOffset + 200, locations.length))} of {count(locations.length)} loaded points</span>
+                  <button aria-label="Previous loaded locations" disabled={locationListOffset === 0} onClick={() => setLocationListOffset(value => Math.max(0, value - 200))}>Previous</button>
+                  <button aria-label="Next loaded locations" disabled={locationListOffset + 200 >= locations.length} onClick={() => setLocationListOffset(value => value + 200)}>Next</button>
+                </nav>
               )}
             </section>
             <section
@@ -761,6 +781,7 @@ export default function MapWorkspace({
                 Records dated to the same day, across all sources. This does not
                 establish that a post was written at the selected place.
               </p>
+              {day && <SortControls label="Same-day records" options={[["date", "Date"], ["imported", "Import order"]]} value={daySort} />}
               {!selected ? (
                 <p className="context-empty">
                   Choose a point on the map or in the list.

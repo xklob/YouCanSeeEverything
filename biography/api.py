@@ -91,7 +91,9 @@ def overview():return queries.overview(settings.database)
 def sources():return queries.sources(settings.database)
 
 @app.get('/api/imports')
-def imports():return queries.imports()
+def imports(sort:str='date',direction:str='desc',limit:int=Query(100,ge=1,le=200),offset:int=Query(0,ge=0)):
+    try:return queries.imports(settings.database,sort=sort,direction=direction,limit=limit,offset=offset)
+    except ValueError as error:raise HTTPException(400,'Invalid import sort.') from error
 
 def backup_status():
     path=settings.state_dir/'backup-status.json'
@@ -121,10 +123,10 @@ def daily_category_options():
 
 @app.get('/api/days')
 def days(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),
-         limit:int=Query(90,ge=1,le=366),offset:int=Query(0,ge=0),undated:bool=False):
+         limit:int=Query(90,ge=1,le=366),offset:int=Query(0,ge=0),undated:bool=False,sort:str='date',direction:str='desc'):
     from .daily import daily_days
     try:return daily_days(settings.database,settings.daily_database,q=q,source=source,category=category,
-                          start=start,end=end,limit=limit,offset=offset,undated=undated)
+                          start=start,end=end,limit=limit,offset=offset,undated=undated,sort=sort,direction=direction)
     except ValueError as error:raise HTTPException(400,'Invalid day filter.') from error
 
 @app.get('/api/days/{day}')
@@ -144,19 +146,19 @@ def rollup_detail(rollup_id:str,limit:int=Query(50,ge=1,le=200),offset:int=Query
     return result
 
 @app.get('/api/events')
-def events(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0),sort:str='desc',undated:bool=False):
-    try:return queries.list_events(settings.database,q=q,source=source,category=category,start=start,end=end,limit=limit,offset=offset,sort=sort,undated=undated)
+def events(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0),sort:str='date',direction:str='desc',undated:bool=False):
+    try:return queries.list_events(settings.database,q=q,source=source,category=category,start=start,end=end,limit=limit,offset=offset,sort=sort,direction=direction,undated=undated)
     except queries.RecordQueryTimeout as error:
         raise HTTPException(503,'This record search took too long. Narrow the date range or source, or retry shortly.',headers={'Retry-After':'2'}) from error
-    except ValueError as e:raise HTTPException(400,'Invalid date filter.') from e
+    except ValueError as e:raise HTTPException(400,'Invalid record filter or sort.') from e
 
 @app.get('/api/map')
-def map_locations(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),limit:int=Query(2000,ge=1,le=5000),offset:int=Query(0,ge=0),undated:bool=False,bounds:str=''):
+def map_locations(q:str='',source:str='',category:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),limit:int=Query(2000,ge=1,le=5000),offset:int=Query(0,ge=0),undated:bool=False,bounds:str='',direction:str='desc'):
     from .locations import map_points
     try:
         bbox=tuple(float(v) for v in bounds.split(',')) if bounds else None
         if bbox is not None and len(bbox)!=4:raise ValueError('Invalid map bounds')
-        return map_points(q=q,source=source,category=category,start=start,end=end,limit=limit,offset=offset,undated=undated,bounds=bbox)
+        return map_points(settings.database,q=q,source=source,category=category,start=start,end=end,limit=limit,offset=offset,undated=undated,bounds=bbox,direction=direction)
     except ValueError as error:raise HTTPException(400,'Invalid map filter.') from error
 
 @app.get('/api/events/{event_id}')
@@ -176,9 +178,9 @@ def inferred_trips(q:str='',source:str='',category:str='',start:str=Query('',ali
 
 @app.get('/api/journeys')
 def journeys(source:str='',start:str=Query('',alias='from'),end:str=Query('',alias='to'),
-             kind:str='all',limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0)):
+             kind:str='all',limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),sort:str='date',direction:str='desc'):
     from .journeys import list_journeys
-    try:return list_journeys(settings.database,source=source,start=start,end=end,kind=kind,limit=limit,offset=offset)
+    try:return list_journeys(settings.database,source=source,start=start,end=end,kind=kind,limit=limit,offset=offset,sort=sort,direction=direction)
     except ValueError as error:raise HTTPException(400,'Invalid trip filter.') from error
 
 @app.get('/api/journeys/{journey_id}')
@@ -197,9 +199,10 @@ def saved_summary(period:str,source:str='',model:str='gpt-6.1-sol',focus:str=Que
     except (ValueError,AgentError) as error:raise HTTPException(400,str(error)) from error
 
 @app.get('/api/summaries/library')
-def summary_library(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0)):
+def summary_library(limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0),sort:str='generated',direction:str='desc'):
     from .synthesis import list_saved
-    return list_saved(settings.summaries_dir,limit=limit,offset=offset)
+    try:return list_saved(settings.summaries_dir,limit=limit,offset=offset,sort=sort,direction=direction)
+    except ValueError as error:raise HTTPException(400,'Invalid saved summary sort.') from error
 
 @app.get('/api/summaries/saved/{key}')
 def summary_from_library(key:str):
@@ -252,9 +255,14 @@ def job_value(row):
     return value
 
 @app.get('/api/jobs')
-def jobs():
+def jobs(sort:str='date',direction:str='desc',limit:int=Query(40,ge=1,le=200),offset:int=Query(0,ge=0)):
+    fields={'date':'created_at','status':'status','kind':'kind','prompt':'prompt COLLATE NOCASE'}
+    if sort not in fields or direction not in {'asc','desc'}:raise HTTPException(400,'Invalid task sort.')
     conn=connect()
-    try:return {'items':[job_value(r) for r in conn.execute('SELECT * FROM jobs ORDER BY created_at DESC LIMIT 40')]}
+    try:
+        rows=conn.execute(f'SELECT * FROM jobs ORDER BY {fields[sort]} {direction.upper()} NULLS LAST,id ASC LIMIT ? OFFSET ?',
+                          (limit+1,offset)).fetchall()
+        return {'items':[job_value(r) for r in rows[:limit]],'limit':limit,'offset':offset,'has_more':len(rows)>limit}
     finally:conn.close()
 
 @app.get('/api/jobs/{job_id}')

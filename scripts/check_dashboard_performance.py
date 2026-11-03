@@ -44,13 +44,74 @@ def performance_fixture_api(path):
     return value
 
 
+def run_live_sorting(page, overview, report, passed, screenshot):
+    """One bounded record page and two filtered trip orders, without counting."""
+    from playwright.sync_api import expect
+    def request(action,path,query=lambda p:True):
+        with page.expect_response(lambda response:urlsplit(response.url).path==path and query(parse_qs(urlsplit(response.url).query))) as pending:
+            action()
+        assert pending.value.status==200,'Live sort request failed'
+        return pending.value.json()
+    modes=page.get_by_role('group',name='Archive view')
+    records=request(lambda:modes.get_by_role('button',name='Records',exact=True).click(),'/api/events')
+    expect(page.get_by_role('region',name='Timeline results')).to_have_attribute('aria-busy','false')
+    stats=overview.get('stats',{})
+    if stats.get('status')=='counting':
+        expect(page.locator('.archive-summary')).to_contain_text(re.compile(r'Counting…|[0-9,]+\+ \(counting\)'))
+        assert overview['total_events'] is None
+    elif stats.get('status')=='current':
+        assert isinstance(overview.get('total_events'),int)
+    elif overview.get('total_events') is None:
+        expect(page.locator('.archive-summary')).to_contain_text(re.compile(r'Counting…|Count unavailable'))
+    passed('live_record_count_matches_exact_or_lower_bound_state',status=stats.get('status'),counted_events=stats.get('counted_events'))
+    screenshot('record-count-state.png')
+    records=request(lambda:page.get_by_role('combobox',name='Records sort',exact=True).select_option('imported'),'/api/events',lambda p:p.get('sort')==['imported'])
+    assert len(records['items'])<=40
+    passed('live_import_order_uses_bounded_record_page',returned=len(records['items']))
+    nav=page.get_by_role('complementary',name='Main navigation')
+    request(lambda:nav.get_by_role('button',name='Trips',exact=True).click(),'/api/journeys')
+    trips=page.get_by_role('region',name='Trips',exact=True)
+    payload=request(lambda:trips.get_by_role('combobox',name='Trips sort').select_option('distance'),'/api/journeys',lambda p:p.get('sort')==['distance'])
+    assert payload['items'],'Live trips are empty'
+    source=payload['items'][0]['source_id']
+    start=min(row['departure_at'][:10] for row in payload['items'])
+    end=max(row['arrival_at'][:10] for row in payload['items'])
+    request(lambda:trips.get_by_role('combobox',name='Trip source',exact=True).select_option(source),'/api/journeys',lambda p:p.get('source')==[source])
+    request(lambda:trips.get_by_label('Trips from',exact=True).fill(start),'/api/journeys',lambda p:p.get('from')==[start])
+    payload=request(lambda:trips.get_by_label('Trips to',exact=True).fill(end),'/api/journeys',lambda p:p.get('to')==[end])
+    def verify(payload,direction):
+        values=[row['distance_km'] for row in payload['items']]
+        assert values and values==sorted(values,reverse=direction=='desc'),'Trip distance order is incorrect'
+        assert all(row['source_id']==source for row in payload['items'])
+        assert len(values)<=20
+        expect(trips.get_by_role('combobox',name='Trip source')).to_have_value(source)
+        expect(trips.get_by_label('Trips from',exact=True)).to_have_value(start)
+        expect(trips.get_by_label('Trips to',exact=True)).to_have_value(end)
+        expect(trips.locator('.trips-list>button')).to_have_count(len(values))
+        passed('live_trip_distance_'+direction+'_preserves_source_and_date_filters',returned=len(values))
+    verify(payload,'desc')
+    screenshot('trip-distance-desc.png')
+    payload=request(lambda:trips.get_by_role('combobox',name='Trips direction').select_option('asc'),'/api/journeys',
+        lambda p:p.get('direction')==['asc'] and p.get('sort')==['distance'] and p.get('source')==[source] and p.get('from')==[start] and p.get('to')==[end])
+    verify(payload,'asc')
+    screenshot('trip-distance-asc.png')
+
+
 def run(args, report):
     from playwright.sync_api import expect, sync_playwright
 
     dist = args.dist.resolve()
     if not (dist / "index.html").is_file():
         raise ValueError("Built candidate index is missing")
-    server = CandidateServer(dist, None if args.fixture else api_origin(args.api_url), fixture_handler=performance_fixture_api)
+    sorting = getattr(args, "sorting", False)
+    if sorting:
+        if not args.fixture:
+            raise ValueError("Global sorting scenarios require synthetic fixtures")
+        from sorting_fixtures import SortingFixtures
+        fixture_handler = SortingFixtures()
+    else:
+        fixture_handler = performance_fixture_api
+    server = CandidateServer(dist, None if args.fixture else api_origin(args.api_url), fixture_handler=fixture_handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     origin = f"http://127.0.0.1:{server.server_port}"
@@ -107,6 +168,24 @@ def run(args, report):
             with page.expect_response(endpoint("/api/overview")) as overview_response:
                 page.goto(origin, wait_until="domcontentloaded")
             overview = overview_response.value.json()
+            if getattr(args, 'sorting_live', False):
+                run_live_sorting(page,overview,report,passed,screenshot)
+                count_text_is_clean()
+                assert not report['errors'] and not report['blocked_requests'] and not server.violations,'Live sorting runtime or network boundary failure'
+                passed('live_sorting_is_read_only_without_google_or_model_requests')
+                context.close()
+                browser.close()
+                return
+            if sorting:
+                from sorting_fixtures import run_sorting_acceptance
+                run_sorting_acceptance(page, fixture_handler, report, passed)
+                count_text_is_clean()
+                assert not report["errors"] and not report["blocked_requests"] and not server.violations, "Sorting runtime or network boundary failure"
+                passed("sorting_and_counting_have_no_runtime_errors_or_external_requests")
+                screenshot("sorting-counts.png")
+                context.close()
+                browser.close()
+                return
             map_view = page.get_by_role("region", name="Map and same-day timeline", exact=True)
             expect(map_view).to_be_visible()
             expect(page.get_by_role("combobox", name="Map provider")).to_have_value("openstreetmap")
@@ -121,7 +200,7 @@ def run(args, report):
             passed("records_render_bounded_page", returned=len(records["items"]), total_status=records.get("total_status"))
             if args.fixture:
                 assert overview["total_events"] is None and records["total"] is None
-                expect(page.get_by_text("Unknown", exact=True).first).to_be_visible()
+                expect(page.get_by_text("Counting…", exact=True).first).to_be_visible()
                 expect(results.get_by_text("40 shown", exact=True)).to_be_visible()
                 expect(results.get_by_text("Counts pending", exact=True)).to_be_visible()
                 expect(results.get_by_text("0 records", exact=True)).to_have_count(0)
@@ -160,7 +239,7 @@ def run(args, report):
             if args.fixture:
                 page.get_by_role("complementary", name="Main navigation").get_by_role("button", name="Sources", exact=True).click()
                 expect(page.get_by_role("heading", name="QA journal", exact=True)).to_be_visible()
-                expect(page.locator(".source-card-count").first).to_contain_text("Unknown")
+                expect(page.locator(".source-card-count").first).to_contain_text("Counting")
                 expect(page.get_by_text("Counts pending", exact=True).first).to_be_visible()
                 passed("source_pending_counts_remain_explicit")
             count_text_is_clean()
@@ -176,10 +255,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", type=Path, default=Path("web/dist"))
     parser.add_argument("--fixture", action="store_true")
+    sorting_modes=parser.add_mutually_exclusive_group()
+    sorting_modes.add_argument("--sorting", action="store_true", help="Fixture-only all sorting and incremental-count states")
+    sorting_modes.add_argument("--sorting-live", action="store_true", help="Bounded live count display and trip-direction/filter checks")
     parser.add_argument("--api-url", default="http://127.0.0.1:8000")
     parser.add_argument("--output", type=Path, default=Path(".local/browser-acceptance/performance"))
     parser.add_argument("--timeout", type=int, default=20)
     args = parser.parse_args()
+    if args.sorting and not args.fixture:
+        parser.error("--sorting requires --fixture")
+    if args.sorting_live and args.fixture:
+        parser.error("--sorting-live requires the read-only live API")
     os.umask(0o077)
     args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
     args.output.chmod(0o700)

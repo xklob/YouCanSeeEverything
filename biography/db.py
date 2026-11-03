@@ -78,14 +78,20 @@ def connect(path: Path | str | None = None):
     conn = sqlite3.connect(p, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA recursive_triggers=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=FULL")
     return conn
 
 def init_db(path: Path | str | None = None):
-    with connect(path) as conn:
+    from .catalog_counts import ensure_counts
+    conn = connect(path)
+    try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        ensure_counts(conn)
+    finally:
+        conn.close()
 
 @contextmanager
 def transaction(path=None):

@@ -5239,6 +5239,11 @@ button:hover {
 }
 
 .saved-summary-list {display:grid;gap:8px}
+.sort-controls {display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;margin:8px 0}
+.sort-controls label {display:flex;align-items:center;gap:6px}
+.day-pagination {flex-wrap:wrap}
+.trip-list .day-pagination>button {width:auto}
+.sort-controls select {max-width:190px;background:var(--bg-panel,#161d29);color:var(--text-primary,#e5eaf2);border:1px solid var(--border,#344054);border-radius:6px;padding:6px 8px;font:inherit}
 .saved-summary-list>button {display:grid;gap:5px;text-align:left;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel)}
 .saved-summary-list>button[aria-pressed=true] {border-color:#4778bc;background:#eff5ff}
 .saved-summary-list span,.saved-summary-list small {color:var(--muted);overflow-wrap:anywhere}

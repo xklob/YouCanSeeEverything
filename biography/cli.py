@@ -31,6 +31,11 @@ def main():
     media.add_argument('--max-seconds',type=float,default=30)
     media.add_argument('--batch-size',type=int,default=500)
     sub.add_parser('media-status',help='Show media discovery and linking progress')
+    counts=sub.add_parser('counts-build',help='Count existing records in resumable batches')
+    counts.add_argument('--max-seconds',type=float,default=30)
+    counts.add_argument('--batch-size',type=int,default=5000)
+    counts.add_argument('--reset',action='store_true',help='Rebuild derived counters')
+    sub.add_parser('counts-status',help='Show exact totals or initial counting progress')
     backup=sub.add_parser('backup',help='Retain a fixed catalog, original files and completed import manifests')
     backup.add_argument('destination',type=Path)
     verify=sub.add_parser('backup-verify',help='Read back and verify a backup')
@@ -39,7 +44,7 @@ def main():
     full_restore.add_argument('backup',type=Path)
     full_restore.add_argument('destination',type=Path)
     args=parser.parse_args()
-    if args.command not in {'backup','backup-verify','backup-restore','daily-build','daily-status','media-status','restore'}:
+    if args.command not in {'backup','backup-verify','backup-restore','daily-build','daily-status','media-status','counts-status','restore'}:
         init_db()
     if args.command=='init':print(json.dumps({'database':str(settings.database)}))
     elif args.command in ('plan','import'):
@@ -100,6 +105,15 @@ def main():
     elif args.command=='media-status':
         from .media import media_candidate_status
         print(json.dumps(media_candidate_status(settings.database),indent=2))
+    elif args.command=='counts-build':
+        from .catalog_counts import build_counts
+        if args.max_seconds<=0 or not 1<=args.batch_size<=10000:
+            parser.error('Choose a positive duration and a batch size from 1 to 10000.')
+        print(json.dumps(build_counts(settings.database,batch_size=args.batch_size,
+            max_batches=10000,max_seconds=args.max_seconds,reset=args.reset),indent=2))
+    elif args.command=='counts-status':
+        from .catalog_counts import count_status
+        print(json.dumps(count_status(settings.database),indent=2))
     elif args.command=='backup':
         from .backups import create_backup
         result=create_backup(settings.database,settings.data_dir,args.destination,

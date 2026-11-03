@@ -119,12 +119,12 @@ it("browses unknown totals with has_more and labels cached counts without invent
     }),
   );
   const card = document.querySelector(".source-card")!;
-  expect(card.textContent).toContain("Unknown records");
+  expect(card.textContent).toContain("Records: Counting…");
   expect(within(card as HTMLElement).getByText("Dates pending")).toBeTruthy();
   expect(screen.queryByText("No dated records")).toBeNull();
   status = "stale";
   await user.click(screen.getByRole("button", { name: "Refresh archive" }));
-  await waitFor(() => expect(card.textContent).toContain("99 records"));
+  await waitFor(() => expect(card.textContent).toContain("Records: 99"));
   expect(within(card as HTMLElement).getByText("Cached counts")).toBeTruthy();
   status = "partial";
   await user.click(screen.getByRole("button", { name: "Refresh archive" }));
@@ -133,7 +133,7 @@ it("browses unknown totals with has_more and labels cached counts without invent
       within(card as HTMLElement).getByText("Partial counts"),
     ).toBeTruthy(),
   );
-  expect(card.textContent).toContain("Unknown records");
+  expect(card.textContent).toContain("Records: Count unavailable");
 });
 
 it("keeps one abortable library cycle in flight and waits thirty seconds after it completes", async () => {
@@ -179,4 +179,28 @@ it("keeps one abortable library cycle in flight and waits thirty seconds after i
   expect(
     fetch.mock.calls.filter(([path]) => path === "/api/overview"),
   ).toHaveLength(2);
+});
+
+it("shows a counted lower bound until exact totals arrive, with per-source scope", async () => {
+  localStorage.clear();
+  let complete = false;
+  vi.stubGlobal('fetch', vi.fn(async (input) => {
+    const path = String(input);
+    if (path === '/api/overview') return Response.json({ ...snapshot(), total_events: complete ? 1300 : null,
+      stats: { status: complete ? 'current' : 'counting', counted_events: 1234, measured_at: null } });
+    if (path === '/api/sources') return Response.json({items: [{...source(), event_count: complete ? 40 : null,
+      stats: { status: complete ? 'current' : 'counting', counted_events: 12, measured_at: null }}]});
+    return Response.json({items:[]});
+  }));
+  const user = userEvent.setup();render(<App />);
+  await screen.findByText('1,234+ (counting)');
+  expect(document.querySelector('.archive-summary')?.textContent).toContain('Records: 1,234+ (counting)');
+  await user.click(within(screen.getByRole('navigation')).getByRole('button',{name:'Sources',exact:true}));
+  const card = document.querySelector('.source-card')!;
+  expect(card.textContent).toContain('Records: 12+ (counting)');
+  expect(card.textContent).not.toContain('1,234');
+  complete=true;await user.click(screen.getByRole('button',{name:'Refresh archive'}));
+  await waitFor(()=>expect(card.textContent).toContain('Records: 40'));
+  expect(card.textContent).not.toContain('(counting)');
+  localStorage.clear();
 });

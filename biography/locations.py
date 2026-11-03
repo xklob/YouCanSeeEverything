@@ -254,8 +254,10 @@ def reconcile_locations(path=None, *, event_ids=None, source_id=None, limit=None
 
 
 def map_points(path=None, *, q="", source="", category="", start="", end="",
-               undated=False, limit=2000, offset=0, bounds=None) -> dict:
+               undated=False, limit=2000, offset=0, bounds=None, direction='desc') -> dict:
     """Return indexed explicit points under the timeline's event filters."""
+    if direction not in {'asc','desc'}:raise ValueError('Invalid map sort direction')
+    order=direction.upper()
     with _connection(path) as conn:
         ensure_schema(conn)
         where, args = event_filters(q,source,category,start,end,undated)
@@ -275,7 +277,7 @@ def map_points(path=None, *, q="", source="", category="", start="", end="",
         limit,offset = min(max(int(limit),1),10000),max(int(offset),0)
         rows = conn.execute("""SELECT p.id,p.event_id,p.latitude,p.longitude,p.occurred_at,
             p.kind,p.locator,p.metadata,e.title,e.category,e.time_precision,e.source_id,s.name AS source""" + joins + where +
-            " ORDER BY p.occurred_at IS NULL,p.occurred_at DESC,p.event_id,p.point_index LIMIT ? OFFSET ?",
+            f" ORDER BY p.occurred_at {order} NULLS LAST,p.id {order} LIMIT ? OFFSET ?",
             args + [limit,offset]).fetchall()
         items = []
         for row in rows:

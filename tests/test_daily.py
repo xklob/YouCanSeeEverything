@@ -195,6 +195,52 @@ def test_q_filters_projected_readable_labels_and_rollups_without_raw_sensor_sear
     assert daily.daily_days(*catalog,start='2024-06-02',end='2024-06-02')['total']==1
 
 
+@pytest.mark.parametrize('sort,direction,expected',[
+    ('date','asc',['2024-06-01','2024-06-02','2024-06-03','undated']),
+    ('date','desc',['2024-06-03','2024-06-02','2024-06-01','undated']),
+    ('records','desc',['2024-06-01','2024-06-02','2024-06-03','undated']),
+    ('records','asc',['undated','2024-06-02','2024-06-03','2024-06-01']),
+    ('sources','desc',['2024-06-01','2024-06-02','2024-06-03','undated']),
+    ('sources','asc',['2024-06-03','undated','2024-06-01','2024-06-02']),
+])
+def test_day_sort_is_global_before_pagination_with_stable_ties(catalog,sort,direction,expected):
+    rows=[('2024-06-01','source-a')]*3+[('2024-06-01','source-b'),('2024-06-02','source-a'),('2024-06-02','source-b')]+[('2024-06-03','source-a')]*2+[(None,'source-a')]
+    for index,(day,source) in enumerate(rows):
+        event(catalog,str(index),when=day+'T12:00:00Z' if day else None,source=source,category='post',title='Matching label' if index in {0,6} else 'Other label')
+    build(catalog)
+    pages=[daily.daily_days(*catalog,sort=sort,direction=direction,limit=1,offset=index) for index in range(4)]
+    assert [page['items'][0]['day'] for page in pages]==expected
+    assert all(page['total']==4 for page in pages)
+    filtered=daily.daily_days(*catalog,sort='records',direction='asc',q='Matching')
+    assert [(item['day'],item['observed_records']) for item in filtered['items']]==[('2024-06-03',2),('2024-06-01',4)]
+    assert [item['day'] for item in daily.daily_days(*catalog,sort=sort,direction=direction,source='source-b')['items']]==(['2024-06-02','2024-06-01'] if sort=='date' and direction=='desc' else ['2024-06-01','2024-06-02'])
+    assert daily.daily_days(*catalog,sort=sort,direction=direction,start='2024-06-02',end='2024-06-02')['total']==1
+
+
+def test_day_sort_uses_constant_bounded_sidecar_query_count(catalog,monkeypatch):
+    from contextlib import contextmanager
+    for index in range(50):event(catalog,str(index),when=f'2024-{index//28+1:02d}-{index%28+1:02d}T12:00:00Z',category='post')
+    build(catalog);original=daily._readonly;statements=[]
+    @contextmanager
+    def traced(path,*args,**kwargs):
+        with original(path,*args,**kwargs) as conn:
+            if Path(path)==catalog[1]:conn.set_trace_callback(statements.append)
+            yield conn
+    monkeypatch.setattr(daily,'_readonly',traced)
+    result=daily.daily_days(*catalog,sort='records',limit=50)
+    assert len(result['items'])==50
+    aggregate_queries=[sql for sql in statements if any('FROM '+table in sql for table in ('day_counts','display_groups','rollups'))]
+    assert len(aggregate_queries)==5
+    assert all(item['display_groups']==1 and item['measurement_groups']==0 for item in result['items'])
+
+
+@pytest.mark.parametrize('options',[{'sort':'unknown'},{'direction':'DESC'},{'sort':'records; DELETE FROM events'}])
+def test_day_sort_rejects_unknown_keys_before_opening_catalog(catalog,monkeypatch,options):
+    def forbidden(*args,**kwargs):raise AssertionError('Invalid sorts must not read the catalog')
+    monkeypatch.setattr(daily,'daily_status',forbidden)
+    with pytest.raises(ValueError):daily.daily_days(*catalog,**options)
+
+
 def test_multi_metric_row_counts_source_once_and_conflicting_same_stream_values_are_not_chosen(catalog):
     event(catalog,'multi',metadata={'metric':{'name':'weight','unit':'kg','value':70},'beats per minute':80})
     # The health source label makes the explicit source header eligible too.

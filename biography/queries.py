@@ -111,19 +111,26 @@ def event_filters(q='',source='',category='',start='',end='',undated=False):
         clauses.append('e.occurred_at IS NULL')
     return (' WHERE '+' AND '.join(clauses) if clauses else ''),args
 
-def list_events(path=None, *,q='',source='',category='',start='',end='',limit=50,offset=0,sort='desc',undated=False):
+def list_events(path=None, *,q='',source='',category='',start='',end='',limit=50,offset=0,sort='date',direction='desc',undated=False):
     where,args=event_filters(q,source,category,start,end,undated)
-    order='ASC' if sort=='asc' else 'DESC'
+    if direction not in {'asc','desc'}:raise ValueError('Invalid record sort direction')
+    if sort in {'asc','desc'}:sort,direction='date',sort
+    if sort not in {'date','imported'} or direction not in {'asc','desc'}:
+        raise ValueError('Invalid record sort')
+    order=direction.upper()
     # events_time is (occurred_at DESC,id ASC). Scan that index in either
     # direction; an "occurred_at IS NULL" expression forces a full-table sort.
     # Explicit NULLS LAST preserves undated placement for ascending pages too.
     tie_order='DESC' if order=='ASC' else 'ASC'
+    tie='e.rowid' if source or category else 'e.id'
+    ordering=f'e.occurred_at {order} NULLS LAST,{tie} {tie_order}' if sort=='date' else f'e.rowid {order}'
+    event_table='events e NOT INDEXED' if sort=='imported' else 'events e'
     limit,offset=min(max(limit,1),200),max(offset,0)
     budget=_RecordBudget()
     with _record_connection(path,budget) as conn:
         conn.execute('BEGIN')
-        rows=conn.execute('SELECT e.*,s.name AS source FROM events e JOIN sources s ON s.id=e.source_id'+where+
-            f' ORDER BY e.occurred_at {order} NULLS LAST,e.id {tie_order} LIMIT ? OFFSET ?',args+[limit+1,offset]).fetchall()
+        rows=conn.execute('SELECT e.*,s.name AS source FROM '+event_table+' JOIN sources s ON s.id=e.source_id'+where+
+            f' ORDER BY {ordering} LIMIT ? OFFSET ?',args+[limit+1,offset]).fetchall()
         has_more=len(rows)>limit
         budget.check()
         items=[decode_event(r) for r in rows[:limit]]
@@ -181,7 +188,8 @@ def sources(path=None):
         source_stats=by_source.get(v['id'],{})
         v.update(event_count=source_stats.get('total_events'),
                  first_event=source_stats.get('date_range',{}).get('start'),
-                 last_event=source_stats.get('date_range',{}).get('end'),stats=measured['stats'])
+                 last_event=source_stats.get('date_range',{}).get('end'),
+                 stats={**measured['stats'],'counted_events':source_stats.get('counted_events')})
         if v['review_file_count']:
             if v['status']=='ready':v['status']='partial'
             note=f"{v['review_file_count']} retained files need further content extraction."
@@ -189,8 +197,15 @@ def sources(path=None):
         items.append(v)
     return {'items':items,'stats':measured['stats']}
 
-def imports(path=None):
+def imports(path=None, *,sort='date',direction='desc',limit=100,offset=0):
+    fields={'date':'i.started_at','name':'s.name COLLATE NOCASE','records':'i.events',
+            'files':'i.total_files','bytes':'i.total_bytes','status':'i.status'}
+    if sort not in fields or direction not in {'asc','desc'}:raise ValueError('Invalid import sort')
+    limit,offset=min(max(int(limit),1),200),max(int(offset),0)
     conn=connect(path)
     try:
-        return {'items':[dict(r) for r in conn.execute('SELECT i.*,s.name AS source FROM imports i JOIN sources s ON s.id=i.source_id ORDER BY started_at DESC LIMIT 100')]}
+        rows=conn.execute('SELECT i.*,s.name AS source FROM imports i JOIN sources s ON s.id=i.source_id '+
+            f'ORDER BY {fields[sort]} {direction.upper()} NULLS LAST,i.id ASC LIMIT ? OFFSET ?',
+            (limit+1,offset)).fetchall()
+        return {'items':[dict(r) for r in rows[:limit]],'limit':limit,'offset':offset,'has_more':len(rows)>limit}
     finally:conn.close()

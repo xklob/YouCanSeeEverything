@@ -356,3 +356,34 @@ def test_media_manifest_caches_are_omitted_and_older_snapshots_still_restore(tmp
         assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 9
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT count(*) FROM media_manifest_refs").fetchone()[0] == 1
+
+
+def test_partial_counters_are_omitted_and_restore_rebuilds_for_new_rowids(tmp_path):
+    from contextlib import closing
+    from biography import catalog_counts
+    from biography.db import connect
+    database, _, _, _, _ = seed(tmp_path)
+    # Simulate a sparse old catalog and a partly completed counting migration.
+    with closing(connect(database)) as conn, conn:
+        conn.execute("UPDATE events SET rowid=100 WHERE id='event-8'")
+    result = catalog_counts.build_counts(database, reset=True, batch_size=2)
+    assert result['stats']['status'] == 'counting'
+    assert result['stats']['counted_events'] == 2
+    output = tmp_path / 'snapshot-with-partial-derived-counts'
+    manifest = snapshots.export_snapshot(database, output)
+    assert set(catalog_counts.TABLES).isdisjoint(manifest['tables'])
+    restored = tmp_path / 'restored-counts.sqlite3'
+    snapshots.restore_snapshot(output, restored)
+    status = catalog_counts.count_status(restored)
+    assert status['total_events'] is None
+    assert status['stats']['error'] == 'counts_not_initialized'
+    with closing(connect(restored)) as conn:
+        assert conn.execute('SELECT max(rowid) FROM events').fetchone()[0] == 9
+        assert not conn.execute("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'catalog_counts_%'").fetchall()
+    # No copied partial prefix may be interpreted using the newly assigned IDs.
+    init_db(restored)
+    assert catalog_counts.count_status(restored)['stats']['counted_events'] == 0
+    completed = catalog_counts.build_counts(restored, batch_size=20)
+    assert completed['total_events'] == 9
+    assert completed['undated_count'] == 1
+    assert completed['by_source']['source-1']['total_events'] == 9

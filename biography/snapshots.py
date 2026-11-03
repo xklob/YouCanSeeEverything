@@ -31,7 +31,8 @@ DERIVED_TABLES = frozenset({"event_locations", "location_index_state", "media_ob
                           "media_file_index", "media_path_suffixes", "media_file_state",
                           "media_source_generation", "event_media_refs", "media_event_state",
                           "media_manifest_state", "media_manifest_refs", "media_candidates",
-                          "media_native_keys", "media_candidate_backfill"})
+                          "media_native_keys", "media_candidate_backfill",
+                          "catalog_count_state", "catalog_event_counts"})
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
 
 
@@ -118,6 +119,8 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     ensure_enrichment_schema(connection)
     locations_schema(connection)
     media_schema(connection)
+    from .catalog_counts import ensure_schema as counts_schema
+    counts_schema(connection)
 
 
 def _stat(path: Path) -> tuple:

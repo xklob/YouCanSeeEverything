@@ -23,6 +23,7 @@ import {
 } from "./api";
 import MediaGallery from "./MediaGallery";
 import MonthlySummary from "./MonthlySummary";
+import { SortControls, useSortPreference } from "./sorting";
 import ReadableData, { readablePreview } from "./ReadableData";
 
 type DailyFilters = {
@@ -341,6 +342,8 @@ export default function DailyWorkspace({
   refreshKey: number;
   onOpenEvent: (id: string) => void;
 }) {
+  const sorting = useSortPreference("days", "date", ["date", "records", "sources"], "desc");
+  const [sort, direction] = sorting;
   const [days, setDays] = useState<DaysPage | null>(null);
   const [day, setDay] = useState("");
   const [detail, setDetail] = useState<DayDetail | null>(null);
@@ -353,7 +356,7 @@ export default function DailyWorkspace({
   const [technical, setTechnical] = useState(false);
   const [retry, setRetry] = useState(0);
   const { q, source, category, from, to, undated } = filters;
-  const key = [q, source, category, from, to, undated].join("\0");
+  const key = [q, source, category, from, to, undated, sort, direction].join("\0");
   const [previous, setPrevious] = useState(key);
   if (previous !== key) {
     setPrevious(key);
@@ -367,7 +370,7 @@ export default function DailyWorkspace({
     setDaysError("");
     const params = new URLSearchParams({
       limit: "31",
-      offset: String(indexOffset),
+      offset: String(indexOffset), sort, direction,
     });
     for (const [name, value] of Object.entries({
       q,
@@ -399,9 +402,10 @@ export default function DailyWorkspace({
         if (!controller.signal.aborted) setDaysLoading(false);
       });
     return () => controller.abort();
-  }, [q, source, category, from, to, undated, indexOffset, refreshKey, retry]);
+  }, [q, source, category, from, to, undated, sort, direction, indexOffset, refreshKey, retry]);
   useEffect(() => {
     if (!day) {
+      setLoading(false);
       setDetail(null);
       return;
     }
@@ -460,6 +464,7 @@ export default function DailyWorkspace({
           retry={() => setRetry((value) => value + 1)}
         />
       )}
+      <SortControls label="Days" options={[["date", "Date"], ["records", "Records"], ["sources", "Sources"]]} value={sorting} />
       <MonthlySummary day={day} sourceId={source} onOpenEvent={onOpenEvent} />
       <div className="daily-layout">
         <aside className="daily-date-rail">
@@ -498,7 +503,7 @@ export default function DailyWorkspace({
           {days && (
             <div className="day-index-pagination">
               <button
-                aria-label="Newer observed days"
+                aria-label="Previous observed days"
                 disabled={indexOffset === 0}
                 onClick={() =>
                   setIndexOffset((value) => Math.max(0, value - 31))
@@ -508,7 +513,7 @@ export default function DailyWorkspace({
               </button>
               <span>{count(days.total)} day buckets</span>
               <button
-                aria-label="Older observed days"
+                aria-label="Next observed days"
                 disabled={indexOffset + 31 >= days.total}
                 onClick={() => setIndexOffset((value) => value + 31)}
               >

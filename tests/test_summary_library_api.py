@@ -48,7 +48,7 @@ def test_library_routes_only_read_saved_results_and_do_not_queue_inference(clien
     assert session.get('/api/summaries/library?limit=7&offset=2').json()['items'] == [entry]
     assert session.get('/api/summaries/saved/' + key).json() == saved
     assert session.get('/api/summaries/saved/' + 'c' * 64).status_code == 404
-    assert observed[0] == ('list', local.summaries_dir, {'limit': 7, 'offset': 2})
+    assert observed[0] == ('list', local.summaries_dir, {'limit': 7, 'offset': 2, 'sort': 'generated', 'direction': 'desc'})
     assert not executor.calls
     with db.connect(local.database) as conn:
         assert conn.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0

@@ -1,8 +1,12 @@
 import {useEffect,useState} from 'react';
 import {api,count,formatDate,type SavedSummaryPage,type SavedSummaryResult} from './api';
 import SummaryView from './SummaryView';
+import {SortControls,useSortPreference} from './sorting';
 
 export default function SavedSummaries({onOpenEvent}:{onOpenEvent:(id:string)=>void}) {
+  const sorting=useSortPreference('saved-summaries','generated',['generated','period','title'],'desc');
+  const [sort,direction]=sorting;
+  const reset=()=>{setOffset(0);setSelected('')};
   const [open,setOpen]=useState(false),[offset,setOffset]=useState(0),[retry,setRetry]=useState(0);
   const [page,setPage]=useState<SavedSummaryPage|null>(null),[selected,setSelected]=useState('');
   const [saved,setSaved]=useState<SavedSummaryResult|null>(null),[error,setError]=useState('');
@@ -10,14 +14,14 @@ export default function SavedSummaries({onOpenEvent}:{onOpenEvent:(id:string)=>v
   useEffect(()=>{
     if(!open)return;
     const controller=new AbortController(); setLoading(true);setError('');setPage(null);
-    api<SavedSummaryPage>(`/summaries/library?limit=20&offset=${offset}`,{signal:controller.signal})
+    api<SavedSummaryPage>(`/summaries/library?limit=20&offset=${offset}&sort=${sort}&direction=${direction}`,{signal:controller.signal})
       .then(value=>{if(!controller.signal.aborted)setPage(value)})
       .catch(cause=>{if(!controller.signal.aborted)setError(cause.message)})
       .finally(()=>{if(!controller.signal.aborted)setLoading(false)});
     return ()=>controller.abort();
-  },[open,offset,retry]);
+  },[open,offset,sort,direction,retry]);
   useEffect(()=>{
-    setSaved(null);if(!open||!selected)return;
+    setSaved(null);setReading(false);if(!open||!selected)return;
     const controller=new AbortController();setReading(true);setError('');
     api<SavedSummaryResult>(`/summaries/saved/${encodeURIComponent(selected)}`,{signal:controller.signal})
       .then(value=>{if(!controller.signal.aborted)setSaved(value)})
@@ -28,6 +32,7 @@ export default function SavedSummaries({onOpenEvent}:{onOpenEvent:(id:string)=>v
   return <details className="monthly-summary-panel" onToggle={event=>setOpen(event.currentTarget.open)}>
     <summary>Saved summaries</summary>
     {open&&<div className="monthly-summary-content">
+      <SortControls label="Saved summaries" options={[["generated","Saved date"],["period","Period"],["title","Title"]]} value={[sort,direction,value=>{reset();sorting[2](value)},value=>{reset();sorting[3](value)}]}/>
       <p>Saved narratives. Sources not checked. Opening does not run a model.</p>
       {loading&&<p role="status">Loading saved summaries…</p>}
       {error&&<p role="alert">{error} <button onClick={()=>setRetry(n=>n+1)}>Retry saved summaries</button></p>}

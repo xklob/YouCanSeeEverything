@@ -94,10 +94,37 @@ const report = {
   backup: { status: "not_supplied" },
 };
 beforeEach(() => {
+  localStorage.clear();
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => new Response(JSON.stringify(report))),
   );
+});
+
+it("sorts the full coverage source inventory without changing execution queue order", async () => {
+  const user = userEvent.setup();
+  const sample = report.sources[0];
+  const data = {
+    ...report,
+    sources: [
+      { ...sample, id: "unknown", name: "Unknown source" },
+      { ...sample, id: "known", name: "Known source", records: { ...sample.records, total: 20 } },
+      { ...sample, id: "zero", name: "Zero source", records: { ...sample.records, total: 0 } },
+    ],
+    queue: [
+      { ...report.queue[0], source_id: "unknown", source: "Unknown source", position: 1 },
+      { ...report.queue[0], source_id: "known", source: "Known source", position: 2 },
+    ],
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(data))));
+  render(<CoverageWorkspace refreshKey={0} onBrowseSource={vi.fn()} />);
+  await screen.findByLabelText("Source coverage sort");
+  const names = () => [...document.querySelectorAll(".coverage-source h3")].map(node => node.textContent);
+  await user.selectOptions(screen.getByLabelText("Source coverage sort"), "records");
+  expect(names()).toEqual(["Zero source", "Known source", "Unknown source"]);
+  await user.selectOptions(screen.getByLabelText("Source coverage direction"), "desc");
+  expect(names()).toEqual(["Known source", "Zero source", "Unknown source"]);
+  expect([...document.querySelectorAll(".coverage-queue strong")].map(node => node.textContent)).toEqual(["Unknown source", "Known source"]);
 });
 afterEach(() => {
   cleanup();
@@ -121,7 +148,8 @@ it("distinguishes input file and byte progress from retained inventory and unkno
       .getByRole("progressbar", { name: "Example archive: input bytes" })
       .getAttribute("aria-valuenow"),
   ).toBe("80");
-  expect(screen.getAllByText("Unknown").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("Counting…").length).toBeGreaterThan(0);
+  expect(screen.queryByText("Unknown")).toBeNull();
   expect(screen.getByText(/do not establish continuous coverage/)).toBeTruthy();
   expect(
     screen.getByText(/Retained files alone do not verify a separate backup/),

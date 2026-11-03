@@ -23,8 +23,8 @@ def test_api_unknown_objects_and_safe_static_boundaries(client):
     assert client.get('/api/files/missing/download').status_code==404
     assert client.get('/api/not-real').status_code==404
     overview=client.get('/api/overview').json()
-    assert overview['total_events'] is None
-    assert overview['stats']['status']=='pending'
+    assert overview['total_events']==0
+    assert overview['stats']['status']=='current'
     assert client.get('/api/events').json()['total']==0
     assert 'frame-ancestors' in client.get('/api/status').headers['content-security-policy']
 

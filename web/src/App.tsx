@@ -7,7 +7,6 @@ import {
   type ReactNode,
 } from "react";
 import {
-  ArrowDown,
   ArrowRight,
   ArrowUpRight,
   BookOpen,
@@ -42,6 +41,7 @@ import {
   api,
   bytes,
   count,
+  recordCount,
   formatDate,
   humanize,
   hasMore,
@@ -65,6 +65,13 @@ import ReadableData, { CitedProse, readablePreview } from "./ReadableData";
 import TripsWorkspace from "./TripsWorkspace";
 import SavedSummaries from "./SavedSummaries";
 import SummaryView from "./SummaryView";
+import {
+  SortControls,
+  sortItems,
+  sourceSortOptions,
+  useSortPreference,
+  type SortPreference,
+} from "./sorting";
 
 type View = "timeline" | "sources" | "coverage" | "assistant" | "trips";
 type Presentation = "map" | "daily" | "timeline";
@@ -137,7 +144,9 @@ function CountFreshness({ stats }: { stats?: StatsSnapshot }) {
   if (!stats || stats.status === "current" || stats.status === "ready")
     return null;
   const text =
-    stats.status === "cached" || stats.status === "stale"
+    stats.status === "counting"
+      ? "Counting existing records"
+      : stats.status === "cached" || stats.status === "stale"
       ? "Cached counts"
       : stats.status === "partial"
         ? "Partial counts"
@@ -342,7 +351,7 @@ export default function App() {
                       : undefined
                   }
                 >
-                  {count(source.event_count)}
+                  {recordCount(source.event_count, source.stats)}
                 </span>
               )}
             </button>
@@ -516,7 +525,8 @@ function Timeline({
   const [from, setFrom] = useState(tripMapRequest?.from || "");
   const [to, setTo] = useState(tripMapRequest?.to || "");
   const [undated, setUndated] = useState(false);
-  const [sort, setSort] = useState("desc");
+  const recordSort = useSortPreference("records", "date", ["date", "imported"], "desc");
+  const [sort, direction] = recordSort;
   const [offset, setOffset] = useState(0);
   const [page, setPage] = useState<Page<LifeEvent> | null>(null);
   const [loading, setLoading] = useState(true);
@@ -572,6 +582,7 @@ function Timeline({
     from,
     to,
     sort,
+    direction,
     undated,
   ].join("\0");
   const [previousFilters, setPreviousFilters] = useState(filterKey);
@@ -589,6 +600,7 @@ function Timeline({
       limit: String(PAGE_SIZE),
       offset: String(offset),
       sort,
+      direction,
     });
     if (debouncedQuery) params.set("q", debouncedQuery);
     if (sourceFilter) params.set("source", sourceFilter);
@@ -614,6 +626,7 @@ function Timeline({
     from,
     to,
     sort,
+    direction,
     undated,
     offset,
     refreshKey,
@@ -685,10 +698,10 @@ function Timeline({
       </div>
       <div className="archive-summary">
         <span>
+          Records:{" "}
           <span className="summary-number">
-            {overview ? count(overview.total_events) : "—"}
-          </span>{" "}
-          records
+            {overview ? recordCount(overview.total_events, overview.stats) : "—"}
+          </span>
         </span>
         <i />
         <span>
@@ -914,18 +927,7 @@ function Timeline({
                   }}
                 />
               )}
-              <button
-                className="sort-button"
-                onClick={() =>
-                  setSort((value) => (value === "desc" ? "asc" : "desc"))
-                }
-              >
-                <ArrowDown
-                  size={13}
-                  className={sort === "asc" ? "rotated" : ""}
-                />
-                {sort === "desc" ? "Newest first" : "Oldest first"}
-              </button>
+              <SortControls label="Records" options={[["date", "Date"], ["imported", "Import order"]]} value={recordSort} />
             </div>
             {error && (
               <ErrorNotice
@@ -1353,6 +1355,44 @@ function SourceLibrary({
   refresh: () => void;
   browseSource: (id: string) => void;
 }) {
+  const sourceSort = useSortPreference(
+    "sources", "name", sourceSortOptions.map(([field]) => field),
+  );
+  const importOptions = [["date", "Started"], ...sourceSortOptions] as const;
+  const importSort = useSortPreference(
+    "import-history", "date", importOptions.map(([field]) => field), "desc",
+  );
+  const [importOffset, setImportOffset] = useState(0);
+  const [importPage, setImportPage] = useState<Page<ImportRun> | null>(null);
+  const [importError, setImportError] = useState("");
+  const [importLoading, setImportLoading] = useState(false);
+  const importItems = importPage?.items ?? imports;
+  const importPath = importSort[0] === "date" && importSort[1] === "desc" && !importOffset
+    ? "/imports"
+    : `/imports?sort=${importSort[0]}&direction=${importSort[1]}&offset=${importOffset}`;
+  const importChoice: SortPreference = [
+    importSort[0], importSort[1],
+    field => { setImportOffset(0); importSort[2](field); },
+    direction => { setImportOffset(0); importSort[3](direction); },
+  ];
+  useEffect(() => {
+    const controller = new AbortController();
+    setImportLoading(true);
+    api<Page<ImportRun>>(importPath, { signal: controller.signal })
+      .then(page => {
+        if (!controller.signal.aborted) {
+          setImportPage(page);
+          setImportError("");
+        }
+      })
+      .catch(cause => {
+        if (!controller.signal.aborted) setImportError((cause as Error).message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setImportLoading(false);
+      });
+    return () => controller.abort();
+  }, [importPath, imports]);
   return (
     <div className="page library-page">
       <div className="page-heading">
@@ -1386,17 +1426,22 @@ function SourceLibrary({
         </div>
       </div>
       {error && <ErrorNotice message={error} retry={refresh} />}
-      {imports.length > 0 && (
+      {(importItems.length > 0 || importOffset > 0 || importError.length > 0) && (
         <section className="imports-section">
           <div className="section-title">
             <h2>Import activity</h2>
-            <span>Smallest datasets first</span>
+            <SortControls label="Import activity" options={importOptions} value={importChoice} />
           </div>
+          <p className="coverage-description">
+            Browse order only. Execution order is shown in Imports.
+          </p>
+          {importError && <ErrorNotice message={importError} retry={refresh} />}
           <div className="import-list">
-            {imports.map((item) => (
-              <ImportCard key={item.id} item={item} />
-            ))}
+            {importLoading
+              ? <p role="status">Loading import activity…</p>
+              : !importError && importItems.map((item) => <ImportCard key={item.id} item={item} />)}
           </div>
+          {!importError && <BrowsePages page={importPage} offset={importOffset} setOffset={setImportOffset} label="Imports" loading={importLoading} />}
         </section>
       )}
       <section>
@@ -1404,6 +1449,7 @@ function SourceLibrary({
           <h2>Sources</h2>
           <span>{count(sources.length)} connected</span>
         </div>
+        <SortControls label="Sources" options={sourceSortOptions} value={sourceSort} />
         {loading ? (
           <div className="drawer-loading">
             <LoaderCircle className="spin" size={20} />
@@ -1415,17 +1461,22 @@ function SourceLibrary({
           </EmptyState>
         ) : (
           <div className="source-grid">
-            {sources.map((source, index) => (
+            {sortItems(sources, sourceSort, (source, field) =>
+              field === "name" ? source.name
+                : field === "status" ? source.status
+                : field === "records" ? source.event_count
+                : field === "files" ? source.file_count : source.bytes,
+            ).map((source) => (
               <article className="source-card" key={source.id}>
                 <div className="source-card-heading">
-                  <span className={`large-source-glyph color-${index % 5}`}>
+                  <span className={`large-source-glyph color-${sources.indexOf(source) % 5}`}>
                     <Database size={21} />
                   </span>
                   <Status value={source.status || "unknown"} />
                 </div>
                 <h3>{source.name}</h3>
                 <div className="source-card-count">
-                  <strong>{count(source.event_count)}</strong> records
+                  Records: <strong>{recordCount(source.event_count, source.stats)}</strong>
                   <span> · {count(source.file_count)} files</span>
                 </div>
                 <div className="source-date-range">
@@ -1509,6 +1560,32 @@ function ImportCard({ item }: { item: ImportRun }) {
   );
 }
 
+function BrowsePages({ page, offset, setOffset, label, loading }: {
+  page: Page<unknown> | null;
+  offset: number;
+  setOffset: (offset: number) => void;
+  label: string;
+  loading: boolean;
+}) {
+  if (!page || (!offset && !hasMore(page))) return null;
+  const size = page.limit || page.items.length || 40;
+  return (
+    <div className="pagination" aria-label={`${label} pages`}>
+      <span>{page.items.length
+        ? `${count(offset + 1)}–${count(offset + page.items.length)} shown`
+        : `No ${label.toLowerCase()} on this page`}</span>
+      <div>
+        <button disabled={loading || !offset} onClick={() => setOffset(Math.max(0, offset - size))}>
+          Previous {label.toLowerCase()}
+        </button>
+        <button disabled={loading || !hasMore(page)} onClick={() => setOffset(offset + size)}>
+          Next {label.toLowerCase()}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Assistant({ onChange }: { onChange: () => void }) {
   const [mode, setMode] = useState<"ask" | "change">("ask");
   const [prompt, setPrompt] = useState("");
@@ -1519,22 +1596,40 @@ function Assistant({ onChange }: { onChange: () => void }) {
   const [undoing, setUndoing] = useState("");
   const [notice, setNotice] = useState("");
   const [selectedEvidence, setSelectedEvidence] = useState<string | null>(null);
-  const refreshJobs = useCallback(async () => {
-    const result = await api<{ items: Job[] }>("/jobs");
-    setJobs(result.items);
-    setLoading(false);
-  }, []);
+  const jobOptions = [
+    ["date", "Created"], ["status", "Status"], ["kind", "Kind"], ["prompt", "Question"],
+  ] as const;
+  const jobSort = useSortPreference(
+    "assistant-jobs", "date", jobOptions.map(([field]) => field), "desc",
+  );
+  const [jobOffset, setJobOffset] = useState(0);
+  const [jobPage, setJobPage] = useState<Page<Job> | null>(null);
+  const [jobRefresh, setJobRefresh] = useState(0);
+  const [jobLoadError, setJobLoadError] = useState("");
+  const jobPath = jobSort[0] === "date" && jobSort[1] === "desc" && !jobOffset
+    ? "/jobs"
+    : `/jobs?sort=${jobSort[0]}&direction=${jobSort[1]}&offset=${jobOffset}`;
+  const jobChoice: SortPreference = [
+    jobSort[0], jobSort[1],
+    field => { setJobOffset(0); jobSort[2](field); },
+    direction => { setJobOffset(0); jobSort[3](direction); },
+  ];
+  const refreshJobs = () => setJobRefresh(value => value + 1);
   useEffect(() => {
     let live = true;
+    const controller = new AbortController();
+    setLoading(true);
     const load = async () => {
       try {
-        const result = await api<{ items: Job[] }>("/jobs");
+        const result = await api<Page<Job>>(jobPath, { signal: controller.signal });
         if (live) {
           setJobs(result.items);
+          setJobPage(result);
+          setJobLoadError("");
           setError("");
         }
       } catch (cause) {
-        if (live) setError((cause as Error).message);
+        if (live) setJobLoadError((cause as Error).message);
       } finally {
         if (live) setLoading(false);
       }
@@ -1545,9 +1640,10 @@ function Assistant({ onChange }: { onChange: () => void }) {
     }, 4000);
     return () => {
       live = false;
+      controller.abort();
       window.clearInterval(timer);
     };
-  }, []);
+  }, [jobPath, jobRefresh]);
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!prompt.trim() || submitting) return;
@@ -1658,17 +1754,17 @@ function Assistant({ onChange }: { onChange: () => void }) {
       <section className="jobs-section">
         <div className="section-title">
           <h2>Activity</h2>
-          <span>Saved locally</span>
+          <SortControls label="Assistant activity" options={jobOptions} value={jobChoice} />
         </div>
         {loading ? (
           <div className="drawer-loading">
             <LoaderCircle className="spin" size={19} />
             Loading your activity…
           </div>
-        ) : !jobs.length ? (
+        ) : jobLoadError ? <ErrorNotice message={jobLoadError} retry={refreshJobs} /> : !jobs.length ? (
           <EmptyState
             icon={<MessageSquareText size={27} />}
-            title="No questions yet"
+            title={jobOffset ? "No activity on this page" : "No questions yet"}
           >
             Questions, answers, and app changes appear here.
           </EmptyState>
@@ -1723,6 +1819,7 @@ function Assistant({ onChange }: { onChange: () => void }) {
             ))}
           </div>
         )}
+        {!jobLoadError && <BrowsePages page={jobPage} offset={jobOffset} setOffset={setJobOffset} label="Activity" loading={loading} />}
       </section>
       <div className="assistant-disclosure">
         <CircleAlert size={14} />

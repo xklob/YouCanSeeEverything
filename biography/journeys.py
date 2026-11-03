@@ -1,5 +1,7 @@
 """Read-only grouped exploration of existing, conservatively inferred legs."""
 
+import math
+
 from .trips import _bound, _instant, trip_connections
 
 
@@ -8,9 +10,12 @@ NOTICE = ("Trips group inferred straight-line connections between recorded stops
           "Recording gaps and uncertain stops break the grouping.")
 
 
-def list_journeys(path=None, *, source="", start="", end="", kind="all", limit=20, offset=0):
+def list_journeys(path=None, *, source="", start="", end="", kind="all", limit=20, offset=0,
+                  sort="date",direction="desc"):
     if kind not in ("all", "long_distance", "local_movement"):
         raise ValueError("Unknown journey kind")
+    if sort not in {'date','distance','duration','stops'} or direction not in {'asc','desc'}:
+        raise ValueError('Unknown journey sort or direction')
     lower, _ = _bound(start)
     upper, exclusive = _bound(end, upper=True)
     if lower and upper and (lower >= upper if exclusive else lower > upper):
@@ -20,19 +25,29 @@ def list_journeys(path=None, *, source="", start="", end="", kind="all", limit=2
     groups = []
     for group in result["trips"]:
         departure, arrival = _instant(group["departure_at"]), _instant(group["arrival_at"])
-        if lower and arrival < lower:
+        if lower and (arrival is None or arrival < lower):
             continue
-        if upper and (departure >= upper if exclusive else departure > upper):
+        if upper and (departure is None or (departure >= upper if exclusive else departure > upper)):
             continue
         if kind != "all" and group["kind"] != kind:
             continue
-        groups.append(group)
-    groups.sort(key=lambda item: (item["departure_at"], item["id"]), reverse=True)
+        elapsed=(arrival-departure).total_seconds()/3600 if departure and arrival and arrival>=departure else None
+        group={**group,'duration_hours':elapsed}
+        value=departure if sort=='date' else elapsed if sort=='duration' else group.get('distance_km' if sort=='distance' else 'represented_stops')
+        if sort!='date' and (type(value) not in {int,float} or not math.isfinite(value) or value<0):value=None
+        groups.append((group,value))
+    # Keep missing values last in both directions. ID direction preserves the
+    # existing date-descending/ID-descending default, including equal dates.
+    known=[pair for pair in groups if pair[1] is not None];unknown=[pair for pair in groups if pair[1] is None]
+    known.sort(key=lambda pair:(pair[1],pair[0]['id']),reverse=direction=='desc')
+    unknown.sort(key=lambda pair:pair[0]['id'],reverse=direction=='desc')
+    groups=[pair[0] for pair in known+unknown]
     items = groups[offset:offset + limit]
     return {"items": items, "total": len(groups), "limit": limit, "offset": offset,
             "truncated": offset + len(items) < len(groups),
             "coverage_complete": result["coverage_complete"], "coverage": result["coverage"],
             "notice": NOTICE, "date_filter_basis": "whole_group_intersects_selected_window",
+            'sort':sort,'direction':direction,
             "sources": [{"id": entry["source_id"], "name": entry["source"]}
                         for entry in result["coverage"] if "source_id" in entry]}
 

@@ -52,3 +52,29 @@ it('loads a saved trip without generating or checking source freshness',async()=
  await user.click(screen.getByText('Summarize this trip'));await screen.findByText('Saved trip narrative');
  expect(screen.getByText('Saved · Sources not checked')).toBeTruthy();expect(fetcher.mock.calls.every(call=>!String(call[0]).includes('/assistant'))).toBe(true);
 });
+it('resets saved paging for server sorting, aborts stale pages and restores its preference',async()=>{
+ localStorage.clear();
+ const requests:{url:URL;signal?:AbortSignal|null}[]=[];
+ let finishOld:(response:Response)=>void=()=>{};
+ vi.stubGlobal('fetch',vi.fn(async(input,options)=>{
+  const url=new URL(String(input),'http://localhost');requests.push({url,signal:options?.signal});
+  if(url.searchParams.get('offset')==='20')return new Promise<Response>(resolve=>{finishOld=resolve});
+  const sorted=url.searchParams.get('sort')==='title';
+  return Response.json({items:[{key:'key',title:sorted?'Sorted account':'Initial account',kind:'period_summary',period:'2024-04',generated_at:'2026-11-03',citation_count:1,source_ids:[],model:'gpt-6.1-sol'}],has_more:true});
+ }));
+ const user=userEvent.setup(),view=render(<SavedSummaries onOpenEvent={vi.fn()}/>);
+ await user.click(screen.getByText('Saved summaries'));await screen.findByRole('button',{name:/Initial account/});
+ await user.click(screen.getByRole('button',{name:'Next saved summaries'}));
+ await waitFor(()=>expect(requests.some(item=>item.url.searchParams.get('offset')==='20')).toBe(true));
+ await user.selectOptions(screen.getByLabelText('Saved summaries sort'),'title');
+ await screen.findByRole('button',{name:/Sorted account/});
+ expect(requests.find(item=>item.url.searchParams.get('offset')==='20')?.signal?.aborted).toBe(true);
+ finishOld(Response.json({items:[{title:'Stale page'}],has_more:false}));
+ await user.selectOptions(screen.getByLabelText('Saved summaries direction'),'asc');
+ await waitFor(()=>expect(requests.some(item=>item.url.searchParams.get('sort')==='title'&&item.url.searchParams.get('direction')==='asc'&&item.url.searchParams.get('offset')==='0')).toBe(true));
+ expect(screen.queryByText('Stale page')).toBeNull();
+ view.unmount();requests.length=0;render(<SavedSummaries onOpenEvent={vi.fn()}/>);await user.click(screen.getByText('Saved summaries'));await screen.findByRole('button',{name:/Sorted account/});
+ expect((screen.getByLabelText('Saved summaries sort') as HTMLSelectElement).value).toBe('title');
+ expect((screen.getByLabelText('Saved summaries direction') as HTMLSelectElement).value).toBe('asc');
+ localStorage.clear();
+});

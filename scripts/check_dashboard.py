@@ -204,8 +204,11 @@ def fixture_api(path: str) -> dict:
                            kind="explicit_coordinates", time_precision="second")
                       for r in selected if r["id"] == "qa-alder"]
             return {"items": points, "total": sum(record["id"] in {"qa-alder", "qa-cedar"} for record in selected)}
-        selected = sorted(selected, key=lambda r: r["occurred_at"],
-                          reverse=params.get("sort", ["desc"])[0] != "asc")
+        sort_field = params.get("sort", ["date"])[0]
+        direction = sort_field if sort_field in {"asc", "desc"} else params.get("direction", ["desc"])[0]
+        imported = {row["id"]: index for index, row in enumerate(records)}
+        selected = sorted(selected, key=lambda r: (imported[r["id"]] if sort_field == "imported" else r["occurred_at"], r["id"]),
+                          reverse=direction != "asc")
         offset, limit = int(params.get("offset", [0])[0]), int(params.get("limit", [40])[0])
         return {"items": selected[offset:offset + limit], "total": len(selected),
                 "limit": limit, "offset": offset}

@@ -1,8 +1,10 @@
 """Synthetic journey groups exercise pagination beyond the map leg limit."""
 from datetime import datetime, timedelta, timezone
 import sqlite3
+import pytest
 
 from biography.db import init_db
+from biography import journeys
 from biography.locations import ensure_schema
 from biography.journeys import journey_detail, list_journeys
 
@@ -101,3 +103,35 @@ def test_journey_filters_reject_invalid_ranges_and_kinds(tmp_path):
                     {"start": "2024-02-01", "end": "2024-01-01"}):
         with pytest.raises(ValueError):
             list_journeys(db, **options)
+
+
+@pytest.mark.parametrize('sort,descending',[
+    ('date',['c','d','b','a','z']),('distance',['d','b','c','a','z']),
+    ('duration',['a','c','d','b','z']),('stops',['c','a','d','b','z']),
+])
+@pytest.mark.parametrize('direction',['asc','desc'])
+def test_journey_sort_is_global_stable_and_null_last(monkeypatch,sort,descending,direction):
+    groups=[
+        {'id':'a','departure_at':'2024-01-01T00:00:00Z','arrival_at':'2024-01-02T00:00:00Z','distance_km':20,'represented_stops':3},
+        {'id':'b','departure_at':'2024-01-02T00:00:00Z','arrival_at':'2024-01-02T01:00:00Z','distance_km':100,'represented_stops':2},
+        {'id':'c','departure_at':'2024-01-03T00:00:00Z','arrival_at':'2024-01-03T12:00:00Z','distance_km':50,'represented_stops':5},
+        {'id':'d','departure_at':'2024-01-02T00:00:00Z','arrival_at':'2024-01-02T01:00:00Z','distance_km':100,'represented_stops':2},
+        {'id':'z','departure_at':None,'arrival_at':None,'distance_km':None,'represented_stops':None},
+    ]
+    for group in groups:group['kind']='long_distance' if group['id'] in {'b','d'} else 'local_movement'
+    monkeypatch.setattr(journeys,'trip_connections',lambda *args,**kwargs:{'trips':groups,'coverage':[],'coverage_complete':True})
+    expected=descending if direction=='desc' else list(reversed(descending[:-1]))+['z']
+    pages=[list_journeys(sort=sort,direction=direction,limit=1,offset=index) for index in range(5)]
+    assert [page['items'][0]['id'] for page in pages]==expected
+    assert all(page['total']==5 for page in pages)
+    assert [page['truncated'] for page in pages]==[True,True,True,True,False]
+    assert list_journeys(sort='duration',direction='desc')['items'][0]['duration_hours']==24
+    assert [item['id'] for item in list_journeys(sort='distance',direction='asc',kind='long_distance')['items']]==['b','d']
+    assert [item['id'] for item in list_journeys(sort='distance',direction='desc',start='2024-01-02',end='2024-01-02')['items']]==['d','b','a']
+
+
+@pytest.mark.parametrize('options',[{'sort':'unknown'},{'direction':'DESC'},{'sort':'date; DELETE FROM events'}])
+def test_journey_sort_rejects_unknown_keys_without_catalog_access(monkeypatch,options):
+    def forbidden(*args,**kwargs):raise AssertionError('Invalid sorts must not read the catalog')
+    monkeypatch.setattr(journeys,'trip_connections',forbidden)
+    with pytest.raises(ValueError):list_journeys(**options)

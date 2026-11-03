@@ -1,8 +1,8 @@
 """Read-only coverage of observed imported records, never complete service history.
 
-File/progress summaries are current read snapshots. Large event/date aggregates
-use a covering index in a bounded background refresh; their separate timestamp
-and catalog watermark remain explicit while ingestion advances.
+File/progress summaries are current read snapshots. Record counts come from the
+durable incremental catalog counters. Optional monthly presence has its own
+bounded refresh and never authorizes a default whole-event aggregate.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import time
 
 from .config import settings
 from .session_sources import sanitize_visible
+from .query_stats import get_catalog_stats
 
 
 ACTIVE = {"queued", "pending", "running", "importing", "processing", "indexing"}
@@ -99,37 +100,25 @@ def _refresh(key, path, include_months, month_limit, budget):
         connection.set_progress_handler(lambda: time.monotonic() - started > budget, 20000)
         connection.execute("BEGIN")
         watermark = connection.execute("SELECT coalesce(max(rowid),0) FROM events").fetchone()[0]
-        source_ids = {row[0] for row in connection.execute("SELECT id FROM sources")}
-        indexes = {row[1] for row in connection.execute("PRAGMA index_list(events)")}
-        if "events_source" not in indexes:
-            raise sqlite3.OperationalError("required_covering_index_missing")
-        rows = connection.execute("""SELECT source_id,count(*) AS total,
-            min(NULLIF(occurred_at,'')) AS first_observed,
-            max(NULLIF(occurred_at,'')) AS last_observed,
-            sum(occurred_at IS NULL OR occurred_at='') AS undated
-            FROM events INDEXED BY events_source GROUP BY source_id""").fetchall()
-        by_source = {row["source_id"]: {"total": row["total"], "dated": row["total"] - row["undated"],
-                     "undated": row["undated"], "first_observed": row["first_observed"],
-                     "last_observed": row["last_observed"]} for row in rows}
         months = {}
         month_status = "not_requested"
-        total = sum(row["total"] for row in rows)
-        if include_months and total <= 250000:
-            month_status = "observed_records_only"
-            for row in connection.execute("""SELECT source_id,substr(occurred_at,1,7) AS month,count(*) AS records
+        if include_months:
+            # The counter and optional month scan use separate short snapshots.
+            # Bound this guard even if a large import commits between them.
+            bounded_total=connection.execute('SELECT count(1) FROM (SELECT 1 FROM events LIMIT 250001)').fetchone()[0]
+            month_status = "observed_records_only" if bounded_total<=250000 else 'not_computed_at_request_scale'
+            rows=connection.execute("""SELECT source_id,substr(occurred_at,1,7) AS month,count(*) AS records
                     FROM events WHERE length(occurred_at)>=7 AND time_precision NOT IN ('year','unknown')
                     AND substr(occurred_at,1,7) GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
                     AND CAST(substr(occurred_at,6,2) AS INTEGER) BETWEEN 1 AND 12
-                    GROUP BY source_id,substr(occurred_at,1,7) ORDER BY month DESC"""):
+                    GROUP BY source_id,substr(occurred_at,1,7) ORDER BY month DESC""") if bounded_total<=250000 else []
+            for row in rows:
                 item = months.setdefault(row["source_id"], {"items": [], "truncated": False})
                 if len(item["items"]) < month_limit:
                     item["items"].append({"month": row["month"], "records": row["records"]})
                 else:
                     item["truncated"] = True
-        elif include_months:
-            month_status = "not_computed_at_request_scale"
-        result = {"by_source": by_source, "source_ids": source_ids, "total": total,
-                  "undated": sum(row["undated"] for row in rows), "measured_at": _now(),
+        result = {"measured_at": _now(),
                   "catalog_max_event_rowid": watermark, "signature": signature,
                   "months": months, "month_status": month_status}
         with _LOCK:
@@ -194,8 +183,9 @@ def coverage_overview(path=None, *, include_months=False, month_limit=120,
                       classifications=None, backup_status=None):
     """Return catalog-declared retention/progress and separately dated record stats.
 
-    ``wait=True`` is intended for bounded validation/background jobs, not a UI
-    refresh. Optional classifications/backup status must come from independently
+    ``wait=True`` waits only for requested bounded monthly presence. Record
+    counts always use the cheap durable counter read, never a refresh scan.
+    Optional classifications/backup status must come from independently
     verified callers; this endpoint never guesses a service identity or backup.
     """
     path = Path(path or settings.database)
@@ -207,7 +197,7 @@ def coverage_overview(path=None, *, include_months=False, month_limit=120,
                               "File retention counts are catalog declarations; payload readback is not performed by this endpoint.",
                               "Import progress counts original input files and their bytes, not expanded retained leaves.",
                               "Observed date bounds retain stored source timestamps, which can have coarse precision; inspect original evidence for precision.",
-                              "Record counts/date ranges have their own measured timestamp and may lag active ingestion."]}
+                              "Counting records are a known subset, not an estimate of the full catalog. Date bounds come from indexed source timestamp seeks."]}
     connection = _read(path)
     try:
         connection.execute("BEGIN")
@@ -218,23 +208,37 @@ def coverage_overview(path=None, *, include_months=False, month_limit=120,
             completed_bytes,events,error,started_at,finished_at FROM imports ORDER BY started_at DESC""").fetchall()
     finally:
         connection.close()
-    data, pending, error = _stats(path, watermark, include_months=bool(include_months), month_limit=month_limit,
-        cache_ttl_seconds=max(1, float(cache_ttl_seconds)), scan_budget_seconds=max(0.001, float(scan_budget_seconds)),
-        refresh=bool(refresh), wait=bool(wait))
-    # A synchronous warm-up may have observed a later ingestion cut. Keep the
-    # current catalog position newer than the separately timestamped cache cut.
+    measured=get_catalog_stats(path)
+    stats=measured.get('stats') or {}
+    stats_status=stats.get('status') if stats.get('status') in {'current','counting','unavailable'} else 'unavailable'
+    current=stats_status=='current'
+    total=measured.get('total_events') if current else None
+    undated=measured.get('undated_count') if current else None
+    by_source=measured.get('by_source') or {}
+    data=None;pending=False;error=None
+    month_status='not_requested'
+    if include_months:
+        if total is None:month_status='unavailable_until_counted'
+        elif total>250000:month_status='not_computed_at_request_scale'
+        else:
+            data,pending,error=_stats(path,watermark,include_months=True,month_limit=month_limit,
+                cache_ttl_seconds=max(1,float(cache_ttl_seconds)),scan_budget_seconds=max(0.001,float(scan_budget_seconds)),
+                refresh=bool(refresh),wait=bool(wait))
+            month_status=data['month_status'] if data else 'refreshing' if pending else 'unavailable'
+    # The durable counter and current progress have independent short snapshots.
     connection = _read(path)
     try:
         watermark = connection.execute("SELECT coalesce(max(rowid),0) FROM events").fetchone()[0]
     finally:
         connection.close()
-    current = bool(data and data["catalog_max_event_rowid"] == watermark and data["signature"] == _signature(path))
-    stats_status = "current" if current else "stale" if data else "refreshing" if pending else "unavailable"
     report["indexing"] = {"catalog_max_event_rowid": watermark,
-        "coverage_stats": {"status": stats_status, "refreshing": pending, "measured_at": data["measured_at"] if data else None,
-                           "catalog_max_event_rowid": data["catalog_max_event_rowid"] if data else None,
-                           "refresh_interval_seconds": max(1, float(cache_ttl_seconds)), "error_code": error},
+        "coverage_stats": {"status": stats_status, "refreshing": False, "measured_at": stats.get('measured_at'),
+                           "catalog_max_event_rowid": stats.get('watermark'),
+                           'checkpoint_rowid':stats.get('checkpoint_rowid'),'scanned_records':stats.get('scanned_records'),
+                           'counted_events':stats.get('counted_events'),
+                           "refresh_interval_seconds": None, "error_code": stats.get('error')},
         "daily": _daily(path, watermark, index_status)}
+    months_stale=bool(data and data['signature']!=_signature(path))
     file_stats = {}
     latest_imports = {}
     for row in import_rows:
@@ -246,9 +250,9 @@ def coverage_overview(path=None, *, include_months=False, month_limit=120,
         item["by_parse_status"][state] = item["by_parse_status"].get(state, 0) + row["files"]
     totals = {"sources": len(source_rows), "files": 0, "bytes": 0, "parsed_files": 0,
               "metadata_only_files": 0, "retained_only_files": 0, "review_files": 0,
-              "events": data["total"] if data else None,
-              "dated_events": data["total"] - data["undated"] if data else None,
-              "undated_events": data["undated"] if data else None}
+              "events": total,
+              "dated_events": total-undated if total is not None and undated is not None else None,
+              "undated_events": undated,'counted_events':stats.get('counted_events')}
     for source in source_rows:
         sid = source["id"]
         files = file_stats.get(sid, {"total": 0, "bytes": 0, "by_parse_status": {}}).copy()
@@ -259,12 +263,21 @@ def coverage_overview(path=None, *, include_months=False, month_limit=120,
         files["needs_review"] = sum(states.get(name, 0) for name in REVIEW)
         records = {"status": stats_status, "total": None, "dated": None, "undated": None,
                    "first_observed": None, "last_observed": None,
-                   "measured_at": data["measured_at"] if data else None}
-        if data and sid in data["source_ids"]:
-            records.update(data["by_source"].get(sid, {"total": 0, "dated": 0, "undated": 0, "first_observed": None, "last_observed": None}))
-        records["months"] = {"status": data["month_status"] if data else "unavailable", "items": [], "truncated": False}
+                   "measured_at": stats.get('measured_at'),'counted_events':None}
+        source_stats=by_source.get(sid)
+        if source_stats is not None:
+            source_total=source_stats.get('total_events') if current else None
+            source_undated=source_stats.get('undated_count') if current else None
+            records.update(total=source_total,undated=source_undated,
+                dated=source_total-source_undated if source_total is not None and source_undated is not None else None,
+                counted_events=source_stats.get('counted_events'),
+                first_observed=(source_stats.get('date_range') or {}).get('start'),
+                last_observed=(source_stats.get('date_range') or {}).get('end'))
+        records["months"] = {"status": month_status, "items": [], "truncated": False,
+                             'refreshing':pending,'error_code':error,'measured_at':data['measured_at'] if data else None}
         if data:
             records["months"].update(data["months"].get(sid, {}))
+            if months_stale:records['months']['status']='stale'
         status = source["status"]
         if status == "ready" and files["needs_review"]:
             status = "partial"

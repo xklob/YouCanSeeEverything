@@ -1,8 +1,7 @@
-"""Bounded, asynchronous measurements for catalog browsing.
+"""Cheap durable catalog totals and bounded asynchronous filtered counts.
 
-Requests never wait for a count. Measurements describe a committed SQLite
-snapshot, not an estimate of the current catalog. This disposable in-memory
-cache writes neither the catalog nor personal data to the application checkout.
+Catalog reads use transactionally maintained aggregates. Complex filters use
+a disposable single-flight cache; a missed measurement remains unknown.
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ import threading
 import time
 
 from .config import settings
+from .catalog_counts import count_status
 
 
 def _now():
@@ -112,14 +112,8 @@ class _Entry:
     error: str | None = None
 
 
-def _empty_catalog():
-    return {"total_events": None, "undated_count": None,
-            "date_range": {"start": None, "end": None}, "activity": None,
-            "categories": None, "by_source": None}
-
-
 class CatalogStatsCache:
-    """One bounded worker for all summaries and filtered counts in this process."""
+    """One bounded worker for complex filtered counts in this process."""
 
     def __init__(self, *, ttl_seconds=300, query_seconds=8,
                  max_opcodes=500_000_000, max_wal_growth_bytes=256 * 1024**2,
@@ -170,7 +164,7 @@ class CatalogStatsCache:
 
     def _run(self, key, path, kind, where, args):
         reader = None
-        value = _empty_catalog() if kind == "catalog" else {}
+        value = {}
         error = None
         signature = None
         try:
@@ -182,10 +176,7 @@ class CatalogStatsCache:
             reader.execute("BEGIN")
             watermark = reader.execute("SELECT rowid FROM events ORDER BY rowid DESC LIMIT 1").fetchone()
             value.update(measured_at=_now(), watermark=watermark[0] if watermark else 0)
-            if kind == "catalog":
-                self._catalog(reader, value)
-            else:
-                self._count(reader, value, where, args)
+            self._count(reader, value, where, args)
         except (sqlite3.Error, OSError, _BudgetExceeded) as exc:
             if isinstance(exc, _BudgetExceeded):
                 error = str(exc)
@@ -209,48 +200,6 @@ class CatalogStatsCache:
                 entry.error, entry.pending = error, False
                 self._pending -= 1
 
-    def _catalog(self, reader, value):
-        # Bounds are two covering-index seeks, available even if aggregates hit
-        # their budget. Empty catalogs have measured null bounds and zero counts.
-        first = reader.execute("SELECT occurred_at FROM events INDEXED BY events_time WHERE occurred_at IS NOT NULL ORDER BY occurred_at ASC LIMIT 1").fetchone()
-        last = reader.execute("SELECT occurred_at FROM events INDEXED BY events_time WHERE occurred_at IS NOT NULL ORDER BY occurred_at DESC LIMIT 1").fetchone()
-        value["date_range"] = {"start": first[0] if first else None, "end": last[0] if last else None}
-        # Distinct names via successive seeks avoid a DISTINCT scan across every
-        # sample. Counts stay unknown until the category aggregate completes.
-        value["categories"], value["categories_status"] = [], "names_partial"
-        previous = None
-        while True:
-            row = reader.execute("SELECT category FROM events INDEXED BY events_category " +
-                ("WHERE category>? " if previous is not None else "") +
-                "ORDER BY category LIMIT 1", (previous,) if previous is not None else ()).fetchone()
-            if row is None:
-                break
-            if len(value["categories"]) >= self.max_summary_rows:
-                raise _BudgetExceeded("summary_result_limit")
-            previous = row[0]
-            value["categories"].append({"name": previous, "count": None})
-        value["categories_status"] = "names_only"
-        sources = reader.rows("SELECT id FROM sources")
-        # count(1), unlike SQLite's count(*) fast path, is interruptible by the
-        # opcode progress handler. Only source/date index leaves are visited.
-        rows = reader.rows("""SELECT source_id,count(1) AS total_events,
-            sum(occurred_at IS NULL) AS undated_count,
-            min(occurred_at) AS first_event,max(occurred_at) AS last_event
-            FROM events INDEXED BY events_source GROUP BY source_id""")
-        by_source = {row["id"]: {"total_events": 0, "undated_count": 0,
-                     "date_range": {"start": None, "end": None}} for row in sources}
-        for row in rows:
-            by_source[row["source_id"]] = {"total_events": row["total_events"],
-                "undated_count": row["undated_count"],
-                "date_range": {"start": row["first_event"], "end": row["last_event"]}}
-        value.update(total_events=sum(row["total_events"] for row in rows),
-                     undated_count=sum(row["undated_count"] for row in rows), by_source=by_source)
-        categories = reader.rows("SELECT category AS name,count(1) AS count FROM events INDEXED BY events_category GROUP BY category")
-        value["categories"] = sorted(categories, key=lambda row: (-row["count"], row["name"]))
-        value["categories_status"] = "measured"
-        # Monthly grouping needs an unindexed expression and a temp sort at this
-        # scale. Daily projection owns that browsing; do not imply zero activity.
-
     def _count(self, reader, value, where, args):
         sql = "SELECT count(1) FROM events e" + where
         plan = reader.execute("EXPLAIN QUERY PLAN " + sql, args).fetchall()
@@ -260,24 +209,45 @@ class CatalogStatsCache:
         value["total"] = reader.execute(sql, args).fetchone()[0]
 
     def catalog(self, path=None):
-        value, pending, error, stale = self._request(path, "catalog")
-        result = _empty_catalog() if value is None else {k: v for k, v in value.items() if k not in {"measured_at", "watermark", "categories_status"}}
-        status = "stale" if stale else "partial" if value is not None and error else "ready" if value is not None else "pending" if pending else "unavailable"
-        result["stats"] = {"status": status, "measured_at": value.get("measured_at") if value else None,
-            "watermark": value.get("watermark") if value else None, "refreshing": pending,
-            "activity_status": "not_computed", "categories_status": value.get("categories_status", "unknown") if value else "unknown", "error": error}
-        return result
+        # Durable aggregates change in the same transaction as events. Do not
+        # hide progress or current totals behind the filtered-count cache TTL.
+        return count_status(path)
 
     def count(self, path=None, where="", args=()):
         where = where.strip()
-        if not where:
-            result = self.catalog(path)
-            stats = result["stats"]
-            total = result["total_events"]
-            return {"total": total, "total_status": "stale" if total is not None and stats["status"] == "stale" else "current" if total is not None else "pending" if stats["refreshing"] else "unavailable",
-                    "counted_at": stats["measured_at"] if total is not None else None}
-        if not where.upper().startswith("WHERE ") or ";" in where or "--" in where or "/*" in where:
+        simple = {'WHERE e.source_id=?': 'source', 'WHERE e.category=?': 'category',
+                  'WHERE e.occurred_at IS NULL': 'undated'}
+        if where and (not where.upper().startswith("WHERE ") or ";" in where or "--" in where or "/*" in where):
             raise ValueError("A single parameterized event WHERE clause is required")
+        kind = simple.get(where)
+        if kind in {'source', 'category'} and len(args) != 1:
+            raise ValueError('One count filter parameter is required')
+        # TEXT affinity can coerce numeric SQL parameters; use the SQL worker
+        # for those rather than a Python dictionary lookup with different rules.
+        simple_key = kind == 'undated' or (kind in {'source', 'category'} and
+                     (isinstance(args[0], str) or args[0] is None))
+        if not where or simple_key:
+            result = count_status(path, bounds=False)
+            stats = result['stats']
+            total, counted = result['total_events'], stats['counted_events']
+            kind = simple.get(where)
+            if kind in {'source', 'category'}:
+                if kind == 'source':
+                    value = (result['by_source'] or {}).get(args[0])
+                    total = value['total_events'] if value else 0 if stats['status'] == 'current' else None
+                    counted = value['counted_events'] if value else 0 if stats['counted_events'] is not None else None
+                else:
+                    value = next((v for v in result['categories'] or [] if v['name'] == args[0]), None)
+                    total = value['count'] if value else 0 if stats['status'] == 'current' else None
+                    counted = value['counted_events'] if value else 0 if stats['counted_events'] is not None else None
+            elif kind == 'undated':
+                total, counted = result['undated_count'], None
+            answer = {'total': total, 'total_status': 'current' if total is not None else
+                      'counting' if stats['status'] == 'counting' else 'unavailable',
+                      'counted_at': stats['measured_at'] if total is not None else None}
+            if total is None and stats['status'] == 'counting':
+                answer['counted_events'] = counted
+            return answer
         value, pending, error, stale = self._request(path, "count", " " + where, args)
         total = value.get("total") if value else None
         return {"total": total, "total_status": "stale" if total is not None and stale else "current" if total is not None else "pending" if pending else "unavailable",

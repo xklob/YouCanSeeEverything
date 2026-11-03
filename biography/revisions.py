@@ -23,7 +23,7 @@ from typing import Any
 from .agents import AgentError, DEFAULT_MODEL, MAX_PROMPT, _object, _run, _string, _write_json
 
 
-MAX_SOURCE_BYTES = 320_000
+MAX_SOURCE_BYTES = 384_000
 MAX_FILE_BYTES = 150_000
 ALLOWED_EXTENSIONS = {".ts", ".tsx", ".css", ".svg", ".json"}
 _PACKAGE = re.compile(r"(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*")

@@ -85,6 +85,7 @@ const record = {
 };
 let requests: { path: string; options?: RequestInit }[];
 beforeEach(() => {
+  localStorage.clear();
   requests = [];
   vi.stubGlobal(
     "fetch",
@@ -277,4 +278,34 @@ it("shows source conflicts and distinguishes occurrences, variants and duplicate
     ),
   ).toBeTruthy();
   expect(heading.closest("article")!.textContent).not.toContain("{");
+});
+
+it("requests sorted days on the server, preserves filters and restores its preference", async () => {
+  const user = userEvent.setup();
+  const props = {filters, refreshKey: 0, onOpenEvent: vi.fn()};
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, options) => {
+    const response = await original(input, options);
+    if (String(input).startsWith("/api/days?")) {
+      const value = await response.json(); value.total = 40;
+      return Response.json(value);
+    }
+    return response;
+  });
+  const view = render(<DailyWorkspace {...props} />);
+  await screen.findByText("A retained conversation");
+  await user.click(screen.getByRole("button", {name: "Next observed days"}));
+  await waitFor(() => expect(requests.some(item => item.path.includes("offset=31"))).toBe(true));
+  await user.selectOptions(screen.getByLabelText("Days sort"), "records");
+  await user.selectOptions(screen.getByLabelText("Days direction"), "asc");
+  await waitFor(() => expect(requests.some(item => {
+    const url = new URL(item.path, "http://localhost");
+    return url.pathname === "/api/days" && url.searchParams.get("sort") === "records" && url.searchParams.get("direction") === "asc" && url.searchParams.get("offset") === "0" && url.searchParams.get("source") === filters.source;
+  })).toBe(true));
+  expect(requests.filter(item => item.path.startsWith("/api/days/")).every(item => !new URL(item.path, "http://localhost").searchParams.has("sort"))).toBe(true);
+  view.unmount(); requests.length = 0;
+  render(<DailyWorkspace {...props} />);
+  await screen.findByText("A retained conversation");
+  expect((screen.getByLabelText("Days sort") as HTMLSelectElement).value).toBe("records");
+  expect((screen.getByLabelText("Days direction") as HTMLSelectElement).value).toBe("asc");
 });

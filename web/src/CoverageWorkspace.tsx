@@ -14,14 +14,18 @@ import {
   api,
   bytes,
   count,
+  recordCount,
   formatDate,
   humanize,
   type CoverageReport,
 } from "./api";
 import ReadableData from "./ReadableData";
+import {
+  SortControls, sortItems, sourceSortOptions, useSortPreference,
+} from "./sorting";
 
 const measured = (value: number | null | undefined) =>
-  typeof value === "number" ? count(value) : "Unknown";
+  typeof value === "number" ? count(value) : "Not counted";
 function CoverageProgress({
   label,
   completed,
@@ -78,6 +82,9 @@ export default function CoverageWorkspace({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [retry, setRetry] = useState(0);
+  const sourceSort = useSortPreference(
+    "coverage-sources", "name", sourceSortOptions.map(([field]) => field),
+  );
   const dailyWatermark =
     report?.indexing.daily.watermark_rowid ?? report?.indexing.daily.watermark;
   useEffect(() => {
@@ -163,7 +170,7 @@ export default function CoverageWorkspace({
             </div>
             <div>
               <Layers3 size={18} />
-              <strong>{measured(report.totals.events)}</strong>
+              <strong>{recordCount(report.totals.events, {status: report.indexing.coverage_stats.status, counted_events: report.totals.counted_events})}</strong>
               <span>Observed source records</span>
             </div>
           </div>
@@ -242,8 +249,14 @@ export default function CoverageWorkspace({
               <h2>Source coverage</h2>
               <span>{count(report.sources.length)} sources</span>
             </div>
+            <SortControls label="Source coverage" options={sourceSortOptions} value={sourceSort} />
             <div className="coverage-sources">
-              {report.sources.map((source) => (
+              {sortItems(report.sources, sourceSort, (source, field) =>
+                field === "name" ? source.name
+                  : field === "status" ? source.status
+                  : field === "records" ? source.records.total
+                  : field === "files" ? source.files.total : source.files.bytes,
+              ).map((source) => (
                 <article className="coverage-source" key={source.id}>
                   <header>
                     <div>
@@ -260,7 +273,7 @@ export default function CoverageWorkspace({
                       <strong>{count(source.files.total)}</strong> files
                     </span>
                     <span>
-                      <strong>{measured(source.records.total)}</strong> records
+                      Records: <strong>{recordCount(source.records.total, source.records)}</strong>
                     </span>
                     <span>
                       <strong>{measured(source.records.undated)}</strong>{" "}

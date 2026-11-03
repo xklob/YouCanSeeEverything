@@ -18,6 +18,7 @@ let requests: URL[];
 let failList: boolean;
 let empty: boolean;
 beforeEach(() => {
+  localStorage.clear();
   requests = []; failList = false; empty = false;
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = new URL(String(input), "http://localhost:8000"); requests.push(url);
@@ -80,4 +81,23 @@ it("recovers from a failed request without a page reload", async () => {
   await screen.findByRole("alert"); failList = false;
   await user.click(screen.getByRole("button", { name: "Retry trips" }));
   await screen.findByText("2 source references");
+});
+
+it("sorts the full trip query, resets both pages and keeps its preference after remount", async () => {
+  const user = userEvent.setup();
+  const props = {refreshKey: 0, onOpenEvent: vi.fn(), onShowMap: vi.fn()};
+  const view = render(<TripsWorkspace {...props} />);
+  await screen.findByText("2 source references");
+  await user.click(screen.getByRole("button", {name: "Next trips"}));
+  await waitFor(() => expect(requests.some(url => url.searchParams.get("offset") === "20")).toBe(true));
+  await user.selectOptions(screen.getByLabelText("Trips sort"), "distance");
+  await waitFor(() => expect(requests.some(url => url.pathname === "/api/journeys" && url.searchParams.get("sort") === "distance" && url.searchParams.get("offset") === "0" && url.searchParams.get("direction") === "desc")).toBe(true));
+  await user.selectOptions(screen.getByLabelText("Trips direction"), "asc");
+  await waitFor(() => expect(requests.some(url => url.pathname === "/api/journeys" && url.searchParams.get("sort") === "distance" && url.searchParams.get("direction") === "asc")).toBe(true));
+  view.unmount(); requests.length = 0;
+  render(<TripsWorkspace {...props} />);
+  await screen.findByText("2 source references");
+  expect((screen.getByLabelText("Trips sort") as HTMLSelectElement).value).toBe("distance");
+  expect(requests.find(url => url.pathname === "/api/journeys")?.searchParams.get("direction")).toBe("asc");
+  expect(requests.filter(url => url.pathname.startsWith("/api/journeys/")).every(url => !url.searchParams.has("sort") && url.searchParams.get("offset") === "0")).toBe(true);
 });

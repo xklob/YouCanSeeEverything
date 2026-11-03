@@ -103,8 +103,9 @@ def summary_status(period: str, work_dir: Path, path=None, *, source_ids=None, f
     return {"status": state, "period": period, "key": key, "model": model, "fixed_watermark": fixed, "current_watermark": current_token, "current_coverage": current["coverage"], "freshness_check": {key: value for key, value in current.items() if key != "coverage"}, "result": result}
 
 
-def list_saved(work_dir: Path, *, limit=20, offset=0) -> dict:
-    return summary_library.list_saved(_cache_root(work_dir), limit=limit, offset=offset)
+def list_saved(work_dir: Path, *, limit=20, offset=0,sort='generated',direction='desc') -> dict:
+    summary_library._sort_order(sort,direction)
+    return summary_library.list_saved(_cache_root(work_dir), limit=limit, offset=offset,sort=sort,direction=direction)
 
 
 def saved_summary(key: str, work_dir: Path) -> dict | None:

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import L from "leaflet";
 import userEvent from "@testing-library/user-event";
 import MapWorkspace, { recordedDay } from "../src/MapWorkspace";
@@ -326,7 +326,7 @@ it("draws only backend-provided inferred legs with off-page recorded endpoints a
     screen.getAllByRole("button", { name: "Open record", exact: true })[1],
   );
   expect(open).toHaveBeenCalledWith("later-record");
-  await user.click(screen.getByRole("button", { name: "Older points" }));
+  await user.click(screen.getByRole("button", { name: "Next points" }));
   await waitFor(() =>
     expect(
       requests.some(
@@ -595,4 +595,78 @@ it("paginates same-day records using has_more when the total is unavailable", as
   expect(
     screen.getByRole("button", { name: "Previous", exact: true }),
   ).toBeTruthy();
+});
+
+it("pages every loaded point and connection without changing selection or requesting another provider", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  const points = Array.from({length: 405}, (_, index) => ({...point, id: `point-${index}`, event_id: `event-${index}`, title: `Loaded point ${index + 1}`}));
+  const legs = Array.from({length: 405}, (_, index) => ({id: `leg-${index}`, trip_id: "trip", inferred: true, geometry_type: "straight_line", from: {...point, title: `Stop ${index + 1}`}, to: {...point, title: "Destination"}, distance_km: index + 1, gap_hours: 1}));
+  vi.mocked(fetch).mockImplementation(async (input, options) => {
+    const path = String(input);
+    if (path.startsWith("/api/map?") || path.startsWith("/api/trips?")) {
+      requests.push(path);
+      return Response.json(path.startsWith("/api/map?") ? {items: points, total: 2405} : {items: legs, total: 9000, truncated: true});
+    }
+    return original(input, options);
+  });
+  const user = userEvent.setup();
+  const props = {filters, refreshKey: 0, onOpenEvent: vi.fn(), onShowTimeline: vi.fn()};
+  const view = render(<MapWorkspace {...props}/>);
+  const list = await screen.findByRole("region", {name: "Recorded locations list"});
+  await screen.findByText("A post on the same day");
+  const tiles = tileLayer.mock.calls.length, mapCalls = requests.filter(path => path.startsWith("/api/map?")).length;
+  expect(within(list).getAllByRole("button")).toHaveLength(200);
+  await user.click(screen.getByRole("button", {name: "Next loaded locations"}));
+  await user.click(within(list).getByRole("button", {name: /^Loaded point 201/}));
+  await user.click(screen.getByRole("button", {name: "Next loaded locations"}));
+  expect(within(list).getAllByRole("button")).toHaveLength(5);
+  expect(within(list).getByText("Loaded point 405")).toBeTruthy();
+  expect((screen.getByRole("button", {name: "Next loaded locations"}) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByRole("heading", {name: "Loaded point 201"})).toBeTruthy();
+  await user.click(screen.getByRole("button", {name: "Previous loaded locations"}));
+  expect(within(list).getByText("Loaded point 201")).toBeTruthy();
+  await user.click(screen.getByText("Browse 405 inferred connections"));
+  await user.click(screen.getByRole("button", {name: "Next loaded connections"}));
+  await user.click(screen.getByRole("button", {name: /Stop 201 → Destination/}));
+  await user.click(screen.getByRole("button", {name: "Next loaded connections"}));
+  expect(screen.getByRole("button", {name: /Stop 405 → Destination/})).toBeTruthy();
+  expect(screen.getByRole("heading", {name: "Stop 201"})).toBeTruthy();
+  expect(screen.getByText(/First 405 shown/)).toBeTruthy();
+  expect(tileLayer).toHaveBeenCalledTimes(tiles);
+  expect(requests.filter(path => path.startsWith("/api/map?"))).toHaveLength(mapCalls);
+  expect(requests.filter(path => path.startsWith("/api/trips?"))).toHaveLength(1);
+  await user.selectOptions(screen.getByLabelText("Recorded locations direction"), "asc");
+  await waitFor(() => expect(requests.some(path => path.startsWith("/api/map?") && path.includes("direction=asc") && path.includes("offset=0"))).toBe(true));
+  expect(within(list).getByText("Loaded point 1")).toBeTruthy();
+  expect(screen.getByRole("button", {name: /Stop 1 → Destination/})).toBeTruthy();
+  await user.click(screen.getByRole("button", {name: "Next loaded locations"}));
+  await user.click(screen.getByRole("button", {name: "Next loaded connections"}));
+  await user.click(screen.getByRole("button", {name: "Next points", exact: true}));
+  await waitFor(() => expect(requests.some(path => path.startsWith("/api/map?") && path.includes("offset=2000"))).toBe(true));
+  expect(within(list).getByText("Loaded point 1")).toBeTruthy();
+  expect(screen.getByRole("button", {name: /Stop 1 → Destination/})).toBeTruthy();
+  await user.click(screen.getByRole("button", {name: "Next loaded locations"}));
+  await user.click(screen.getByRole("button", {name: "Next loaded connections"}));
+  view.rerender(<MapWorkspace {...props} filters={{...filters,q:"narrow"}}/>);
+  await waitFor(() => expect(requests.some(path => path.startsWith("/api/map?") && path.includes("q=narrow") && path.includes("offset=0"))).toBe(true));
+  expect(within(list).getByText("Loaded point 1")).toBeTruthy();
+  expect(screen.getByRole("button", {name: /Stop 1 → Destination/})).toBeTruthy();
+}, 20000);
+
+it("resets same-day paging when Date or Import order sorting changes", async () => {
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, options) => {
+    if (!String(input).startsWith("/api/events?")) return original(input, options);
+    requests.push(String(input));
+    return Response.json({items: [{id:"same-day",title:"Same-day sorted record",source:"Synthetic",category:"post"}],total:100,limit:20,offset:0});
+  });
+  const user = userEvent.setup();
+  render(<MapWorkspace filters={filters} refreshKey={0} onOpenEvent={vi.fn()} onShowTimeline={vi.fn()}/>);
+  await screen.findByText("Same-day sorted record");
+  await user.click(screen.getByRole("button", {name:"Next",exact:true}));
+  await waitFor(() => expect(requests.some(path => path.startsWith("/api/events?") && path.includes("offset=20"))).toBe(true));
+  await user.selectOptions(screen.getByLabelText("Same-day records sort"), "imported");
+  await user.selectOptions(screen.getByLabelText("Same-day records direction"), "desc");
+  await waitFor(() => expect(requests.some(path => path.startsWith("/api/events?") && path.includes("sort=imported") && path.includes("direction=desc") && path.includes("offset=0"))).toBe(true));
+  expect(requests.filter(path => path.startsWith("/api/map?"))).toHaveLength(1);
 });

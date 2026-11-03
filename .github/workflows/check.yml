@@ -15,9 +15,10 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: uv sync --extra dev
       - run: uv run pytest
-      - run: uv run pytest scripts/test_check_dashboard.py scripts/test_summary_fixtures.py scripts/test_dashboard_performance.py
+      - run: uv run pytest scripts/test_check_dashboard.py scripts/test_summary_fixtures.py scripts/test_dashboard_performance.py scripts/test_sorting_fixtures.py
       - run: npm ci && npm test && npm run build
         working-directory: web
       - run: uv run playwright install --with-deps chromium
       - run: uv run python scripts/check_dashboard.py --dist web/dist --fixture --output .local/ci-browser
       - run: uv run python scripts/check_dashboard.py --dist web/dist --fixture --summary-workflows --output .local/ci-summaries
+      - run: uv run python scripts/check_dashboard_performance.py --dist web/dist --fixture --sorting --output .local/ci-sorting

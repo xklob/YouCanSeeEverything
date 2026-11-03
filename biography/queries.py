@@ -35,11 +35,16 @@ def event_filters(q='',source='',category='',start='',end='',undated=False):
 def list_events(path=None, *,q='',source='',category='',start='',end='',limit=50,offset=0,sort='desc',undated=False):
     where,args=event_filters(q,source,category,start,end,undated)
     order='ASC' if sort=='asc' else 'DESC'
+    # events_time is (occurred_at DESC,id ASC). Scan that index in either
+    # direction; an "occurred_at IS NULL" expression forces a full-table sort.
+    # Explicit NULLS LAST preserves undated placement for ascending pages too.
+    tie_order='DESC' if order=='ASC' else 'ASC'
     conn=connect(path)
     try:
+        conn.execute('BEGIN')
         total=conn.execute('SELECT count(*) FROM events e'+where,args).fetchone()[0]
         rows=conn.execute('SELECT e.*,s.name AS source FROM events e JOIN sources s ON s.id=e.source_id'+where+
-            f' ORDER BY e.occurred_at IS NULL,e.occurred_at {order},e.id {order} LIMIT ? OFFSET ?',args+[min(max(limit,1),200),max(offset,0)]).fetchall()
+            f' ORDER BY e.occurred_at {order} NULLS LAST,e.id {tie_order} LIMIT ? OFFSET ?',args+[min(max(limit,1),200),max(offset,0)]).fetchall()
         items=[decode_event(r) for r in rows]
         from .media import media_for_events
         attachments=media_for_events([item['id'] for item in items],path)

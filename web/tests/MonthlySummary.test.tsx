@@ -95,6 +95,21 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it.each([2, null])('renders bounded freshness coverage without inventing omitted counts or source status (total %s)', async (total) => {
+  vi.mocked(fetch).mockResolvedValue(Response.json({status: 'missing', result: null,
+    current_coverage: {total_events_in_scope: total, selected_events: 0,
+      sources: [{source_id: 'synthetic-source', source: 'Synthetic archive', total_events: total, selected_events: 0}],
+      time_basis: 'source_dates', limitations: ['No new narrative was generated.']},
+  }));
+  render(<MonthlySummary day="2024-04-05" sourceId="" onOpenEvent={() => {}} />);
+  expect(await screen.findByText('No saved summary for this selection')).toBeTruthy();
+  expect(screen.getByText(/Synthetic archive: 0 selected/)).toBeTruthy();
+  expect(screen.queryByText(/retrieval candidates|undated records excluded/)).toBeNull();
+  expect(screen.queryByText(/Only selected evidence was summarized|Evidence selection is shown below/)).toBeNull();
+  if (total === null) expect(screen.getByText(/Scope count unavailable\./)).toBeTruthy();
+  else expect(screen.getByText(/2 records in scope/)).toBeTruthy();
+});
+
 it("only generates on request, preserves actual source IDs, and opens cited original evidence", async () => {
   const user = userEvent.setup();
   const open = vi.fn();

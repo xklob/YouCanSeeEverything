@@ -304,19 +304,19 @@ export interface CoverageReport {
   backup: { status: string; [key: string]: unknown };
 }
 export interface SummaryCoverage {
-  total_events_in_scope: number;
+  total_events_in_scope: number | null;
   selected_events: number;
-  candidate_events: number;
-  undated_events_excluded: number;
+  candidate_events?: number;
+  undated_events_excluded?: number;
   sources: {
     source_id: string;
     source: string;
-    total_events: number;
+    total_events: number | null;
     selected_events: number;
-    status: string;
+    status?: string;
   }[];
-  retrieval_limited: boolean;
-  time_basis: string;
+  retrieval_limited?: boolean;
+  time_basis?: string | null;
   limitations: string[];
 }
 export interface PeriodSummary {

@@ -67,6 +67,8 @@ class AcceptanceBoundaryTests(unittest.TestCase):
         focused = fixture_api("/api/summaries?period=2024-04&focus=fictional")
         self.assertEqual(focused["status"], "missing")
         self.assertIsNone(focused["result"])
+        self.assertNotIn('status',focused['current_coverage']['sources'][0])
+        self.assertNotIn('candidate_events',focused['current_coverage'])
         self.assertNotEqual(focused["key"], saved["key"])
         raw_types = {row["name"] for row in fixture_api("/api/overview")["categories"]}
         derived = fixture_api("/api/daily/categories")

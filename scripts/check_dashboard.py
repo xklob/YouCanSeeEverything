@@ -171,9 +171,12 @@ def fixture_api(path: str) -> dict:
             coverage=coverage, selection={}, model=model,
             cache=dict(status="fresh", key="qa-summary", generated_at="2024-04-05T13:00:00Z", fixed_watermark="4", current_watermark="4"), limitations=[])
         focused = bool(params.get("focus", [""])[0].strip())
+        current_coverage = dict(total_events_in_scope=4, selected_events=0,
+            sources=[dict(source_id='qa-one', source='QA journal', total_events=2, selected_events=0)],
+            time_basis='source_timestamp', limitations=['Bounded freshness check; no new narrative was generated.'])
         return dict(status="missing" if focused else "fresh", period=period, key="qa-summary-focused" if focused else "qa-summary",
                     model=model, fixed_watermark=None if focused else "4",
-                    current_watermark="4", current_coverage=coverage, result=None if focused else result)
+                    current_watermark="4", current_coverage=current_coverage, result=None if focused else result)
     if parsed.path in {"/api/imports", "/api/jobs"}:
         return {"items": []}
     if parsed.path == "/api/map-config":

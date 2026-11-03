@@ -18,14 +18,16 @@ from decimal import Decimal, InvalidOperation
 from pathlib import PurePosixPath
 
 from .parsers.common import parse_date
+from .source_policy import package_member
 
-CLASSIFIER_VERSION = 2
+CLASSIFIER_VERSION = 3
 CLASSIFICATION_VERSION = CLASSIFIER_VERSION
 
 _ACTIVITY_CATEGORIES = {
     "activity", "travel", "place_visit", "post", "comment", "purchase",
     "event_booking", "event_attendance", "git_commit", "listening", "usage",
     "ethereum_transaction", "ethereum_token_transfer", "ethereum_internal_transaction",
+    "sleep", "health_achievement",
 }
 _TECHNICAL_CATEGORIES = {"shell_command", "project_context", "technical", "diagnostic", "telemetry"}
 _MEASUREMENT_CATEGORIES = {"location", "measurement", "health_sample", "health_measurement", "sensor_sample"}
@@ -395,6 +397,10 @@ def classify_event(event: Mapping, provenance: list[Mapping] | None = None) -> d
         display_class, is_sample = "measurement", True
     else:
         display_class = "document"
+    paths = _paths(provenance)
+    if paths and all(package_member(path) for path in paths):
+        display_class, category, is_sample = 'technical', 'application_resource', False
+        notes.append('Evidence is inside an application package; this is implementation material.')
     device, device_basis = _device(metadata)
     measurement_keys = set(_key(key) for key in metadata) & set(_FIELDS)
     legacy_measurement_file = any(re.match(r"(?:steps|distance|height|weight|altitude|calories|heart_rate|time_in_heart_rate_zones)-\d", PurePosixPath(path).name, re.I) for path in _paths(provenance))

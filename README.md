@@ -58,9 +58,14 @@ Existing catalogs need an initial count with `counts-build`; repeat it until com
 
 - **Records:** search and filter imported entries; view media and source files.
 - **Days:** group entries by day, summarize measurement samples, and expand the underlying records.
+
 - **Map and Trips:** browse recorded locations, inferred connections and cited trip summaries. Records from the same dates are shown as context; they may be unrelated to the trip.
 - **Imports:** view progress, extraction status, observed dates and gaps.
 - **Ask:** ask questions, generate day or month summaries, and browse saved summaries. Opening a saved result does not run a model.
+
+Sleep and achievement records use their explicit source dates. Local times keep
+their unknown timezone, and ambiguous legacy dates remain undated. Previously
+expanded app resources are labeled as technical material.
 
 Records load before archive totals finish counting. Cached counts are labeled. Days may cover only part of the archive while the day index is building.
 

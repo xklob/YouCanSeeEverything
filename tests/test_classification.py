@@ -5,6 +5,19 @@ import pytest
 from biography.classification import CLASSIFIER_VERSION, classify_event
 
 
+def test_application_resources_are_technical_only_with_exclusive_package_evidence():
+    original={'source_id':'source','title':'icon','category':'media','metadata':{}}
+    package={'original_path':'history.zip!attachments/example.apk!res/icon.png'}
+    result=classify_event(original,[package])
+    assert result['category']=='application_resource'
+    assert result['display_class']=='technical'
+    assert original['category']=='media'
+    standalone={'original_path':'history.zip!messages/photos/icon.png'}
+    assert classify_event(original,[package,standalone])['display_class']=='media'
+    assert classify_event(original,[standalone])['display_class']=='media'
+    assert classify_event(original,[{'original_path':'history.zip!attachments/example.apk'}])['display_class']=='media'
+
+
 def event(metadata=None, **overrides):
     return {"id": "event-one", "source_id": "source-one", "source_name": "Google", "category": "record", "title": "Export row", "body": "Retained source row", "occurred_at": None, "end_at": None, "time_precision": "unknown", "metadata": metadata or {}, **overrides}
 

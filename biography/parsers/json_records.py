@@ -213,6 +213,22 @@ def adapt(record: Any, locator: str, source: str, path: str, limit: int) -> tupl
     if record.get("kind") in {"ethereum_transaction", "ethereum_token_transfer", "ethereum_internal_transaction"}:
         return "history.ethereum", [ethereum_record(record, locator, limit)]
     low_source = source.casefold()
+    health_folders = set(re.split(r'[/\\!]', path.casefold()))
+    health_context = ('fitbit' in low_source or bool(health_folders & {
+        'fitbit', 'google health & fit', 'google health', 'google fit',
+    }))
+    if health_context and {'logId', 'dateOfSleep', 'startTime', 'minutesAsleep'} <= record.keys():
+        return 'health.sleep', [event('Sleep', document_text(record, limit), locator,
+            native_id=_health_native('sleep',record['logId']), when=_explicit_health_date(record.get('startTime')),
+            end=_explicit_health_date(record.get('endTime')), category='sleep',
+            metadata={**record, 'record_format': 'health.sleep',
+                'timestamp_basis': 'explicit_startTime; dateOfSleep retained separately'}, limit=limit)]
+    if health_context and {'encodedId', 'badgeType', 'dateTime', 'timesAchieved'} <= record.keys():
+        return 'health.badges', [event(record.get('name') or record.get('shortName') or 'Health achievement',
+            document_text(record, limit), locator, native_id=_health_native('badge',record['encodedId']),
+            when=_explicit_health_date(record.get('dateTime')), category='health_achievement',
+            metadata={**record, 'record_format': 'health.badge',
+                'timestamp_basis': 'explicit_dateTime; achievement count is not expanded into invented dates'}, limit=limit)]
     if isinstance(record.get("mapping"), dict):
         return "chatgpt.messages", chatgpt(record, locator, limit)
     if "timestamp_ms" in record and ("sender_name" in record or "content" in record):
@@ -275,6 +291,20 @@ def adapt(record: Any, locator: str, source: str, path: str, limit: int) -> tupl
     if not isinstance(body, str):
         body = document_text(record, limit)
     return "json.records", [event(title, body, locator, native_id=pick(record, "id", "uuid"), when=when, category="record" if when is not None else "document", metadata=record, unit="ms" if "timestamp_ms" in record else None, limit=limit)]
+
+
+def _health_native(kind,value):
+    if type(value) is int and value>=0 or isinstance(value,str) and value.strip():
+        return kind + ':' + str(value)
+    return None
+
+
+def _explicit_health_date(value):
+    # Legacy exports also contain short slash dates. Their century and field
+    # order remain unknown; neither the filename nor locale fills them in.
+    if isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?', value):
+        return value
+    return None
 
 
 def chatgpt(record: dict, locator: str, limit: int) -> list[dict]:
